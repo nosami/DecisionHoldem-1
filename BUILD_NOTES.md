@@ -316,6 +316,42 @@ source and the demo:
   `narrow_range_given_actions()` both already take an arbitrary range as a
   plain input, not just the uniform default.
 
+**How long does a flop decision take, given each player's range is 30**
+**specific 2-card holdings (not a clustered bucket -- 30 individually-**
+**weighted combos per side)?** Measured directly (not estimated) with
+`PokerAI/tools/bench_resolve_timing.py`, which times only the CFR resolve
+loop itself (the actual per-decision cost) for a configurable holdings
+count and iteration budget:
+
+```bash
+python3 PokerAI/tools/bench_resolve_timing.py --holdings 30 --iterations 6000 --street flop
+#   CFR RESOLVE LOOP (the actual per-decision cost): 10.00s (1.666 ms/iteration)
+python3 PokerAI/tools/bench_resolve_timing.py --holdings 30 --iterations 10000 --street turn
+#   CFR RESOLVE LOOP (the actual per-decision cost): 16.88s (1.688 ms/iteration)
+```
+
+On this machine: **≈10 seconds** for a flop decision at the paper's own
+stated 6,000-iteration real-time budget for preflop/flop off-tree nodes,
+and **≈17 seconds** for a turn/river decision at its 10,000-iteration
+budget, with 30 possible holdings per side. Per-iteration cost scales
+roughly with (holdings/side)², since the dominant per-node work is
+averaging showdown/leaf value over the opponent's whole range; going from
+6 to 30 holdings/side (25x more combo pairs) measured about a 9x
+slowdown per iteration in this implementation.
+
+This is a genuine wall-clock measurement, but of the **toy game**, not the
+real system -- treat it only as a rough order-of-magnitude figure for how
+range size affects cost, for three reasons that could each swing the real
+number by a large, currently unknown factor: (1) this toy game's bet
+abstraction has only ~2-3 actions per street, versus the real system's
+presumably much larger/deeper bet-sizing tree; (2) this is interpreted,
+single-threaded Python -- real (missing) C++ would very likely be faster
+per elementary operation, plausibly by 20-100x, but could also use more
+threads or fewer, an unknown; (3) `Depth_limit_Search.h`, the code that
+would actually do this in DecisionHoldem, does not exist in this
+repository (see 2.1 below) -- there is no real implementation to measure,
+only this demo's inferred reconstruction of its mechanics.
+
 Run it yourself:
 
 ```bash
