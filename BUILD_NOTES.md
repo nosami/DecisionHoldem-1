@@ -8,18 +8,27 @@ included source, and what that means for what can and cannot legitimately run.
 
 **Bottom line:** the C++ blueprint-training/evaluation program now compiles and
 links cleanly on macOS (previously it did not compile at all — see below), and
-its CLI now behaves as documented. However, no part of the trained/real-time
-agent can actually be exercised — on macOS *or* Linux — without the pretrained
-hand-abstraction data described below, which is not present in this repository,
-not present anywhere in its git history, not published as a GitHub release, and
-is only referenced via a third-party Baidu Netdisk link that this investigation
-did not use (unverifiable, access-gated, and out of scope per instructions not
-to rely on dubious third-party binaries). The precompiled `AlascasiaHoldem.so` /
-`blueprint.so` real-time-search binaries are Linux x86_64 ELF objects with **no
-corresponding source in this repo** (the README explicitly says this component
-"currently only provide[s] compiled files"), so they cannot be ported to macOS
-at all without that missing source; they would need to run under Linux x86_64
-(e.g. Docker), which was not available in this sandbox.
+its CLI now behaves as documented. A real, complete, working component was
+found, fixed, and successfully run end-to-end with no missing data at all: the
+README's own referenced Leduc poker example (section 3) — its full 10-million-
+iteration MCCFR training run completed in ~22 seconds after one small build
+fix. The main 52-card engine's required pretrained hand-abstraction data was
+**not present in this repository, its git history, or any GitHub release**, and
+is only officially distributed via a third-party Baidu Netdisk link this
+investigation did not use (unverifiable, access-gated). All six required files
+(five cluster arrays plus `blueprint_strategy.dat`) were, however, eventually
+located via an **unofficial community re-upload** referenced from this
+project's own GitHub issues, byte-size-verified, and used to actually attempt
+the real engine (section 2) — which confirmed, empirically, that `Engine()`'s
+unconditional ~19.4 GiB memory requirement exceeds this specific 16 GiB
+machine's capacity, so the full 52-card trainer/evaluator still cannot run
+*here*, though it should on a machine with more RAM. The precompiled
+`AlascasiaHoldem.so` / `blueprint.so` real-time-search binaries are Linux
+x86_64 ELF objects with **no corresponding source in this repo** (the README
+explicitly says this component "currently only provide[s] compiled files"),
+so they cannot be ported to macOS at all without that missing source; they
+would need to run under Linux x86_64 (e.g. Docker), which was not available in
+this sandbox.
 
 ## 1. Source defects found and fixed (all preserve Linux/GCC behavior)
 
@@ -605,7 +614,102 @@ recommended place to actually attempt this — 19.4 GiB comfortably fits
 within 32 GiB with headroom for the OS, the CFR tree structures the engine
 builds afterward, and normal process overhead.
 
-## 3. Python / GUI stack (`pypokergui`, Slumbot/OpenStackTwo bots)
+## 3. External Leduc poker reference example — successfully built and run
+
+The README (line 15) points to a separate, smaller companion repository for
+understanding the algorithm: ["a simple program about Leduc
+poker"](https://github.com/zqbAse/PokerAI_Sim), by the same
+project/author group. This is a genuinely separate GitHub repo (own git
+history, own README, no shared commits with DecisionHoldem) — it is not
+vendored into this repository and was not committed here; it was cloned to
+a scratch location (`/tmp/PokerAI_Sim`) purely to validate whether the
+"smallest meaningful included/referenced component" mentioned in this
+project's README actually builds and runs, since DecisionHoldem itself has
+no runnable component that doesn't depend on the missing multi-GB cluster
+data (section 2).
+
+**It has the exact same architecture as DecisionHoldem** (`Poker/Engine.h`,
+`Poker/State.h`, `Tree/Node.h`, `Tree/Bulid_Tree.h`, `Tree/Save_load.h`,
+`Tree/Exploitability.h`, MCCFR in `blueprint.cpp`) but scaled down to actual
+Leduc poker (6-card deck, 2 rounds) instead of full 52-card Texas Hold'em —
+so no pretrained cluster/hand-abstraction files are needed at all; the whole
+game is small enough to enumerate exactly.
+
+**Build, as documented in its own README:**
+```shell
+git clone https://github.com/zqbAse/PokerAI_Sim.git
+cd PokerAI_Sim
+g++ blueprint.cpp -o blueprint.o -std=c++11
+```
+This failed exactly once, with the same class of defect found repeatedly in
+DecisionHoldem itself (section 1) — a call site passing an argument to a
+function that takes none:
+```
+blueprint.cpp:196:25: error: too many arguments to function call, expected 0, have 1
+            randi.reset(rand());
+./Util/Randint.h:18:10: note: 'reset' declared here
+    void reset() {
+```
+`Util/Randint.h`'s `reset()` only reseeds from the wall clock; the call site
+clearly intends to reseed from a caller-supplied value (matching the
+existing seeded constructor `Randint(uint32 seed)` right above it, and the
+surrounding comment translating to "recompute the random seed every 10,000
+iterations"). Fixed, behavior-preserving, by adding the missing overload
+(not modifying the existing no-arg `reset()`):
+```cpp
+void reset(uint32 seed) {
+    prngState = seed;
+}
+```
+This fix was applied only to the scratch clone in `/tmp` (documented here as
+text, not committed anywhere, since this is a separate upstream project this
+investigation does not own) — anyone reproducing this should apply the same
+one-method addition to `Util/Randint.h`.
+
+**After that fix, it built cleanly (0 errors, 0 warnings) and ran to full
+completion exactly as documented:**
+```shell
+$ time ./blueprint.o
+...
+16.728
+-14.5346
+16.4112
+-14.1698
+16.4024
+-12.5373
+15.8794
+-13.2493
+15.5639
+-13.9671
+
+real    0m22.3s
+```
+This is the genuine, complete MCCFR training loop — 10,000,000 iterations
+(`n_iterations` in `blueprint.cpp`), exactly as configured in the shipped
+source, run to completion, no shortcuts or reduced parameters. Every 2
+million iterations it computes and prints a best-response
+exploitability-style value for each player (the two numbers per block above)
+and serializes the current strategy tree to `blueprint_sim.stgy` (31,712
+bytes) via `Tree/Save_load.h`'s `visualization()`/save path — the same
+save/load mechanism `Main.cpp` uses for the real, currently-unloadable
+`blueprint_strategy.dat`. Player 0's best-response value trends down across
+checkpoints (16.7 → 16.4 → 16.4 → 15.9 → 15.6), consistent with the strategy
+converging toward equilibrium as training progresses; player 1's shows more
+run-to-run noise (expected — it's a single MCCFR run, not an average over
+seeds, and only 5 sample points).
+
+**Why this matters:** it is a real, unmodified-algorithm, complete,
+successful end-to-end run of exactly the technique (external-sampling MCCFR
+building a game tree, discounted regret updates, periodic best-response
+exploitability checks, strategy serialization) that DecisionHoldem's own
+`BlueprintMCCFR.h`/`Multi_Blureprint.h` implement at full 52-card scale — it
+just does so on Leduc poker's tiny, data-free game, which is exactly why the
+README recommends it as the way to "understand the algorithm framework and
+its mechanism" without needing the missing multi-GB pretrained data. This is
+the most concrete "smallest meaningful component, actually run" result this
+investigation produced.
+
+## 4. Python / GUI stack (`pypokergui`, Slumbot/OpenStackTwo bots)
 
 - `requirements.txt` pinned `tornado==4.4.2`, which does not import on modern
   Python (3.10+, tested here on 3.14): it references the long-removed
@@ -645,7 +749,7 @@ builds afterward, and normal process overhead.
   not installed in this sandbox; install via `brew install graphviz` on macOS
   if you want PNG tree renders.
 
-## 4. What was validated, with exact commands
+## 5. What was validated, with exact commands
 
 ```shell
 # 1. Clean compile now succeeds (previously failed with invalid-preprocessing-directive
@@ -668,12 +772,22 @@ python3 -c "import server.poker"   # (run with cwd=pypokergui, PYTHONPATH set)
 #    confirming the Linux .so is the sole remaining blocker for the GUI.
 ```
 
-## 5. Summary for the user
+## 6. Summary for the user
 
 - **Fixed and verified:** the C++ source now compiles cleanly on macOS/Clang
   and on Linux/GCC (fixes are behavior-preserving on both), the CLI's train
   vs. evaluate dispatch bug is fixed, and the Python GUI/bot dependency list is
   corrected for modern Python.
+- **A real, complete, working component was found, fixed, built, and run to
+  full completion: the README's own referenced Leduc poker example
+  (section 3).** It needs no pretrained data at all, and its full documented
+  10,000,000-iteration MCCFR training run completed in ~22 seconds on this
+  machine after one small, documented, behavior-preserving build fix
+  (identical in nature to the fixes in section 1) — producing a saved
+  strategy file and a converging best-response value. This is the strongest
+  concrete "it actually runs" result in this whole investigation, and
+  exercises the *same* MCCFR/game-tree/save-load architecture DecisionHoldem
+  itself uses at full scale.
 - **Data files: all six obtained, from an unofficial mirror, not the README's
   official source.** None of `sevencards_strength.bin`,
   `preflop_hand_cluster.bin`, `flop_hand_cluster.bin`, `turn_hand_cluster.bin`,
@@ -703,11 +817,11 @@ python3 -c "import server.poker"   # (run with cwd=pypokergui, PYTHONPATH set)
 - **Cannot be run on macOS regardless of data or RAM:** `AlascasiaHoldem.so`
   and `blueprint.so` are Linux x86_64 binaries with no included source; they
   need a Linux x86_64 runtime (e.g. Docker), which was unavailable in this
-  sandbox.
+  sandbox (`docker` is not installed here).
 - No placeholder/fabricated data files were created or committed anywhere in
   this repository.
 
-## 6. Possible path to a working real-time search: an external solver bridge
+## 7. Possible path to a working real-time search: an external solver bridge
 
 Since `Depth_limit_Search.h` (section 2.1) is genuinely missing source and the
 `.so` files (section 3) cannot be ported without it, DecisionHoldem itself has
@@ -736,7 +850,7 @@ project), was evaluated as a possible substitute:
   functionality vs. fixing/documenting what exists). Flagged here as the most
   concrete legitimate path forward if real-time search is ever needed.
 
-## 7. RAM-avoidance alternative: binary search directly against the file on disk
+## 8. RAM-avoidance alternative: binary search directly against the file on disk
 
 Section 2's ~20.86GB unconditional RAM requirement (Engine.h loading all
 cluster arrays fully into memory at construction) was investigated for a
