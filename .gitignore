@@ -1,8 +1,8 @@
 # Large pretrained cluster/blueprint artifacts (community-mirrored or self-generated).
 # These are multi-GB binary data files, not source, and must never be committed.
 # See BUILD_NOTES.md for provenance and how to obtain them.
-PokerAI/cluster/*.bin
-PokerAI/cluster/*.dat
+# Ignore everything in cluster/ except the one small file that ships with the repo.
+PokerAI/cluster/*
 !PokerAI/cluster/preflopallin1326.1225.bin
 
 __pycache__/
