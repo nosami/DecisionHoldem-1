@@ -644,3 +644,59 @@ project), was evaluated as a possible substitute:
   without explicit direction given the scope jump involved (building new
   functionality vs. fixing/documenting what exists). Flagged here as the most
   concrete legitimate path forward if real-time search is ever needed.
+
+## 7. RAM-avoidance alternative: binary search directly against the file on disk
+
+Section 2's ~20.86GB unconditional RAM requirement (Engine.h loading all
+cluster arrays fully into memory at construction) was investigated for a
+lighter-weight alternative: skip loading the arrays into RAM at all, and
+instead perform `find_turn`/`find_river`/`find_strength`'s binary search
+directly against the file on disk, one `pread()` per comparison, exactly
+mirroring the existing algorithm but replacing array indexing with a seek+read.
+
+**Why this is possible:** each cluster array is stored per hole-card combo as
+an independent, pre-sorted, contiguous block (`Engine.h` lines 99-144:
+`keys[N]` then `values[N]`, one block per `(i,j)` pair, written in a fixed,
+computable file order). `find_turn`/`find_river`/`find_flop` each binary-search
+only *within one hand's own block*, never across the whole file. So a
+disk-based binary search for one lookup only ever touches
+`~log2(N)` scattered 4-byte offsets inside an ~0.9MB (turn) / ~8.5MB (river)
+region — not the full 2.3GB/16GB file.
+
+**Empirical measurement** (`pread()`-based binary search implemented to
+exactly mirror `find_turn`/`find_river`/`find_strength`, run against the real,
+byte-verified `turn_hand_cluster.bin` and `sevencards_strength.bin` on this
+machine; page cache forcibly disabled per-fd via macOS's `F_NOCACHE` fcntl(48)
+to guarantee genuine disk I/O, not a warm-cache artifact):
+
+```
+$ python3 PokerAI/tools/bench_disk_binary_search.py nocache
+--- turn_hand_cluster.bin  (N=230,300/hand)   --- mean 0.362 ms/lookup (17.7 reads, ~20 us/read)
+--- river_hand_cluster.bin (N=2,118,760/hand) --- mean 0.896 ms/lookup (21.0 reads, ~43 us/read)
+--- sevencards_strength.bin (N=133,784,560)   --- mean 1.941 ms/lookup (27.0 reads, ~72 us/read)
+```
+
+With normal page-cache behavior re-enabled (no `F_NOCACHE`), repeat lookups
+against the *same* already-touched block drop to ~0.01-0.08 ms (turn/river)
+and ~0.5 ms (seven-card, whose 1.25GB table is scattered wider so warms more
+slowly) — because the OS transparently caches whatever 4KB pages get touched.
+
+**Why this matters:** a real-time resolve only ever queries the small, fixed
+set of hole-card combos present in hero's and villain's supplied ranges (e.g.
+~30 each ⇒ ≤60 distinct per-hand blocks across the *entire* multi-thousand-
+iteration resolve, not per iteration). So the realistic cost is a one-time
+cold warm-up of roughly `60 x (0.90ms river + 1.94ms strength) ≈ 0.17s`,
+after which every subsequent iteration's lookups hit the OS page cache for
+free. That is comparable to or cheaper than section 8's measured ~7-8s
+one-time full-array load, while resident memory stays in the tens-of-MB range
+(only the touched blocks), not 2-16GB per array.
+
+**Conclusion:** doing the binary search directly against the file (via plain
+`pread`/`fread` at the same offsets `Engine.h` already computes, or via
+`mmap()` for less code churn) is a legitimate, more surgical alternative to
+both "load everything into RAM at once" (current code, ~20.86GB) and "load
+one street's whole array lazily" (~15.7GB alone for river, still exceeding
+this machine's 16GB). It was benchmarked here as evidence of feasibility but
+was not implemented in `Engine.h`, per direction to keep this investigation
+analysis/documentation-only rather than modify the real engine's loading
+strategy.
