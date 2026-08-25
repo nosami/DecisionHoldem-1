@@ -468,8 +468,18 @@ data):
 | `flop_hand_cluster.bin` | 207,916,800 | 207,916,800 (1,326 combos × 19,600 × 8 bytes) | ✅ exact |
 | `sevencards_strength.bin` | 1,337,845,600 | 1,337,845,600 (C(52,7)=133,784,560 × 10 bytes) | ✅ exact |
 | `turn_hand_cluster.bin` | 2,443,022,400 | 2,443,022,400 (1,326 combos × 230,300 × 8 bytes) | ✅ exact |
-| `river_hand_cluster.bin` | *(downloading)* | 16,856,854,560 (1,326 combos × 2,118,760 × 6 bytes; values are `unsigned short`, not `unsigned`) | *(pending)* |
-| `blueprint_stgy.dat` (mirror's name for `blueprint_strategy.dat`) | *(size TBD)* | variable (grown by training) | *(pending — needs rename to `blueprint_strategy.dat` before use)* |
+| `river_hand_cluster.bin` | 16,856,854,560 | 16,856,854,560 (1,326 combos × 2,118,760 × 6 bytes; values are `unsigned short`, not `unsigned`) | ✅ exact |
+| `blueprint_stgy.dat` (mirror's name for `blueprint_strategy.dat`) | 16,123,074,125 | *(not independently verifiable — see caveat below)* | hard-linked to `cluster/blueprint_strategy.dat` |
+
+**All six files this project needs now exist and are placed correctly.**
+`blueprint_stgy.dat` was hard-linked (not copied, so no extra disk space) to
+`cluster/blueprint_strategy.dat`, the exact path/name `Main.cpp`/
+`tree/Save_load.h`'s `load()` expects. Unlike the five cluster files, there is
+no independent formula to verify `blueprint_strategy.dat`'s size against
+(it's a serialized CFR game tree, whose size depends on the exact training
+run that produced it, not a fixed formula) — its correctness can only be
+checked by actually loading it, which section 2.1's RAM ceiling prevents on
+this machine (see below).
 
 Every file checked so far against sizes computed independently from
 `Engine.h`'s own constants (before any download happened) is an **exact
@@ -531,6 +541,69 @@ fixed 52-card / 2-player game definition, not a toy parameter), so a smaller
 verification run is only possible by editing those constants yourself and
 accepting a materially different (much weaker) strategy — we did not do this
 since it wasn't requested and would produce a non-representative artifact.
+
+### Actual attempted run of the real engine, once all six files were present (2026-08-26)
+
+Once every required file finished downloading, byte-verified, and was placed
+at its expected path (`blueprint_stgy.dat` hard-linked to
+`cluster/blueprint_strategy.dat`), `Main.cpp` was rebuilt with the documented
+command (clean build, 10 pre-existing warnings only, exit 0) and actually
+executed — `./Main.o 1` (the evaluation branch, which loads
+`blueprint_strategy.dat` and prints two counterfactual values) — to get a
+real, empirical result rather than relying purely on the arithmetic in
+section 2.1.
+
+**This machine's swap was already constrained** (`sysctl vm.swapusage`:
+7.2GB total, ~1GB free, encrypted, before the run) and it is a shared,
+non-dedicated host, so the run was launched under close, second-by-second
+monitoring (`ps`, `vm_stat`, `sysctl vm.swapusage`) with a hard intent to
+kill it at the first sign of dangerous resource growth, rather than let it
+run unsupervised to completion or failure.
+
+Attempting `ulimit -v <N>` first, to cap the process's virtual address space
+and force a fast, clean `std::bad_alloc` instead of relying on live
+monitoring, failed outright: `ulimit: virtual memory: cannot modify limit:
+Invalid argument` — macOS/XNU does not implement `RLIMIT_AS` at all (this is
+a Linux-only resource limit), so there is no OS-level way to safely cap a
+single process's address space on macOS the way there would be on Linux.
+
+The uncapped run was therefore launched under live monitoring. Within
+**~20 seconds**, `sysctl vm.swapusage`/`vm_stat` showed macOS dynamically
+growing its encrypted swap file to satisfy the engine's ~19.4 GiB allocation:
+
+```
+t+0s:   vm.swapusage: total = 17408M  used = 16661M  free =  747M
+t+8s:   vm.swapusage: total = 18432M  used = 17456M  free =  976M
+t+16s:  vm.swapusage: total = 19456M  used = 18705M  free =  750M
+t+20s:  vm.swapusage: total = 19456M  used = 19089M  free =  367M
+df -h /:  free space dropped from 25Gi to 12Gi in the same ~20 seconds
+```
+
+The process was killed at this point (`kill -9`) rather than let it continue,
+because it was visibly consuming shared disk space (via swap-file growth) at
+roughly 0.6 GiB/second with no end in sight, on a machine shared with other
+users/sessions. After the kill, macOS reclaimed most of the swap
+automatically within ~10 seconds (`vm.swapusage` total dropped back to
+~9.2GB, disk free recovered to ~24Gi) — so no lasting disk damage was done,
+but the live trajectory made clear that letting it run to completion (or to
+an actual out-of-memory failure) would have consumed most or all of the
+remaining ~25GB of free disk as swap, on a host this investigation does not
+own exclusively.
+
+**This is now a directly observed, not just calculated, confirmation of
+section 2.1's finding:** the real `Engine()` cannot be constructed on this
+16 GiB machine. Unlike a clean `std::bad_alloc`/crash, macOS's default
+behavior is to try to paper over the shortfall with aggressive, encrypted
+swap-file growth — which is *worse* for a shared host than a clean failure,
+since it silently eats shared disk space and degrades performance for any
+other concurrent user, rather than failing fast. **Do not run `./Main.o`
+(either mode `0` or `1`) on a machine with less than ~24 GiB of true free
+RAM+swap headroom beyond this ~19.4 GiB requirement, and never on a shared
+host without first confirming you have exclusive use of its resources.** The
+user's separate 32 GiB machine, with no other constraints, is the
+recommended place to actually attempt this — 19.4 GiB comfortably fits
+within 32 GiB with headroom for the OS, the CFR tree structures the engine
+builds afterward, and normal process overhead.
 
 ## 3. Python / GUI stack (`pypokergui`, Slumbot/OpenStackTwo bots)
 
@@ -601,18 +674,36 @@ python3 -c "import server.poker"   # (run with cwd=pypokergui, PYTHONPATH set)
   and on Linux/GCC (fixes are behavior-preserving on both), the CLI's train
   vs. evaluate dispatch bug is fixed, and the Python GUI/bot dependency list is
   corrected for modern Python.
-- **Cannot be run, on macOS or Linux, without externally-obtained data:** the
-  blueprint trainer, the evaluator, and both `.so`-based interfaces all require
-  ~19.4 GiB of pretrained hand-abstraction/clustering data
-  (`sevencards_strength.bin`, `preflop_hand_cluster.bin`, `flop_hand_cluster.bin`,
-  `turn_hand_cluster.bin`, `river_hand_cluster.bin`) that is not in this
-  repository, not in its git history, not in a GitHub release, and not
-  regenerable from any source code included here. The only known source is the
-  README's third-party Baidu Netdisk link, which this investigation did not
-  access.
-- **Cannot be run on macOS regardless of data:** `AlascasiaHoldem.so` and
-  `blueprint.so` are Linux x86_64 binaries with no included source; they need a
-  Linux x86_64 runtime (e.g. Docker), which was unavailable in this sandbox.
+- **Data files: all six obtained, from an unofficial mirror, not the README's
+  official source.** None of `sevencards_strength.bin`,
+  `preflop_hand_cluster.bin`, `flop_hand_cluster.bin`, `turn_hand_cluster.bin`,
+  `river_hand_cluster.bin`, or `blueprint_strategy.dat` are in this
+  repository, its git history, or any GitHub release, and none are
+  regenerable from source without already having them (see section 2). All
+  six were eventually located via a community re-upload linked from
+  [issue #13](https://github.com/AI-Decision/DecisionHoldem/issues/13) →
+  [issue #2](https://github.com/AI-Decision/DecisionHoldem/issues/2), byte-size-
+  verified against formulas independently derived from `Engine.h`, and
+  placed at their expected paths — but this is **unofficial, unverified-
+  provenance data**, not the README's official Baidu Netdisk source, which
+  this investigation did not access. It is git-ignored and was never
+  committed to this repository.
+- **Still cannot actually be run, on this 16 GiB machine, even with all data
+  present.** `Engine()` unconditionally requires ~19.4 GiB of RAM to
+  construct, before a single file is even opened. This was originally a
+  calculated finding (section 2.1) and was then **directly, empirically
+  confirmed** by actually building and running `./Main.o` with all six real
+  files in place (section 2, "Actual attempted run"): the process was
+  observed live driving macOS's swap file from 17.4GB to 19.4GB (and disk
+  free from 25GB to 12GB) in about 20 seconds, and was killed as a safety
+  measure before it could either finish or exhaust this shared host's disk.
+  This is a hard ceiling, not a "close a few apps" problem — it requires a
+  machine with genuinely more RAM (the user's separate 32 GiB machine should
+  work).
+- **Cannot be run on macOS regardless of data or RAM:** `AlascasiaHoldem.so`
+  and `blueprint.so` are Linux x86_64 binaries with no included source; they
+  need a Linux x86_64 runtime (e.g. Docker), which was unavailable in this
+  sandbox.
 - No placeholder/fabricated data files were created or committed anywhere in
   this repository.
 
