@@ -1,3 +1,4 @@
-tornado==4.4.2
+tornado>=6.2,<7
 click==6.7
 PyYAML==3.12
+requests>=2.25

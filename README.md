@@ -44,6 +44,15 @@ These data can be obtained through Baidu Netdisk.
 Link: https://pan.baidu.com/s/157n-H1ECjEryAx0Z03p2_w
 Extraction code: q1pv
 ```
+> **Note:** these five files (~19 GiB total) are not stored in this
+> repository or its git history and are not available as a GitHub release —
+> the Baidu Netdisk link above is the only known source. Without them, none
+> of the commands below can produce a trained or evaluable strategy; they
+> will build and start, then fail predictably as soon as they try to load
+> `cluster/sevencards_strength.bin`. See [BUILD_NOTES.md](BUILD_NOTES.md) for
+> a full accounting of what was verified on macOS, exact expected file
+> sizes/formats, and additional build/runtime fixes applied for this
+> platform (all preserving the original Linux/GCC build).
 
 
 ## Training Blueprint Strategy
