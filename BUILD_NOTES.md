@@ -276,13 +276,53 @@ turn/river?** Yes, on both counts checked:
   into the depth-limited leaf) — validated by an assertion that a
   **flop-rooted** resolve (collapsing both the turn and river into one
   leaf) converges exactly like the turn-rooted one used in the main walk-
-  through. Run it yourself:
+  through.
+
+**Can this code be used to narrow what you believe the opponent's range to
+be, given their observed actions?** Yes — this falls directly out of
+machinery already present and already validated above, in both the real
+source and the demo:
+
+- *Real source*: nothing standalone exists for this in DecisionHoldem
+  itself — a repo-wide search for `belief`/`posterior`/`bayes`/`reach_prob`/
+  `update_range` finds no matches. But the *ingredient* is there implicitly:
+  any CFR traversal (blueprint training or real-time resolving alike) is
+  already carrying, at every node, each hand class's **reach probability** —
+  the prior range weight for that class multiplied by the probability its
+  own strategy assigned to every action taken to reach that node. That is
+  mathematically identical to an (unnormalized) Bayesian posterior
+  `P(class | actions seen so far)`; the code just never exposes or
+  renormalizes it as a standalone "belief" object, because the live engine
+  is never in a position to run at all on this build (see the RAM ceiling
+  above).
+- *This demo*: `narrow_range_given_actions(nodes, prior_range, street_idx,
+  observed_actions, observed_player)` exposes exactly that reweighting as a
+  standalone utility — replay an observed action sequence against a fixed,
+  already-solved strategy (blueprint's or a resolve's `ave_strategy`), and
+  get back the renormalized posterior distribution over the acting player's
+  hand classes. Validated with two scenarios sharing one prior (uniform):
+  hero bets and villain either flat-calls or shoves all-in. Both produce a
+  posterior measurably different from the uniform prior (i.e. the action
+  is genuine evidence, not a no-op), *and* the two lines produce
+  measurably different posteriors from each other (calling and shoving are
+  not the same evidence). In this toy game's particular equilibrium, calling
+  turns out to skew strongly toward the two strongest classes while shoving
+  is comparatively flatter/more balanced across classes (a believable
+  polarized-shoving-range shape, though this is a property of the toy
+  game's own solved equilibrium, not a general claim about the real
+  DecisionHoldem abstraction). Practically: you can chain this street by
+  street — feed the posterior from one street's actions in as the prior
+  range for the next street's resolve — since the demo's `resolve()` /
+  `narrow_range_given_actions()` both already take an arbitrary range as a
+  plain input, not just the uniform default.
+
+Run it yourself:
 
 ```bash
 python3 PokerAI/tools/depth_limited_search_demo.py
 ```
 
-Expect all `[PASS]` lines (5 of them) and exit code 0; the two `[FINDING]`
+Expect all `[PASS]` lines (7 of them) and exit code 0; the two `[FINDING]`
 lines above are explained in-line. This is **not** a recovery of the real
 `Depth_limit_Search.h` and does not touch the real cluster files, `Engine`,
 or `Bulid_Tree.h` — it is a clearly-labeled, from-scratch validation

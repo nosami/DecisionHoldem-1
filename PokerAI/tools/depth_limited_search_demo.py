@@ -79,6 +79,13 @@ WHAT IT DEMONSTRATES (each checked by an assertion at the bottom)
   5. The subgame is depth-limited: it does not expand the river street at
      all. Its leaf value is taken directly from the blueprint's own solved
      continuation value at that point (`leafnode`/`expolitvalues`'s role).
+  6. A solved strategy (blueprint or resolve) can be used the other
+     direction too: replaying an OBSERVED action sequence against it
+     narrows a prior opponent range into a posterior belief over that
+     opponent's hand class (`narrow_range_given_actions()`), and different
+     observed lines (e.g. calling vs. shoving) produce measurably different
+     posteriors. This is the same reach-probability reweighting `cfr()`
+     already does internally, exposed standalone.
 
 Run: python3 PokerAI/tools/depth_limited_search_demo.py
 """
@@ -485,6 +492,54 @@ def root_strategy(resolve_nodes, street_idx):
     return out
 
 
+def _node_avg_strategy(node):
+    """Normalize a node's `ave_strategy` accumulator into a probability
+    distribution over its actions (same readout `root_strategy()` and
+    `facing_bet_strategy()` use) -- this is the CFR "average strategy",
+    the object that actually converges to equilibrium, not the noisier
+    single-iteration regret-matched strategy."""
+    tot = sum(node.ave_strategy)
+    if tot > 1e-9:
+        return [x / tot for x in node.ave_strategy]
+    return [1.0 / len(node.actions)] * len(node.actions)
+
+
+def narrow_range_given_actions(nodes, prior_range, street_idx, observed_actions, observed_player):
+    """Bayesian range update: given a FIXED, already-solved strategy profile
+    (blueprint `ave_strategy`, or a resolve's), replay a sequence of actions
+    actually observed on this street and return the renormalized posterior
+    distribution over `observed_player`'s hand classes, P(class | actions).
+
+    This is the exact same reweighting `cfr()` already performs internally
+    at every tree edge for the acting player's own range -- see its
+    `new_p0_range`/`new_p1_range` lines, which multiply each hand class's
+    range weight by the probability that class's strategy assigns to the
+    action taken. Here it is exposed standalone and renormalized so the
+    result is directly readable as a posterior belief, not an internal
+    unnormalized reach probability. `observed_actions` is the full action
+    sequence for the street (both players' moves, in order); only
+    `observed_player`'s own decision points are used to reweight -- the
+    opponent's actions are not evidence about `observed_player`'s hand."""
+    range_ = list(prior_range)
+    history = tuple()
+    for a in observed_actions:
+        turn = whose_turn(history)
+        acts = legal_actions(history)
+        if turn == observed_player:
+            ai = acts.index(a)
+            new_range = []
+            for hc in range(N_CLASSES):
+                node = nodes.get((turn, hc, street_idx, history))
+                strat = _node_avg_strategy(node) if node is not None else [1.0 / len(acts)] * len(acts)
+                new_range.append(range_[hc] * strat[ai])
+            range_ = new_range
+        history = history + (a,)
+    total = sum(range_)
+    if total > 1e-12:
+        range_ = [r / total for r in range_]
+    return range_
+
+
 def main():
     print("=" * 78)
     print("1. Training the 'blueprint' over the FULL 3-street toy game "
@@ -677,6 +732,65 @@ def main():
           f"{other_hist[-1][1]:.3f}) -- confirming the resolve mechanism is not "
           "street-specific: you can supply an arbitrary opponent range and resolve at the "
           "flop, turn, or river alike.")
+
+    print()
+    print("=" * 78)
+    print("5. Narrowing a believed opponent range from OBSERVED actions "
+          "(Bayesian range update using the solved strategy as the likelihood)")
+    print("=" * 78)
+    # Given a solved (blueprint or resolved) strategy, an observed action is
+    # evidence about the hand that produced it: P(class | action) proportional
+    # to prior(class) * P(action | class). This is exactly the reweighting
+    # cfr() already does internally to its own ranges at every tree edge --
+    # narrow_range_given_actions() exposes it standalone and renormalizes so
+    # the output reads as a genuine posterior, not an internal unnormalized
+    # reach probability.
+    uniform_prior = [1.0] * N_CLASSES
+    # Hero bets; villain either just calls, or shoves all-in -- two different
+    # observed lines, each narrowing villain's (player 1's) range differently.
+    posterior_call = narrow_range_given_actions(
+        resolve_nodes_warm, uniform_prior, RESOLVE_STREET, ("bet", "call"), observed_player=1)
+    posterior_allin = narrow_range_given_actions(
+        resolve_nodes_warm, uniform_prior, RESOLVE_STREET, ("bet", "allin"), observed_player=1)
+
+    def fmt_range(r):
+        return ", ".join(f"class{hc}={p:.3f}" for hc, p in enumerate(r))
+
+    print(f"Prior (uniform):                 {fmt_range([1.0 / N_CLASSES] * N_CLASSES)}")
+    print(f"Posterior after hero bets, villain CALLS:   {fmt_range(posterior_call)}")
+    print(f"Posterior after hero bets, villain SHOVES:  {fmt_range(posterior_allin)}")
+
+    # (f) Both posteriors are valid distributions and are non-trivially
+    #     different from the uniform prior (i.e. observing an action actually
+    #     narrows the range instead of being a silent no-op).
+    for post in (posterior_call, posterior_allin):
+        s = sum(post)
+        assert abs(s - 1.0) < 1e-6, f"posterior does not sum to 1 ({s})"
+    max_shift_call = max(abs(p - 1.0 / N_CLASSES) for p in posterior_call)
+    max_shift_allin = max(abs(p - 1.0 / N_CLASSES) for p in posterior_allin)
+    assert max_shift_call > 0.01, "observing a call did not measurably narrow the range"
+    assert max_shift_allin > 0.01, "observing a shove did not measurably narrow the range"
+    print(f"[PASS] Both posteriors are valid distributions and each is measurably narrowed "
+          f"from the uniform prior (max shift: call={max_shift_call:.3f}, allin={max_shift_allin:.3f}).")
+
+    # (g) The two different observed actions should imply DIFFERENT beliefs
+    #     -- a shove and a flat call are not the same evidence, so narrowing
+    #     on one vs. the other must not collapse to the same posterior.
+    max_diff = max(abs(a - b) for a, b in zip(posterior_call, posterior_allin))
+    assert max_diff > 0.01, "calling and shoving produced indistinguishable posteriors"
+    print(f"[PASS] Calling vs. shoving produce distinguishable posteriors (max per-class "
+          f"difference {max_diff:.3f}) -- the update is actually sensitive to which action "
+          "was observed, not just that some action occurred.")
+    print("[NOTE] This uses the SAME strategy machinery already validated above (blueprint "
+          "ave_strategy / a resolve's), replayed against an observed action sequence instead "
+          "of trained against a fixed range. It answers 'can this code narrow what we believe "
+          "the opponent's range to be': yes, structurally -- CFR's reach-probability "
+          "propagation (cfr()'s new_p0_range/new_p1_range lines) already computes exactly "
+          "this Bayesian reweighting during training/resolving; this section exposes it as a "
+          "standalone belief-update utility usable between decision points. The real "
+          "DecisionHoldem source has no equivalent standalone utility (grep across the repo "
+          "for belief/posterior/bayes/reach_prob finds nothing) -- it only ever has this "
+          "quantity live, transiently, inside a resolve.")
 
     print()
     print("All checks passed. This demonstrates the INFERRED algorithm's mechanics "
