@@ -149,10 +149,25 @@ callable real-time-search entry point:
   `get_turn_cluster()` / `get_river_cluster()` lookups against the same
   cluster files from section 2), matched node-for-node against the
   corresponding blueprint subtree. While the action set still matches the
-  blueprint (`existmap`), it **warm-starts real-time regrets directly from
-  blueprint regrets**: `privatenode[j]->regret[k] = subblueprints[j]->averegret[k] / 10;`.
-  The instant actions diverge from the blueprint's abstraction (a genuine
-  "off-tree" bet size), a comment marks the transition — *"只要有一个节点动作不一样，
+  blueprint (`existmap`), it **warm-starts real-time regrets from the
+  blueprint's accumulated average-strategy sum**:
+  `privatenode[j]->regret[k] = subblueprints[j]->averegret[k] / 10;`. Despite
+  its name, `averegret` is **not** accumulated regret — `BlueprintMCCFR.h`
+  shows it is incremented every iteration as `treenode->averegret[i] +=
+  sigma[i]` (the *current strategy probability*, not a regret value), i.e.
+  it is what most CFR literature calls the `strategy_sum`/average-strategy
+  accumulator, misleadingly named. So this warm start literally means "seed
+  real-time regret-matching so it starts out biased toward whatever the
+  blueprint tended to play here," not "reuse the blueprint's regret." Note
+  also that `regret` itself *is* separately discounted elsewhere
+  (`treenode->regret[i] *= d;` in `dfs_discount()`), but the commented-out
+  `//treenode->averegret[i] *= d;` right next to it confirms `averegret` is
+  **not** discounted — it is a raw, ever-growing sum over the entire
+  blueprint training run, so `averegret[k]/10` can be very large in
+  absolute terms (see section 2.1.2 for a concrete demonstration of the
+  practical consequence of this). The instant actions diverge from the
+  blueprint's abstraction (a genuine "off-tree" bet size), a comment marks
+  the transition — *"只要有一个节点动作不一样，
   当前节点和子节点后悔值全0"* ("once one node's actions differ, this node and
   its children's regrets reset to zero") — and `addnode_bysubgame(...,
   offtreeact, treeact, ...)` splices in the new action fresh, unseeded.
@@ -188,6 +203,66 @@ itself most likely contained) is narrower than "everything":
    returns a real-time strategy for the current decision instead of the raw
    blueprint action. `Main.cpp` never calls any of this — it only calls
    `check_subgame()`/`getcfv_whole_holdem()` for offline blueprint evaluation.
+
+### 2.1.2 A reference implementation of the missing training loop
+
+`PokerAI/tools/depth_limited_search_demo.py` is a small, standalone,
+**original** Python program that implements what the missing
+`Depth_limit_Search.h` most plausibly did, per the simplification the user
+confirmed: **the caller supplies both players' ranges directly** (arbitrary
+probability-per-hand-class distributions), so DecisionHoldem's undisclosed
+"diverse opponent ranges" ensemble (section 2.1.0, item 2) is not needed —
+this reduces the problem to standard, published depth-limited CFR resolving
+(à la Brown & Sandholm's Modicum, arXiv:1809.03040), which the demo
+implements and validates end-to-end:
+
+- A tiny synthetic 3-street game (6 hand classes/player, `fold`/`call`/
+  `bet`/`allin`) stands in for the real 1,326-combo/5,000-bucket abstraction
+  (using the real one would require the ~20.8 GiB `Engine()` — see the RAM
+  caveat above — which this host cannot allocate).
+- Trains a "blueprint" over the full game with vanilla CFR.
+- Resolves just the last street given an **arbitrary supplied opponent
+  range** (deliberately different from the blueprint's own training
+  distribution), using a depth-limited leaf whose value is read from the
+  blueprint's own solved continuation — mirroring `leaf`/`leafnode`/
+  `expolitvalues` in `Node.h`.
+- Warm-starts on-tree regrets from the blueprint's `averegret` (accumulated
+  average-strategy sum, see above) divided by 10, exactly mirroring
+  `Bulid_Tree.h`'s formula, and resets off-tree actions (e.g. an extra bet
+  size the blueprint never had) to zero regret, exactly mirroring the
+  `existmap` branch.
+- Runs both a warm-started and a cold-started (all-zero-regret) resolve of
+  the identical subgame and validates, with `assert`s (not just printed
+  output), that: (a) both converge — average positive regret per iteration,
+  the textbook CFR guarantee, trends toward zero for both regardless of
+  starting point; (b) every resolved/blueprint strategy is a valid
+  probability distribution; (c) the resolve is genuinely range-sensitive
+  and game-theoretically sane (e.g. the strongest hand class folds less
+  than a weaker one when facing a bet); (d) the off-tree action trains from
+  scratch rather than crashing or being silently skipped.
+
+**A genuinely useful finding surfaced by this exercise**: because
+`averegret` is *not* discounted (only `regret` is, via `dfs_discount`'s `d`
+factor — see above), it grows unboundedly over the blueprint's entire
+training run, so `averegret/10` can seed real-time regret with a very large
+constant. At a *small* number of real-time iterations, this constant
+dominates the average-regret bound almost entirely regardless of whether it
+is actually a *good* prior for the specific range just supplied — the
+benefit of warm-starting is only asymptotically guaranteed (as more
+iterations dilute that fixed initial offset), not guaranteed at the small
+iteration budgets (~1,000–10,000) the paper describes for real-time play.
+Run it yourself:
+
+```bash
+python3 PokerAI/tools/depth_limited_search_demo.py
+```
+
+Expect all `[PASS]` lines and exit code 0; the two `[FINDING]` lines above
+are explained in-line. This is **not** a recovery of the real
+`Depth_limit_Search.h` and does not touch the real cluster files, `Engine`,
+or `Bulid_Tree.h` — it is a clearly-labeled, from-scratch validation
+artifact demonstrating the inferred algorithm's mechanics on a toy game
+small enough to run in milliseconds on any machine.
 
 ### 2.1 `Depth_limit_Search.h` — missing *source code*, not just data
 
@@ -306,18 +381,37 @@ documented here transparently rather than silently substituted, and it is
 never committed to this repository.
 
 **Hard RAM caveat found while investigating this path:** `Engine`'s
-constructor (`poker/Engine.h`) unconditionally `new`'s ~19.5 GiB of heap for
+constructor (`poker/Engine.h`) unconditionally `new`'s ~19.4 GiB of heap for
 the turn/flop/river cluster arrays *before* attempting to read any file —
-this happens regardless of whether the files exist. Only two of the six
-`ifstream` opens in `Engine::load()` (`sevencards_strength.bin`,
-`preflop_hand_cluster.bin`) check for open failure and throw a clean error;
-the other four (`turn`, `flop`, `river`, `preflopallin`) do not check, so a
-missing file there silently leaves the just-allocated heap arrays as
-uninitialized garbage rather than failing loudly. Combined with the ~19.5 GiB
-unconditional allocation, this means actually *constructing* `Engine()` —
-let alone running the trainer — is memory-intensive independent of the data
-question, and should not be attempted on a host with materially less than
-~24–32 GiB of free RAM.
+this happens regardless of whether the files exist, because the allocation
+size is driven by fixed constants (`turn_community_total`,
+`flop_community_total`, `river_community_total`), not by actual file size.
+On top of that, `seven_keys`/`seven_strengths` (the seven-card-strength
+lookup table) are declared as **static global C arrays**, not heap
+pointers — `ll seven_keys[133784560]` + `unsigned short
+seven_strengths[133784560]` — adding a further ~1.34 GiB that is reserved as
+soon as any binary linking `Engine.h` starts, independent of whether
+`Engine()` is ever constructed. Total: **`Engine()` construction requires
+~20.8 GiB of memory, minimum, before a single CFR node is allocated.**
+
+Only two of the six `ifstream` opens in `Engine::load()`
+(`sevencards_strength.bin`, `preflop_hand_cluster.bin`) check for open
+failure and throw a clean error; the other four (`turn`, `flop`, `river`,
+`preflopallin`) do not check, so a missing file there silently leaves the
+just-allocated heap arrays as uninitialized garbage rather than failing
+loudly.
+
+**This machine (`sysctl hw.memsize` = 17,179,869,184 bytes = exactly 16 GiB
+total, not just "free") cannot run `Engine()` at all, ever, regardless of how
+much RAM is freed up by closing other applications** — the ~20.8 GiB
+requirement exceeds the entire physical memory of this host by itself. This
+is a harder, more definitive blocker than "insufficient free RAM": it is a
+total-capacity ceiling. Running the real blueprint trainer, evaluator, or
+any depth-limited search wired directly into the real `Engine` class on this
+machine is impossible without either (a) a host with ≥24–32 GiB RAM, or
+(b) rewriting `Engine`'s cluster storage to be memory-mapped/on-disk rather
+than fully resident (a nontrivial source change, out of scope here since it
+wasn't reported as broken, just resource-heavy by design).
 
 ### Regenerating `blueprint_strategy.dat` yourself (full-scale, once you have the 5 files)
 
