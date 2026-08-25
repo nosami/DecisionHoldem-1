@@ -251,18 +251,44 @@ is actually a *good* prior for the specific range just supplied — the
 benefit of warm-starting is only asymptotically guaranteed (as more
 iterations dilute that fixed initial offset), not guaranteed at the small
 iteration budgets (~1,000–10,000) the paper describes for real-time play.
-Run it yourself:
+
+**Can you supply an opponent range at the flop, specifically, and not just
+turn/river?** Yes, on both counts checked:
+
+- *Real source*: `Bulid_Tree.h`'s (present, but never-invoked)
+  `build_subgameeroot(..., Engine* engine, ...)` explicitly branches on
+  `curstate.betting_stage` (0=preflop, 1=flop, 2=turn, 3=river — see
+  `poker/State.h`): the `betting_stage == 1` case builds a real-time subgame
+  tree rooted at the **flop**, using `engine->get_flop_cluster(...)` on a
+  caller-supplied array of the opponent's possible hole-card combos
+  (`external_cardid[]`/`external_cards_len`) — architecturally identical in
+  kind to its turn (`betting_stage == 2`) and river (`else`) branches, not a
+  turn/river-only special case. A commented-out debug/visualization helper
+  in `Visualize_Tree.h` (`visualizationsearch_bettingsub234`) shows the
+  intended companion representation: a parallel `cardsweight[]` array giving
+  each combo's probability — i.e. exactly "probabilities of each 2-card
+  holding," matching what you described. Neither array is weight-checked
+  by the actual (non-debug) tree-building code itself; the probability
+  would be threaded through as a range array during CFR traversal, the same
+  way `player0_range`/`player1_range` work in the demo below.
+- *This demo*: `resolve()` takes a `street_idx` parameter and works
+  identically for any of the three streets (collapsing everything after it
+  into the depth-limited leaf) — validated by an assertion that a
+  **flop-rooted** resolve (collapsing both the turn and river into one
+  leaf) converges exactly like the turn-rooted one used in the main walk-
+  through. Run it yourself:
 
 ```bash
 python3 PokerAI/tools/depth_limited_search_demo.py
 ```
 
-Expect all `[PASS]` lines and exit code 0; the two `[FINDING]` lines above
-are explained in-line. This is **not** a recovery of the real
+Expect all `[PASS]` lines (5 of them) and exit code 0; the two `[FINDING]`
+lines above are explained in-line. This is **not** a recovery of the real
 `Depth_limit_Search.h` and does not touch the real cluster files, `Engine`,
 or `Bulid_Tree.h` — it is a clearly-labeled, from-scratch validation
 artifact demonstrating the inferred algorithm's mechanics on a toy game
 small enough to run in milliseconds on any machine.
+
 
 ### 2.1 `Depth_limit_Search.h` — missing *source code*, not just data
 

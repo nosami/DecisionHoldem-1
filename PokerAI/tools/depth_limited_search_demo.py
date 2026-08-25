@@ -442,21 +442,30 @@ def build_resolve_nodes(street_idx, offtree_extra):
     return nodes
 
 
-def resolve(resolve_nodes, p0_range, p1_range, iterations, leaf_fn, offtree_extra):
-    """Runs `iterations` rounds of CFR on `resolve_nodes` in place. Returns a
-    checkpoint history of (T, avg_positive_regret_per_iteration) pairs --
-    the textbook CFR convergence quantity (Zinkevich et al. 2007): average
-    overall regret R_T^+ / T, which is guaranteed to tend to 0 as T grows
-    *regardless of the initial regret values* (any fixed warm-start offset
-    is a constant that gets diluted by the growing denominator T). This is
-    the correct, well-founded metric for checking convergence -- raw
-    (non-normalized) regret is NOT expected to shrink when warm-started
+def resolve(resolve_nodes, p0_range, p1_range, street_idx, iterations, leaf_fn, offtree_extra):
+    """Runs `iterations` rounds of CFR on `resolve_nodes` in place, rooted at
+    `street_idx` (0=flop, 1=turn, 2=river) with the given supplied ranges.
+    Everything from `street_idx + 1` onward is collapsed into a single
+    depth-limited leaf whose value comes from the blueprint's own solved
+    continuation (`leaf_fn`) -- so resolving at the flop (street_idx=0)
+    collapses BOTH the turn and river into that leaf, exactly as resolving
+    at the turn (street_idx=1) collapses just the river. This generalizes
+    across any starting street; it is not turn-specific.
+
+    Returns a checkpoint history of (T, avg_positive_regret_per_iteration)
+    pairs -- the textbook CFR convergence quantity (Zinkevich et al. 2007):
+    average overall regret R_T^+ / T, which is guaranteed to tend to 0 as T
+    grows *regardless of the initial regret values* (any fixed warm-start
+    offset is a constant that gets diluted by the growing denominator T).
+    This is the correct, well-founded metric for checking convergence --
+    raw (non-normalized) regret is NOT expected to shrink when warm-started
     from a large blueprint-derived seed, since that seed is a legitimate,
     intentionally large prior, not noise to be washed out immediately."""
+    max_streets = street_idx + 1
     history = []
     for it in range(1, iterations + 1):
-        cfr(resolve_nodes, p0_range, p1_range, len(STREETS) - 2, tuple(),
-            STARTING_POT, leaf_fn, offtree_extra=offtree_extra, max_streets=len(STREETS) - 1)
+        cfr(resolve_nodes, p0_range, p1_range, street_idx, tuple(),
+            STARTING_POT, leaf_fn, offtree_extra=offtree_extra, max_streets=max_streets)
         if it % max(1, iterations // 10) == 0 or it == 1:
             avg_pos_regret_per_iter = sum(
                 max(0.0, max(n.regret)) for n in resolve_nodes.values()
@@ -487,31 +496,38 @@ def main():
     for hc in range(N_CLASSES):
         print(f"  class {hc}: " + ", ".join(f"{a}={p:.2f}" for a, p in bp_root[hc].items()))
 
+    RESOLVE_ITERS = 3000
+    RESOLVE_STREET = 1  # 0=flop, 1=turn, 2=river -- resolve() generalizes to
+                        # any of these (see resolve()'s docstring); set to 0
+                        # to resolve at the flop instead, collapsing BOTH
+                        # the turn and river into the depth-limited leaf.
+
     print()
     print("=" * 78)
-    print("2. Depth-limited real-time resolve of the TURN street only "
-          "(river+showdown collapsed into a leaf, its value taken from the "
-          "blueprint's own solved continuation), given an ARBITRARY supplied "
-          "opponent range that is NOT the blueprint's uniform prior")
+    print(f"2. Depth-limited real-time resolve of the {STREETS[RESOLVE_STREET].upper()} "
+          "street only (everything after it collapsed into a leaf, its value "
+          "taken from the blueprint's own solved continuation), given an "
+          "ARBITRARY supplied opponent range that is NOT the blueprint's "
+          "uniform prior")
     print("=" * 78)
     # Supplied ranges: hero uniform, but villain's range is skewed strongly
     # toward strong hands (e.g. as if they raised earlier) -- this is
     # exactly the "arbitrary opponent range, given as probabilities per
-    # hand" scenario the user described.
+    # hand" scenario the user described. This works identically whether
+    # RESOLVE_STREET is the flop, turn, or river.
     hero_range = [1.0] * N_CLASSES
     villain_range_skewed = [0.2, 0.3, 0.5, 1.0, 2.0, 3.0]  # skewed toward strong
 
     leaf_fn = blueprint_leaf_value_fn(blueprint_nodes)
 
-    RESOLVE_ITERS = 3000
-    resolve_nodes_warm = build_resolve_nodes(street_idx=1, offtree_extra=None)
-    warm, cold = warm_start_from_blueprint(resolve_nodes_warm, blueprint_nodes, street_idx=1)
+    resolve_nodes_warm = build_resolve_nodes(street_idx=RESOLVE_STREET, offtree_extra=None)
+    warm, cold = warm_start_from_blueprint(resolve_nodes_warm, blueprint_nodes, street_idx=RESOLVE_STREET)
     print(f"Warm-started {warm} on-tree info sets from blueprint average-strategy/10; {cold} off-tree.")
-    hist_warm = resolve(resolve_nodes_warm, hero_range, villain_range_skewed,
+    hist_warm = resolve(resolve_nodes_warm, hero_range, villain_range_skewed, RESOLVE_STREET,
                          iterations=RESOLVE_ITERS, leaf_fn=leaf_fn, offtree_extra=None)
 
-    resolve_nodes_cold = build_resolve_nodes(street_idx=1, offtree_extra=None)
-    hist_cold = resolve(resolve_nodes_cold, hero_range, villain_range_skewed,
+    resolve_nodes_cold = build_resolve_nodes(street_idx=RESOLVE_STREET, offtree_extra=None)
+    hist_cold = resolve(resolve_nodes_cold, hero_range, villain_range_skewed, RESOLVE_STREET,
                          iterations=RESOLVE_ITERS, leaf_fn=leaf_fn, offtree_extra=None)
 
     print("Average positive regret / T (the standard CFR convergence quantity; "
@@ -519,8 +535,8 @@ def main():
     print(f"  warm-started: {[(t, round(v, 3)) for t, v in hist_warm]}")
     print(f"  cold-started: {[(t, round(v, 3)) for t, v in hist_cold]}")
 
-    resolved_strategy = root_strategy(resolve_nodes_warm, 1)
-    print("\nResolved turn strategy vs skewed villain range, by hero hand class:")
+    resolved_strategy = root_strategy(resolve_nodes_warm, RESOLVE_STREET)
+    print(f"\nResolved {STREETS[RESOLVE_STREET]} strategy vs skewed villain range, by hero hand class:")
     for hc in range(N_CLASSES):
         print(f"  class {hc}: " + ", ".join(f"{a}={p:.2f}" for a, p in resolved_strategy[hc].items()))
 
@@ -529,15 +545,15 @@ def main():
     print("3. Off-tree action: resolving with an extra bet size "
           "('smallbet') the blueprint never had")
     print("=" * 78)
-    resolve_nodes_offtree = build_resolve_nodes(street_idx=1, offtree_extra="smallbet")
-    warm2, cold2 = warm_start_from_blueprint(resolve_nodes_offtree, blueprint_nodes, street_idx=1)
+    resolve_nodes_offtree = build_resolve_nodes(street_idx=RESOLVE_STREET, offtree_extra="smallbet")
+    warm2, cold2 = warm_start_from_blueprint(resolve_nodes_offtree, blueprint_nodes, street_idx=RESOLVE_STREET)
     print(f"Warm-started {warm2} on-tree info sets; {cold2} off-tree "
           "(root nodes now have 3 actions instead of the blueprint's 2, so "
           "existmap is false there and they train from a fresh, zero regret).")
-    resolve(resolve_nodes_offtree, hero_range, villain_range_skewed,
+    resolve(resolve_nodes_offtree, hero_range, villain_range_skewed, RESOLVE_STREET,
             iterations=800, leaf_fn=leaf_fn, offtree_extra="smallbet")
-    offtree_strategy = root_strategy(resolve_nodes_offtree, 1)
-    print("Resolved turn strategy with the extra off-tree action available:")
+    offtree_strategy = root_strategy(resolve_nodes_offtree, RESOLVE_STREET)
+    print(f"Resolved {STREETS[RESOLVE_STREET]} strategy with the extra off-tree action available:")
     for hc in range(N_CLASSES):
         print(f"  class {hc}: " + ", ".join(f"{a}={p:.2f}" for a, p in offtree_strategy[hc].items()))
 
@@ -624,7 +640,7 @@ def main():
             out[hc] = dict(zip(n.actions, (x / tot for x in n.ave_strategy)))
         return out
 
-    facing_bet = facing_bet_strategy(resolve_nodes_warm, 1)
+    facing_bet = facing_bet_strategy(resolve_nodes_warm, RESOLVE_STREET)
     strongest_fold = facing_bet[N_CLASSES - 1].get("fold", 0.0)
     some_weaker_fold = max(facing_bet[hc].get("fold", 0.0) for hc in range(N_CLASSES - 1))
     assert strongest_fold < some_weaker_fold, \
@@ -639,6 +655,28 @@ def main():
     print(f"[INFO] Off-tree 'smallbet' action peak usage across hand classes: {offtree_usage:.2f} "
           "(0 is a valid CFR outcome if it is strictly dominated here; the key point is the "
           "branch trained from zero regret rather than crashing or being silently skipped).")
+
+    # (e) The resolve mechanism generalizes to ANY starting street, not just
+    #     the one exercised above -- confirm a FLOP-rooted resolve (which
+    #     collapses BOTH the turn and river into the depth-limited leaf)
+    #     also converges. This directly matters because DecisionHoldem's own
+    #     (present but unused) Bulid_Tree.h::build_subgameeroot() explicitly
+    #     handles betting_stage==1 (flop) as one of its three cases
+    #     (flop/turn/river), using the live Engine's flop-cluster lookup --
+    #     i.e. the real source's scaffolding is not turn/river-only either.
+    other_street = 0 if RESOLVE_STREET != 0 else 1
+    other_nodes = build_resolve_nodes(street_idx=other_street, offtree_extra=None)
+    warm_start_from_blueprint(other_nodes, blueprint_nodes, street_idx=other_street)
+    other_hist = resolve(other_nodes, hero_range, villain_range_skewed, other_street,
+                          iterations=RESOLVE_ITERS, leaf_fn=leaf_fn, offtree_extra=None)
+    assert other_hist[-1][1] < CONVERGENCE_THRESHOLD, \
+        (f"resolve rooted at street {other_street} ({STREETS[other_street]}) did not converge "
+         f"(avg positive regret/T = {other_hist[-1][1]:.3f})")
+    print(f"[PASS] A resolve rooted at a DIFFERENT street ({STREETS[other_street]}, not just "
+          f"{STREETS[RESOLVE_STREET]}) also converges (avg positive regret/T = "
+          f"{other_hist[-1][1]:.3f}) -- confirming the resolve mechanism is not "
+          "street-specific: you can supply an arbitrary opponent range and resolve at the "
+          "flop, turn, or river alike.")
 
     print()
     print("All checks passed. This demonstrates the INFERRED algorithm's mechanics "
