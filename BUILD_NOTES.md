@@ -1057,6 +1057,36 @@ run infeasible on this 16GiB machine on its own.
   both fully removed afterward — `poker/Engine.h` is back to its original,
   unconditional river-loading code, verified byte-identical via `git diff`.
 
+### 9.1 Follow-up: "just let it run using swap" — declined, with the math
+
+Asked next: rather than skip river data, why not just let the full,
+unmodified engine run and let macOS grow swap to cover the shortfall? This
+was checked quantitatively before touching anything, and declined, because
+the shortfall is not marginal — it's arithmetically guaranteed to exceed
+this shared host's available disk, calculated at the time of asking:
+
+| Requirement | Size |
+|---|---|
+| `Engine()` cluster tables (section 2/6) | ~19.4 GiB |
+| `blueprint_strategy.dat` in-memory tree (file size; live tree likely larger, section 8.1) | ~15.0 GiB |
+| **Minimum total** | **~34.4 GiB** |
+| Physical RAM on this machine | 16 GiB |
+| **Minimum swap growth required** | **~18.4 GiB** |
+| Disk free available for swap at the time of asking | 13 GB |
+| **Shortfall** | **~5.4 GB short — before counting any additional memory the recursive CFV computation itself needs on top of just loading the data** |
+
+This is worse than the previous live-monitored attempt (section 2's "Actual
+attempted run"), which had 25GB of free disk to work with and *still* had
+to be killed as a precaution at 12GB free/19.4GB swap used, well before
+finishing even the loading phase. With only 13GB of headroom available this
+time, letting the process run would not merely risk running low on disk —
+it is expected to actually exhaust it, on a host shared with other users,
+which could disrupt more than just this experiment. For this reason the run
+was not attempted. The only two changes that would make this attemptable
+are (a) more free disk/RAM on this shared host, or (b) running on the
+user's separate 32GB machine (see section 2/6), where the ~34.4GiB minimum
+requirement fits far more comfortably within RAM + ordinary swap headroom.
+
 ## 10. Appendix: complete binary-file inventory
 
 A consolidated list of every binary (non-source-code) file relevant to this
