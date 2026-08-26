@@ -38,3 +38,4 @@ PokerAI/tools/split_cluster_file
 PokerAI/tools/test_per_file_cluster_load
 PokerAI/tools/validate_split_against_monolith
 PokerAI/tools/time_per_file_river_load
+PokerAI/tools/test_villain_weight_distribution

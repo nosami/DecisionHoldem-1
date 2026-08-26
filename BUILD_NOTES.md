@@ -3985,3 +3985,106 @@ binaries — `.cpp` sources are the tracked artifacts):
 earlier draft of this section's validator that used `turn_hand_cluster.bin`
 + `Engine` as ground truth before the real river file became accessible,
 is also kept as a secondary reference tool.)
+
+## 32. Answering three follow-up questions about the per-hole-hand file split: why not "one file per river card", how many files total, and whether one file already covers every river possibility — plus real (not assumed) villain-weight concentration data
+
+**"I was thinking 47 files, one for each possible river card" — why the
+file isn't organized that way.** Checked `Engine.h`'s own
+`get_river_cluster()` precisely:
+```cpp
+unsigned char comm[] = { com[0], com[1], com[2], com[3], com[4] };
+sortp(comm, 5);  // <-- all 5 board cards sorted together
+unsigned rank = find_river(a1*52+a2,
+    comm[0]*7311616 + comm[1]*140608 + comm[2]*2704 + comm[3]*52 + comm[4]);
+```
+The key encodes **all 5 sorted board cards together**, not "4 fixed cards
++ a river digit appended." Verified numerically (Python): for a fixed
+flop+turn (4 cards) with only the 5th (river) card varying across its
+~44-48 legal values, the resulting keys are **NOT contiguous** in sorted
+order — gaps between consecutive keys ranged from 1 to over 7,000,000 in
+a test case, because where the river card's value lands in the 5-card
+sort order (and therefore which digit position it occupies in the key)
+depends on its rank relative to the other 4 cards, not just its identity.
+So a per-river-card split of a single hole-hand's data is not a natural
+partition of this file format — there's no clean "47 contiguous rows" to
+carve out.
+
+**How many files in total for the river data, then?** **1326** — already
+built and validated in section 31: one file per **hole-hand** (2-card
+combo), not per board card at all. This was correctly derived from
+`Engine.h`'s own load loop (`for i in 0..50: for j in i+1..51`, `i<j`
+pairs over 52 cards, giving C(52,2) = 1326).
+
+**"Doesn't one file contain the entire strategy for any river
+possibility?" — yes, confirmed, and this is the key insight.** Each of
+the 1326 per-hole-hand files contains **all 2,118,760 possible 5-card
+board completions** (`C(50,5)`, every combination of the 50 cards not in
+that hole-hand) — not just completions of one particular flop+turn. So
+for a FIXED hole-hand, a single file already holds the trained cluster
+id for literally every board that hand could ever face, on every street,
+including every possible river card for every possible flop+turn. This
+directly confirms the user's reasoning: the partition axis that matters
+is the **hole-hand** (1326 files, section 31), not the river card; within
+one hole-hand's file, all river possibilities for all flop/turn
+combinations are already present as different entries in the same file
+— there is no additional per-street splitting needed or possible with
+this format.
+
+**Real (not assumed) measurement of villain-weight concentration.** The
+user next asked whether many `.weight` values would be close to zero
+after real narrowing. Rather than reasoning about this, wrote
+`PokerAI/tools/test_villain_weight_distribution.cpp`, which `#include`s
+`dh_native_ai.cpp` directly (that file defines no `main()`, so this
+reuses the exact real production code — `restart_game()`,
+`opp_take_action()`, `Next_stage()`, `narrow_villain_range_preflop/postflop()`
+— with zero reimplementation) and drives two synthetic hands through the
+real extern "C" entry points the live Slumbot server calls, inspecting
+`g.villain_range`'s actual resulting weight distribution after each real
+narrowing step (including real `LiveResolver` best-response runs, not
+mocked).
+
+**Important side-finding while building this:** confirmed
+`narrow_villain_range_postflop()` only fires for actions matching
+`LiveResolver`'s reduced fold/call/allin abstraction — an arbitrary bet
+size like `"raise 800"` has no corresponding tree node and is silently
+skipped (logged via `[DH_RANGE_MODEL] ... skipped`). Had to switch the
+test's postflop actions to `"allin"`/`"call"` to actually exercise real
+narrowing; this is a genuine, already-known limitation of the postflop
+narrowing abstraction (documented in that function's own header
+comment), not a new bug.
+
+**Measured results** (hero dealt A-K offsuit, arbitrary but reasonable;
+1225→1081→1035 combos tracked as preflop→flop→turn board-collision
+pruning removes blocked combos, matching section 32's earlier math):
+
+| Scenario | Combos for 50% of mass | Combos for 90% of mass | Combos < 1% of uniform's fair share |
+|---|---|---|---|
+| Fresh uniform prior | 613/1225 (50.0%) | 1103/1225 (90.0%) | 0/1225 (0%) |
+| After 1 preflop raise narrowing | 316/1225 (25.8%) | 808/1225 (66.0%) | 12/1225 (1.0%) |
+| [A] After 1 FLOP all-in narrowing | 58/1081 (5.4%) | 581/1081 (53.7%) | 21/1081 (1.9%) |
+| [B] After FLOP call + TURN all-in (2 rounds) | **3/1035 (0.3%)** | **161/1035 (15.6%)** | 67/1035 (6.5%) |
+
+**The user's assumption is confirmed, and more strongly than expected
+after a strong signal.** A single informative action (an all-in) already
+concentrates roughly half the probability mass onto a few dozen-to-few
+combos; two compounding real narrowing rounds (a call then an all-in)
+left just **3 combos carrying half the mass** and only **161 of 1035
+combos (15.6%) needed for 90% of the mass** — the other ~84% of tracked
+combos combined carry only 10% of the probability. This is a real,
+measured result from actual production narrowing code, not a synthetic
+assumption, and it directly supports why a weight-thresholded partial
+river-cluster loader (loading only the files for combos carrying, say,
+99% of the mass) could plausibly need far fewer than the full 990-1081
+board-collision-pruned combos in practice — though the exact right
+threshold (and its effect on CFR best-response correctness if the
+dropped tail is treated as zero-weight rather than folded into a
+residual bucket) remains undesigned, consistent with section 31's
+closing note.
+
+New file: `PokerAI/tools/test_villain_weight_distribution.cpp` (kept as
+a permanent reference/regression tool; reuses real production narrowing
+code rather than reimplementing it). Build/run (from `PokerAI/`):
+```
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_villain_weight_distribution tools/test_villain_weight_distribution.cpp
+./tools/test_villain_weight_distribution
+```
