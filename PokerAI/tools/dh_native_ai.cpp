@@ -79,6 +79,7 @@
 //###############################################################################
 #include "../tree/RealtimeSearch.h"
 #include "../tree/BlueprintReader.h"
+#include "../tree/PreflopCache.h"
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -147,6 +148,47 @@ struct LiveGame {
 };
 
 LiveGame g;
+
+// Optional, purely-additive fast path for preflop blueprint lookups: a
+// small (~750KB, measured) in-memory cache of every preflop-only node's
+// trained strategy, built ahead of time by
+// PokerAI/tools/build_preflop_cache.cpp (see that file and
+// PokerAI/tree/PreflopCache.h for the full design). Loaded once here, at
+// dylib load time, alongside the (much larger) global `engine` object
+// this file already constructs eagerly the same way. If the cache file
+// is missing or fails to load for any reason, `g_preflop_cache_loaded`
+// stays false and every preflop lookup below transparently falls back to
+// BlueprintReader's original per-decision disk walk (slower -- 6-10s per
+// BUILD_NOTES.md section 23 -- but exactly as correct as before this
+// feature existed). This can never make a decision WORSE or WRONG, only
+// slower on a cache miss/failure.
+PreflopCache::Cache g_preflop_cache;
+bool g_preflop_cache_loaded = false;
+
+struct PreflopCacheLoader {
+	PreflopCacheLoader() {
+		try {
+			g_preflop_cache.load("cluster/preflop_blueprint_cache.bin");
+			g_preflop_cache_loaded = true;
+			std::fprintf(stderr,
+				"[DH_PREFLOP_CACHE] loaded %zu preflop nodes from "
+				"cluster/preflop_blueprint_cache.bin -- preflop lookups will "
+				"use this in-memory cache instead of walking the ~16GB "
+				"blueprint file per decision\n",
+				g_preflop_cache.nodes.size());
+		} catch (const std::exception& e) {
+			g_preflop_cache_loaded = false;
+			std::fprintf(stderr,
+				"[DH_PREFLOP_CACHE] not available (%s) -- falling back to "
+				"direct blueprint disk-walk lookups for every preflop decision "
+				"(correct, but 6-10s slower per decision; run "
+				"PokerAI/tools/build_preflop_cache once to build the cache and "
+				"remove this slowdown)\n",
+				e.what());
+		}
+	}
+};
+PreflopCacheLoader g_preflop_cache_loader;
 
 int committed_this_street(int slot) {
 	return g.stack_at_street_start[slot] - g.stack[slot];
@@ -274,21 +316,40 @@ void prune_villain_range_for_board() {
 }
 
 // Bayesian-narrows villain_range using the REAL trained preflop blueprint:
-// looks up, in ONE disk walk (see BlueprintReader::lookup_preflop_strategy_
-// all_clusters()), every one of the 169 preflop hand clusters' probability
-// of taking `observed_byte` at the node the opponent just acted from (i.e.
+// looks up every one of the 169 preflop hand clusters' probability of
+// taking `observed_byte` at the node the opponent just acted from (i.e.
 // g.preflop_action_path AS IT STOOD BEFORE this action was appended), then
 // multiplies each tracked combo's weight by its own cluster's probability
-// and renormalizes. Every failure mode (file/lookup problems, an
-// unrecognized action byte, a degenerate all-zero result) is caught and
-// logged, leaving villain_range unchanged for this action only -- never a
-// crash, never fabricated data, matching resolve_preflop_decision()'s own
-// established error-handling style.
+// and renormalizes. Tries the in-memory PreflopCache first (microseconds,
+// see PreflopCache.h) and falls back to a direct BlueprintReader disk walk
+// (6-10s, see BUILD_NOTES.md section 23) only if the cache is unavailable
+// or doesn't contain this exact path -- both paths are numerically
+// identical (validated in tools/test_preflop_cache_validation.cpp), so this
+// fallback is purely a speed difference, never a correctness difference.
+// Every failure mode (file/lookup problems, an unrecognized action byte, a
+// degenerate all-zero result) is caught and logged, leaving villain_range
+// unchanged for this action only -- never a crash, never fabricated data,
+// matching resolve_preflop_decision()'s own established error-handling
+// style.
 void narrow_villain_range_preflop(unsigned char observed_byte) {
 	if (!g.preflop_path_confident) return;
 	try {
-		BlueprintReader::AllClustersResult res = BlueprintReader::lookup_preflop_strategy_all_clusters(
-			"cluster/blueprint_strategy.dat", g.preflop_action_path);
+		BlueprintReader::AllClustersResult res;
+		bool used_cache = false;
+		if (g_preflop_cache_loaded) {
+			try {
+				res = PreflopCache::lookup_preflop_strategy_all_clusters(g_preflop_cache, g.preflop_action_path);
+				used_cache = true;
+			} catch (const std::exception&) {
+				// Cache miss/failure for this specific path -- fall through
+				// to the disk walk below, exactly as if the cache weren't
+				// loaded at all.
+			}
+		}
+		if (!used_cache) {
+			res = BlueprintReader::lookup_preflop_strategy_all_clusters(
+				"cluster/blueprint_strategy.dat", g.preflop_action_path);
+		}
 		int idx = -1;
 		for (size_t i = 0; i < res.actionstr.size(); i++)
 			if (res.actionstr[i] == observed_byte) { idx = (int)i; break; }
@@ -487,11 +548,16 @@ std::string resolve_decision() {
 // blueprint (cluster/blueprint_strategy.dat, via the new targeted
 // BlueprintReader.h -- NOT the original Save_load.h full-tree loader) for
 // hero's actual average strategy at this exact decision node, instead of
-// the "always call" placeholder. Falls back to that placeholder, for this
-// decision only, if the lookup fails for ANY reason (file missing/
+// the "always call" placeholder. Tries the in-memory PreflopCache first
+// (microseconds; see PreflopCache.h/tools/build_preflop_cache.cpp) and
+// falls back to a direct BlueprintReader disk walk (6-10s, see
+// BUILD_NOTES.md section 23) only if the cache is unavailable or doesn't
+// contain this exact path -- both are numerically identical (validated in
+// tools/test_preflop_cache_validation.cpp), so this is purely a speed
+// difference. Falls back further to the "always call" placeholder, for
+// this decision only, if BOTH lookups fail for any reason (file missing/
 // unreadable, path inconsistent with the tree, non-positive strategy sum,
-// etc.) -- see BUILD_NOTES.md for the full honest writeup, including this
-// reader's unvalidated-from-this-sandbox status.
+// etc.) -- see BUILD_NOTES.md for the full honest writeup.
 std::string resolve_preflop_decision() {
 	if (!g.preflop_path_confident) {
 		return "call"; // an earlier raise this street didn't match the trained
@@ -499,8 +565,22 @@ std::string resolve_preflop_decision() {
 	}
 	try {
 		int hand_cluster = engine->get_preflop_cluster(g.my_hole);
-		BlueprintReader::LookupResult res = BlueprintReader::lookup_preflop_strategy(
-			"cluster/blueprint_strategy.dat", g.preflop_action_path, hand_cluster);
+		BlueprintReader::LookupResult res;
+		bool used_cache = false;
+		if (g_preflop_cache_loaded) {
+			try {
+				res = PreflopCache::lookup_preflop_strategy(g_preflop_cache, g.preflop_action_path, hand_cluster);
+				used_cache = true;
+			} catch (const std::exception&) {
+				// Cache miss/failure for this specific path -- fall through
+				// to the disk walk below, exactly as if the cache weren't
+				// loaded at all.
+			}
+		}
+		if (!used_cache) {
+			res = BlueprintReader::lookup_preflop_strategy(
+				"cluster/blueprint_strategy.dat", g.preflop_action_path, hand_cluster);
+		}
 
 		int total_pot_before = (20000 - g.stack[0]) + (20000 - g.stack[1]);
 		int last_bigbet_before = std::max(20000 - g.stack[0], 20000 - g.stack[1]);

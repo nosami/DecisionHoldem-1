@@ -25,3 +25,6 @@ PokerAI/test_blueprint_root_read
 PokerAI/tools/test_blueprint_root_read
 PokerAI/test_realtime_search_flop
 PokerAI/test_realtime_search_chain
+PokerAI/tools/build_preflop_cache
+PokerAI/tools/test_preflop_cache_validation
+PokerAI/tools/test_preflop_cache_timing

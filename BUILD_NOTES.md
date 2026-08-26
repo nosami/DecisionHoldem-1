@@ -3275,3 +3275,134 @@ Local SSD (`/Users/jason/dh_local_data/`) now holds ~18.7GB total
 before the move (post-move: ~72GB free), so ample headroom remained.
 No functional change to the app: symlink targets changed, not the
 `PokerAI/cluster/` paths the code reads, so no source changes were needed.
+
+## 27. New feature: in-memory preflop blueprint cache — replaces the per-decision 6-10s disk walk with a microsecond in-memory lookup
+
+**Motivation.** Section 23 documented (and measured) that every live preflop
+decision (`resolve_preflop_decision()`) and every preflop opponent-range
+narrowing step (`narrow_villain_range_preflop()`, added in section 25) calls
+`BlueprintReader::lookup_preflop_strategy[_all_clusters]()`, which re-walks
+`cluster/blueprint_strategy.dat` (16.1GB) **from the root, every single
+time**. `cluster/blueprint_strategy.dat` is **one single file holding the
+entire trained game tree — preflop AND every postflop street — serialized
+depth-first, all in one blob.** At almost every preflop node, the
+first-listed sibling action is `'l'` (call/limp) — the action that closes
+preflop betting and opens into a large nested postflop subtree. Reaching any
+later-listed sibling (a raise, an all-in) requires `skip_subtree()` to seek
+past that entire postflop subtree first. Measured cost: 6-10s per lookup on
+local SSD, repeating on every preflop decision/narrowing step in a hand.
+
+**Why the preflop-only region is small enough to cache** (verified, not
+assumed): `State.h`'s `legal_actions()` caps preflop raises at `n_raises < 2`
+for pot-fraction raises and further gates raise availability by
+`cur_round_action_num`; combined with the fixed 20000-chip stacks/blinds,
+the preflop-only action tree (everything before the first flop chance-node
+marker) is small and finite. A one-time DFS walk of the real blueprint file,
+recording only preflop-reachable nodes and skipping (not reading) every
+postflop subtree along the way, found:
+
+| Metric | Measured value |
+|---|---|
+| Distinct preflop-only nodes | 186 |
+| Max depth | 5 |
+| Postflop subtrees skipped past (not read) | 92 |
+| Cache file size | 753,008 bytes (~0.75MB) |
+| One-time build wall-clock cost | ~14.6s |
+
+This is not "loading the 16GB blueprint into memory" — the source file stays
+exactly as-is on disk, untouched; postflop data is never duplicated or
+cached, only ever seeked past exactly as before. The cache is a ~750KB table
+of 186 small entries (per-cluster, per-action trained probabilities).
+
+**New files:**
+- `PokerAI/tools/build_preflop_cache.cpp` — one-time DFS-walk tool. Reuses
+  the existing, already-validated `BlueprintReader::read_node_header()` /
+  `skip_subtree()` primitives with no format changes to the source blueprint
+  file. Writes `cluster/preflop_blueprint_cache.bin` (custom compact binary
+  format: int32 magic/version/clusterlen/node_count header, then per node:
+  path_len+path bytes, action_len+actionstr bytes, then 169×action_len
+  doubles of normalized probabilities).
+  - **Regenerate with:**
+    ```
+    cd PokerAI
+    g++ -std=c++17 -O2 -o tools/build_preflop_cache tools/build_preflop_cache.cpp
+    ./tools/build_preflop_cache
+    ```
+  - Only needs to be re-run if `cluster/blueprint_strategy.dat` itself
+    changes (e.g. a different/retrained blueprint file). Output (186 nodes,
+    753,008 bytes) confirmed identical across repeat runs against the
+    current blueprint file.
+- `PokerAI/tree/PreflopCache.h` — in-memory loader (`PreflopCache::Cache`,
+  reads the cache file once into a `std::unordered_map<std::string, Entry>`
+  keyed by raw action-path bytes) plus two adapter functions
+  (`lookup_preflop_strategy()` / `lookup_preflop_strategy_all_clusters()`)
+  returning the exact same `BlueprintReader::LookupResult` /
+  `AllClustersResult` types the disk-walking functions already use. Every
+  lookup function throws (never silently returns wrong data) on cache-miss,
+  format problems, or a degenerate (all-zero) strategy row — callers must
+  catch and fall back to the disk-walking functions, matching this file's
+  established never-fabricate error-handling style.
+- `PokerAI/tools/test_preflop_cache_validation.cpp` — standalone correctness
+  gate. Pulls a real, varied sample of 16 action paths directly out of the
+  generated cache (root + 3 paths at each of depths 1-5 — guaranteed to
+  actually exist in the trained tree, never synthetic) and compares both
+  all-clusters and single-cluster (5 sample clusters: 0/42/84/100/168)
+  lookups between the cache and a direct `BlueprintReader` disk walk for
+  exact numerical equality. **Result against the real blueprint: 16/16
+  all-clusters checks passed, 80/80 single-cluster checks passed, 0
+  mismatches (~11m44s wall time, dominated by the 96 real disk-walk
+  lookups this comparison requires — the cache side of each comparison is
+  effectively instantaneous).**
+  - Run with: `g++ -std=c++17 -O2 -o tools/test_preflop_cache_validation tools/test_preflop_cache_validation.cpp && ./tools/test_preflop_cache_validation` (from `PokerAI/`).
+- `PokerAI/tools/test_preflop_cache_timing.cpp` — standalone timing
+  benchmark, measuring the actual before/after cost this feature changes
+  (not just asserting correctness). Times a single real
+  `BlueprintReader::lookup_preflop_strategy_all_clusters()` disk-walk call
+  and 10,000 repeated `PreflopCache::lookup_preflop_strategy_all_clusters()`
+  in-memory calls for the same real action path, at each depth 0-5.
+  **Measured on this machine:**
+
+  | path depth | disk-walk (ms) | cache lookup (ms, avg of 10,000) | speedup |
+  |---|---|---|---|
+  | 0 (root) | 0.1 | 0.003 | 45x |
+  | 1 | 9,336.9 | 0.0022 | ~4,170,000x |
+  | 2 | 9,799.4 | 0.0025 | ~3,920,000x |
+  | 3 | 10,151.2 | 0.0024 | ~4,290,000x |
+  | 4 | 10,328.1 | 0.0024 | ~4,250,000x |
+  | 5 | 8,318.3 | 0.0023 | ~3,620,000x |
+
+  Root-node cost is trivially small either way (no sibling subtree to skip
+  first); every non-root preflop lookup — i.e. every real in-hand decision
+  after the very first action — drops from ~8-10 seconds to low
+  single-digit **microseconds**.
+  - Run with: `g++ -std=c++17 -O2 -o tools/test_preflop_cache_timing tools/test_preflop_cache_timing.cpp && ./tools/test_preflop_cache_timing` (from `PokerAI/`).
+
+**Rewiring in `dh_native_ai.cpp`:** a global `PreflopCache::Cache
+g_preflop_cache` is loaded once, at dylib load time (via a small
+`PreflopCacheLoader` global's constructor, alongside the existing eager
+`engine` object this file already constructs the same way), inside a
+try/catch that leaves `g_preflop_cache_loaded = false` and logs to stderr on
+any failure. Both `resolve_preflop_decision()` and
+`narrow_villain_range_preflop()` now try the in-memory cache first (only if
+it loaded successfully) and transparently fall back to the original
+`BlueprintReader` disk-walk call — for that lookup only — on a cache miss
+or any other exception. **This is purely additive**: the original
+disk-walking `BlueprintReader.h` functions are completely untouched and
+remain the correctness reference / fallback; if the cache file is ever
+missing, stale, or fails to load, behavior is functionally identical to
+before this feature existed (just slower again), never wrong.
+
+**Rebuilt `dh_native_ai.dylib`** (same command as section 17): compiled
+clean (only one pre-existing, unrelated `-Wunused-parameter` warning in
+`State.h`, not touched by this change); confirmed all 4 required ABI
+symbols still exported via `nm -gU dh_native_ai.dylib`
+(`_Next_stage`, `_getdecision`, `_opp_take_action`, `_restart_game`).
+
+**Not committed** (like the other multi-file cluster artifacts):
+`cluster/preflop_blueprint_cache.bin` itself — it's a generated data
+artifact, regenerable in ~15s from the (already-present) blueprint file via
+the command above, not source. Covered by the existing
+`PokerAI/cluster/*` `.gitignore` rule. The three new extensionless compiled
+tool binaries (`build_preflop_cache`, `test_preflop_cache_validation`,
+`test_preflop_cache_timing`) are individually gitignored, matching the
+existing pattern for this repo's other locally-built diagnostic tools.
