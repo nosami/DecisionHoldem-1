@@ -1717,3 +1717,284 @@ real published real-time-search technique, running end-to-end on this host
 in well under a second per resolve and comfortably within its RAM budget —
 not a recovery of DecisionHoldem's specific proprietary algorithm, and not
 claimed to produce the same decisions the original binary would.
+
+## 16. Extending the original real-time search to real turn/river chaining
+
+Section 15's `FlopResolver` stops the instant flop betting ends and estimates
+the continuation value with a turn-cluster leaf model. This section adds a
+second, independent resolver, `StreetChainResolver` (`PokerAI/tree/RealtimeSearch.h`),
+that instead **deals real turn and river cards as genuine chance nodes and
+plays the hand all the way to an exact showdown** via `Engine::compute_winner()`
+— i.e. no leaf-value approximation at all past the flop.
+
+### A correctness bug found and fixed while building this
+
+`Engine::compute_winner()`/`find_strength()` does not fail silently on a
+hash-table miss — it does `cout << "error hand seven cards..."; throw
+exception();`. Building `StreetChainResolver` surfaced two related bugs:
+
+1. **`FlopResolver::terminal_leaf` (section 15, already committed) never
+   checked that hero's and villain's hole cards don't share a card.**
+   Fixed by adding a new `hands_compatible(a, b)` helper and calling it
+   before scoring a hero/villain pair.
+2. **A card-collision check that used `reach[player][hand] == 0.0` as a
+   proxy for "this hand is impossible" is unsafe.** Reach values are also
+   driven to exactly 0.0 by ordinary CFR strategy convergence, for reasons
+   having nothing to do with card collisions. `StreetChainResolver`'s
+   showdown path was fixed to instead call an explicit
+   `collides_with_board()` check on both hero's and villain's hole cards
+   against the board, independent of reach magnitude, before ever calling
+   `compute_winner()`.
+
+Both fixes are narrow, additive, and do not change `FlopResolver`'s
+previously-validated flop-only behavior.
+
+### Tractability: why the action set had to be reduced
+
+A first attempt chained turn+river dealing under the same full native
+raise-size ladder `FlopResolver` uses (`State.h`'s `legal_actions()`, up to
+~6 actions per decision node) and did not finish 5 CFR iterations in over 5
+minutes — the combinatorics of (up to 6 actions)×(~48 turn cards)×(up to 6
+actions)×(~47 river cards)×(up to 6 actions) explode far too fast for
+interactive use. **Fix:** `StreetChainResolver` restricts every decision node
+to exactly `{fold, call, all-in}` (filtering `legal_actions()`'s output down
+to those three byte codes: `'d'`, `'l'`, `'n'`), which is what actually made
+full turn/river chaining tractable at all.
+
+### Validated run
+
+New tool: `PokerAI/tools/test_realtime_search_chain.cpp` — 6 hero combos ×
+6 villain combos, fixed flop board `[10,23,41]`, chains through a real turn
+card, then a real river card, to an exact showdown.
+
+```shell
+cd PokerAI
+g++ -std=c++17 -O2 -Wall -Wextra -DDH_SKIP_RIVER_CLUSTER \
+    tools/test_realtime_search_chain.cpp -o /tmp/test_chain
+/tmp/test_chain
+```
+
+```
+50 iterations in 2222.8 ms, 31124 tree nodes, peak RSS ~4GB
+avg|regret| increasing across checkpoints (5/15/30/50 iterations) — expected,
+since these checkpoints report cumulative regret, not per-iteration regret.
+Root strategies for all 6 villain hands: sane, non-degenerate mixes,
+~90-97% call / 3-10% all-in.
+```
+
+### Honest scope and limitations
+
+- Still **unsafe resolving** against a small, explicit, fixed range — same
+  caveat as section 15, not fixed here.
+- The reduced `{fold, call, all-in}` action set is a **deliberate
+  tractability tradeoff**, not a claim that the original bot's action space
+  was this small — section 15's `FlopResolver` (single street only) keeps
+  the full native raise ladder precisely because it doesn't pay this
+  multiplicative cost.
+- Exact showdown scoring (no cluster approximation) makes this **slower but
+  more accurate than `FlopResolver`** per street resolved — a genuinely
+  different, complementary tool, not a strict upgrade.
+- This resolver is an off-line study/validation tool (like section 15's),
+  not wired into any live-play path — see section 17 for that.
+
+## 17. Wiring the original resolver into the existing web GUI (`pypokergui`)
+
+The repo already ships a complete, working Tornado-based poker GUI
+(`pypokergui/`, a fork of ishikota's PyPokerGUI) whose only missing piece —
+per section 4 — was that `pypokergui/server/game_manager.py` hardcodes
+`cdll.LoadLibrary('./AlascasiaHoldem.so')`, a Linux x86_64 ELF binary that
+cannot load on macOS, and section 4 correctly identified this as a hard
+blocker with nothing in the repo to port or recompile (the real-time search
+inside that `.so` was never open-sourced — see sections 12-14 for the full
+forensic investigation of that binary).
+
+Sections 15/16 built an **original, from-scratch** real-time search
+(`FlopResolver`, `StreetChainResolver`) as a legitimate substitute — not a
+reconstruction of the `.so`'s contents. This section wires that search
+into the GUI as a genuine, loadable macOS library, so the GUI is actually
+playable end-to-end on this host, subject to the same
+missing-cluster-artifact caveats documented throughout this file.
+
+### `PokerAI/tools/dh_native_ai.cpp` (new)
+
+A new, independently-written `.cpp` file that exposes the **exact same
+four-function C ABI** `pypokergui/server/fish_player_setup.py` already calls
+via `ctypes` against the original `.so`:
+
+| Function | Signature (as called from Python) | Purpose |
+|---|---|---|
+| `restart_game` | `(myid, c1id, c2id)` | New hand: which slot is "me", my hole cards |
+| `Next_stage` | `(betting_stage, community_card_bytes)` | Street transition + board |
+| `opp_take_action` | `(actionstr)` | Opponent's action (`"fold"/"call"/"allin"/"raise N"`) |
+| `getdecision` | `(out_buf[20])` | My decision, written back as a C string |
+
+It is backed by a third, new resolver added to `RealtimeSearch.h`,
+`LiveResolver`, which unifies flop/turn/river resolving behind one `Mode`
+enum specifically tuned for interactive latency (all three modes use the
+same `{fold, call, all-in}`-only action reduction as section 16, for the
+same tractability reason):
+
+- **`Mode::FLOP`** — same approximate turn-cluster leaf value as
+  `FlopResolver` (section 15); no cards dealt.
+- **`Mode::TURN`** — deals one real river card (a genuine ~48-branch chance
+  node) then scores an **exact** showdown — but deliberately does **not**
+  simulate river betting (assumes a check-down on the river). This is a
+  documented, deliberate accuracy/speed tradeoff to avoid a second full
+  betting-round layer at interactive latency.
+- **`Mode::RIVER`** — resolves the real (final) betting round exactly; no
+  chance nodes fire since the board is already complete.
+- **Preflop is not resolved at all** — `dh_native_ai.cpp` always returns
+  `"call"` preflop, by explicit design, not oversight. Every real
+  DeepStack/Libratus/Alascasia-style architecture in this genre precomputes
+  preflop strategy offline (from `blueprint_strategy.dat`, a 16GB file this
+  investigation was never able to obtain — see section 2) and only uses
+  real-time search postflop; without that file there is nothing legitimate
+  to search preflop against, so this is left as an honest, clearly-labeled
+  placeholder rather than something invented to look more complete.
+- The opponent's range for every resolve is a **uniformly sampled** set of
+  ~40 hole-card combos consistent with the known board/hero cards (the
+  opponent's true range is unknown — there is no belief-tracking blueprint
+  to consult) — the same "unsafe resolving" caveat as sections 15/16,
+  applied here for the first time to genuinely unknown live opposition
+  rather than a hand-picked demonstration range.
+- Chip-accounting note: pypokergui's underlying engine
+  (`pypokerengine/engine/player.py`) reports raise/call amounts as
+  **per-street cumulative** totals (reset every street), while `Searchstate`
+  (`PokerAI/poker/State.h`) tracks `n_bet_chips()` as **cumulative for the
+  whole hand** (never reset). `dh_native_ai.cpp`'s internal `LiveGame`
+  struct tracks `stack_at_street_start[2]` explicitly to convert between
+  the two conventions each time it builds a `Searchstate` snapshot.
+- Slot convention: `myid` (0 or 1) passed to `restart_game` directly
+  matches `Searchstate`'s own hardcoded HU convention (slot 0 = small
+  blind/button, acts first preflop; slot 1 = big blind, acts first
+  postflop) — confirmed by reading how `server/fish_player_setup.py`
+  derives `myid` for the original `.so`, so no remapping is needed.
+- The GUI never separately tells the AI about its own action (`server/
+  fish_player_setup.py`'s `receive_game_update_message` explicitly
+  early-returns when the acting player is the AI itself), so `getdecision`
+  applies the same state-update bookkeeping to its own chosen action,
+  mirrored from `opp_take_action`, before returning.
+
+Build (produces a real macOS `.dylib`, must be run from `PokerAI/` so the
+`Engine`'s `"cluster/..."` relative load paths resolve, exactly like every
+other tool in this repo):
+
+```shell
+cd PokerAI
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -shared -fPIC \
+    -o dh_native_ai.dylib tools/dh_native_ai.cpp
+```
+
+This compiles cleanly (0 errors, 1 pre-existing unrelated unused-parameter
+warning shared with every other file that includes `State.h`), and
+`nm -gU dh_native_ai.dylib` confirms all four required symbols are exported:
+`_restart_game`, `_Next_stage`, `_opp_take_action`, `_getdecision`.
+
+### GUI wiring: `pypokergui/server/game_manager.py`
+
+Changed the single hardcoded `cdll.LoadLibrary('./AlascasiaHoldem.so')` call
+to branch on `platform.system()`: `./dh_native_ai.dylib` on Darwin,
+unchanged `./AlascasiaHoldem.so` on Linux (Linux behavior is 100%
+preserved). Added symlinks (not copies, so they always track the real
+build/source) so the GUI's relative-path load works from its own working
+directory:
+
+```shell
+cd pypokergui/server
+ln -s ../../PokerAI/dh_native_ai.dylib dh_native_ai.dylib
+ln -s ../../PokerAI/cluster cluster   # Engine::load() needs "cluster/..." too
+```
+
+### Blocker hit while validating end-to-end: macOS disk permission (TCC), not a code defect
+
+Section 11 relocated the multi-GB cluster/blueprint files to an external
+Seagate drive with symlinks back into `PokerAI/cluster/`, and section 15/16's
+resolvers were validated successfully reading through those symlinks earlier
+in this investigation. When this section's work was validated, the *exact
+same* symlinked files started failing with `Operation not permitted` —
+confirmed to be an OS-level permission (TCC / "Files and Folders" access for
+removable volumes), **not** a bug in this new code:
+
+```shell
+$ stat "/Volumes/Seagate Desktop Drive/DecisionHoldem_cluster_data/sevencards_strength.bin"
+# succeeds — metadata (size, dates) is visible, and matches the known-good 1,337,845,600 byte file
+$ cat "/Volumes/Seagate Desktop Drive/DecisionHoldem_cluster_data/sevencards_strength.bin" > /dev/null
+cat: ...: Operation not permitted
+```
+
+`stat`/`ls` (metadata-only syscalls) succeed; `open`/`read`/`cp` (actual
+content access) are denied — this asymmetry is the signature of macOS's
+per-app disk-access control, not a missing file, wrong path, corrupt
+symlink, or code bug. Every previously-successful read of this same file
+this session happened under a different granted-permission context; this
+session's process does not currently have it. Because `Engine`'s
+constructor (`PokerAI/poker/Engine.h`) unconditionally calls `load()` at
+**global static-initialization time** — i.e. the instant any binary or
+shared library linking against it is loaded, before `main()` or any
+`extern "C"` entry point runs — this blocks loading `dh_native_ai.dylib` at
+all right now, the same way it would block any of this repo's other tools
+(`Main.o`, `test_realtime_search_flop`, `test_realtime_search_chain`) if run
+fresh in this exact process context. This is **not specific to the new
+library** — it is the pre-existing, repo-wide `cluster/*.bin`-on-first-touch
+dependency from section 2, now manifesting as an OS permission gap rather
+than a missing-file gap.
+
+**To unblock, on the actual machine (not fixable from within this session):**
+open System Settings → Privacy & Security → Files and Folders (or Full Disk
+Access) and grant the terminal/app running the build access to the Seagate
+volume, or physically re-eject/reattach the drive and approve any Finder
+permission prompt that appears, then re-run the commands in the next
+subsection to confirm.
+
+### What was and wasn't validated
+
+**Validated (real, reproducible, no fabricated data):**
+- `dh_native_ai.cpp` compiles cleanly to a real arm64 Mach-O `.dylib` with
+  all 4 required C symbols exported (`nm -gU`, shown above).
+- `game_manager.py`'s new OS-conditional load logic is syntactically valid
+  and resolves to the correct filename on this host
+  (`platform.system() == 'Darwin' → './dh_native_ai.dylib'`).
+- The symlink wiring in `pypokergui/server/` is in place and points at the
+  real build artifacts (not copies).
+
+**Not validated (blocked by the disk-permission issue above, not a code
+defect):** an actual live decision from `getdecision()` through real
+cluster data, and a full browser-driven hand through the Tornado GUI. Once
+disk access is restored, re-run this exact sequence to confirm (run from
+`pypokergui/server/`, matching the `.so`'s own required working directory):
+
+```shell
+cd pypokergui/server
+python3 -c "
+import ctypes
+lib = ctypes.cdll.LoadLibrary('./dh_native_ai.dylib')
+lib.restart_game(1, 10, 20)
+lib.opp_take_action(b'call')
+buf = ctypes.create_string_buffer(20)
+lib.getdecision(buf)
+print('preflop decision:', buf.value)   # expect b'call'
+lib.Next_stage(1, bytes([2,3,4]))
+lib.getdecision(buf)
+print('flop decision:', buf.value)      # expect b'call'/b'fold'/b'allin'
+"
+# then launch the actual GUI:
+cd ../.. && python3 -m pypokergui.__main__ serve <config path> --port 8000
+```
+
+### Honest scope and limitations
+
+- Flop/turn/river decisions are genuine CFR resolves against a **uniformly
+  sampled, unknown-true opponent range** — unsafe resolving, same caveat as
+  every other resolver in this file.
+- **Preflop is always "call"** — an explicit placeholder, not a solved
+  strategy (no blueprint data available — see section 2).
+- **Turn-mode decisions assume a river check-down** (no river-betting
+  subtree) — a deliberate latency tradeoff, documented in code.
+- The reduced `{fold, call, all-in}` action set (sections 16/17) means the
+  GUI's opponent will never see this AI make an intermediate-sized raise.
+- This is a genuine, original implementation making the existing GUI
+  actually playable against a working search algorithm on macOS — it is
+  explicitly **not** a recovery or reconstruction of the proprietary
+  `.so`'s specific strategy or strength, and its live-play correctness has
+  not yet been end-to-end verified on this host due to the disk-permission
+  issue above, not due to any known defect in the new code.

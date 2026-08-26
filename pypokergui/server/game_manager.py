@@ -1,3 +1,4 @@
+import platform
 import engine_wrapper as Engine
 import ai_generator as AG
 from server.fish_player_setup import FishPlayer
@@ -17,8 +18,18 @@ class GameManager(object):
         #     cc = f.read()
         # ls = eval(cc)
         print('ai start load')
-        self.player_search = cdll.LoadLibrary('./AlascasiaHoldem.so')
-        print('load finish')
+        # AlascasiaHoldem.so is a Linux x86_64 ELF shared object (confirmed via
+        # `file`, see BUILD_NOTES.md section 4/17) and cannot load on macOS.
+        # On Darwin we load dh_native_ai.dylib instead: a from-scratch,
+        # original macOS-native library (PokerAI/tools/dh_native_ai.cpp) that
+        # implements the exact same four-function C ABI
+        # (restart_game/Next_stage/opp_take_action/getdecision) using this
+        # repo's own PokerAI engine + the new RealtimeSearch.h LiveResolver,
+        # NOT a port/reconstruction of the original proprietary binary. Linux
+        # behavior (loading the original .so) is unchanged.
+        lib_name = './dh_native_ai.dylib' if platform.system() == 'Darwin' else './AlascasiaHoldem.so'
+        self.player_search = cdll.LoadLibrary(lib_name)
+        print('load finish (%s)' % lib_name)
         self.human_total_win = 0
         self.cheat_decks = None
         self.roundi = 0

@@ -8,3 +8,12 @@ PokerAI/cluster/*
 __pycache__/
 *.pyc
 *.o
+
+# dh_native_ai.dylib is a locally-built macOS shared library (built from the
+# committed source, PokerAI/tools/dh_native_ai.cpp -- see BUILD_NOTES.md
+# section 17 for the exact build command). It, and the convenience symlinks
+# that wire it (and the cluster/ dir) into pypokergui/server/, are build
+# artifacts / local wiring, not source, and are not committed.
+PokerAI/dh_native_ai.dylib
+pypokergui/server/dh_native_ai.dylib
+pypokergui/server/cluster
