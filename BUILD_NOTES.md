@@ -1298,3 +1298,120 @@ match, after which the swap completed normally. This is noted here only
 because the same disk-block-accounting pitfall could resurface if this
 migration script is ever extended to verify directories instead of single
 files.
+
+## 12. Investigating whether `AlascasiaHoldem.so`/`blueprint.so` can be made to run on this Mac
+
+Asked directly: can the precompiled Linux x86_64 real-time search library be
+gotten to run here somehow? Investigated by directly inspecting the
+unstripped binary (`file`, `nm`, `c++filt`, `strings`, `objdump` — no
+disassembly/decompilation, just reading exported symbols and embedded
+debug/string data) rather than speculating.
+
+### What `AlascasiaHoldem.so` actually is (confirmed via symbol inspection)
+
+This is genuinely the real heads-up No-Limit Hold'em real-time
+depth-limited search engine, not a toy/simplified game. Exported C++ symbols
+include `Pokerstate`, `Searchstate`, `strategy_node`/`subgame_node`,
+`getcfv_whole_holdem`, `getnode_cfv_holdem/turn/river`,
+`build_subtree_preflop/flop`, `bulid_subtree_turn/river`, `search_cfr`,
+`search_mccfr(p)`, `multi_update_substrategy`, `Players_range`, and
+`randomized_pseudo_harmonic` (the exact pseudo-harmonic action-abstraction
+technique from Brown et al.'s Modicum paper, which this project's own paper
+says it extends). The four C-linkage entrypoints the Python GUI actually
+calls (`getdecision`, `restart_game`, `Next_stage`, `opp_take_action`) are a
+thin wrapper around all of this real machinery.
+
+Critically, the binary's embedded DWARF debug info lists compile-unit source
+paths including **`Depth_limit_Search.h`** itself (alongside `tree/Node.h`,
+`tree/Bulid_Tree.h`, `PlaySearch.h`, `Search.h`, `tree/Exploitability.h`,
+`BlueprintMCCFR.h`) — confirming this header genuinely existed and was
+compiled by the original authors; it just was never included in the public
+release (consistent with section 2.1 and the still-open upstream issue #10).
+
+### Why it cannot run natively on macOS
+
+Two independent, unfixable-from-here incompatibilities: (1) format — macOS's
+kernel/dyld only load Mach-O binaries, never ELF, so there is no way to
+`dlopen`/`ctypes.cdll.LoadLibrary` this file on macOS at all, regardless of
+CPU architecture; (2) architecture — this file is x86_64, and this host is
+Apple Silicon (arm64/M4). Rosetta 2 (present on this host) only translates
+Apple's own x86_64 **macOS** binaries to arm64 — it has no bearing on Linux
+ELF binaries.
+
+### Is running it under Linux/emulation practical? Investigated, not attempted
+
+`objdump -p` shows only completely ordinary dynamic dependencies
+(`libc.so.6`, `libstdc++.so.6`, `libpthread.so.0`, `libm.so.6`,
+`libgcc_s.so.1`, `ld-linux-x86-64.so.2`) against old, universally-compatible
+`GLIBC_2.3`/`GLIBCXX_3.4.15` — nothing exotic. On **genuine x86_64 Linux
+hardware or a cloud VM**, this library would very likely load without any
+dependency-installation trouble.
+
+On *this* host, the only way to run x86_64 Linux code at all is full CPU
+emulation (e.g. Docker Desktop/colima + QEMU's TCG emulation, since Apple
+Silicon has no x86_64 hardware execution path) — no container/VM runtime
+(`docker`, `podman`, `colima`, `lima`, `qemu-system-x86_64`) was found
+installed in this sandbox. Installing one is possible via Homebrew, but this
+was **not done**, because two further findings make the expected payoff low
+enough that it isn't a reasonable default action on a shared host without
+asking first:
+
+1. **QEMU-emulated x86_64 on arm64 has no hardware acceleration for the
+   foreign instruction set** — real CPU instruction emulation, commonly
+   5-20x+ slower than native for compute-heavy workloads. A real-time CFR
+   search engine (already shown in sections 2/6 to want ~19-20GB+ RAM and
+   real per-decision compute even natively) is a poor candidate for this.
+
+2. **A second, independent portability blocker beyond platform/architecture,
+   found in the binary's own embedded string literals** — its `Engine`-style
+   cluster loader was compiled with **hardcoded absolute paths pointing at
+   the original author's own development machine**, e.g.:
+   ```
+   /home/zhouqibin/projects/PokerAI/cluster/sevencards_strength.bin
+   /home/zhouqibin/projects/PokerAI/cluster/preflop_hand_cluster.bin
+   /home/zhouqibin/projects/PokerAI/cluster/turn_hand_cluster_ehs5000_1326*230300.bin
+   /home/zhouqibin/projects/PokerAI/cluster/flop_hand_cluster_ehs50000_1326*19600.bin
+   /home/zhouqibin/projects/PokerAI/cluster/river_hand_cluster_ehs1000_1326*2118760.bin
+   /home/zhouqibin/projects/PokerAI/cluster/river_hand_cluster_1326*2118760.bin
+   /home/zhouqibin/projects/PokerAI/preflopallin1326*1225.bin
+   ```
+   These are **not** the relative `cluster/...` paths used by this repo's
+   own public `poker/Engine.h` source (section 1/8), and the filenames
+   themselves encode different clustering-generation parameters (`ehs50000`,
+   `ehs5000`, `ehs1000` — almost certainly "estimated hand strength" sampling
+   counts from the clustering pipeline) than anything shipped publicly or
+   named in this repo. This binary was evidently compiled from an internal,
+   pre-release version of `Engine.h` that differed from the one open-sourced
+   later. Making this library find data at all, even under working Linux,
+   would require recreating this exact absolute directory tree and either
+   feeding it the same-shaped files under these unusual names (workable via
+   `mkdir -p`/symlinks, no root required) or the actual original files —
+   which are not known to exist publicly under these names.
+3. **A further embedded path,
+   `/home/zhouqibin/projects/PokerAI/obj/x64/Debug/new_multiblueprint_policy5000050001000_V3.dat`,
+   references a blueprint file with a completely different name/format than
+   the publicly documented `blueprint_strategy.dat`** (a separate string,
+   `cluster/blueprint_strategy.dat`, relative this time, also appears — it's
+   unclear from symbol inspection alone which code path `getdecision()`
+   actually reaches, without full disassembly). This suggests the shared
+   library may be an internal **Debug** configuration build tied to
+   never-released internal data, independent of whatever pretrained
+   `blueprint_strategy.dat`/cluster files a user manages to obtain.
+
+### Bottom line
+
+- **Not possible on this Mac as-is** — confirmed via direct inspection, not
+  assumption (ELF-on-Darwin and x86_64-on-arm64 are both hard platform
+  blockers; no workaround exists at the OS level).
+- **Theoretically possible only via genuine x86_64 Linux** (real hardware or
+  a cloud VM/instance — not local Apple-Silicon emulation, which would
+  likely be far too slow for this workload to be useful) — and even then,
+  only after reconstructing the exact absolute developer-machine path
+  structure this specific binary was hardcoded against, using cluster files
+  whose expected naming implies a different (possibly incompatible)
+  generation than anything publicly documented, with no certainty the
+  binary would produce correct decisions even if it loads without crashing.
+- No system-level tooling (Docker/colima/QEMU) was installed in this
+  sandbox to pursue this further, given the above; that remains an
+  available next step only if explicitly requested, ideally on genuine
+  Linux/x86_64 hardware rather than this host.
