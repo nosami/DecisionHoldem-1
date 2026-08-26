@@ -51,25 +51,54 @@
 //       clusterlen-wide format), each written in full before the next one
 //       begins (depth-first, action-major order).
 //
-//     Preflop betting never produces `action_len >= 100` (that marker is
-//     reserved for chance nodes -- e.g. the ~19600-way flop board deal --
-//     and no cards are ever dealt until preflop betting closes), so this
-//     reader only implements the `action_len < 100` case and throws if it
-//     ever sees otherwise; that would mean the caller's navigation assumed
-//     a wrong tree shape, and silently trusting nearby bytes as strategy
-//     data would be worse than failing loudly.
+//     CORRECTION (found via a real live-play bug, see BUILD_NOTES.md section
+//     21): an earlier version of this file assumed "preflop betting never
+//     produces `action_len >= 100`" -- that is WRONG. Save_load.h's dump()
+//     serializes the *entire* game tree in one file, not a preflop-only
+//     slice. `action_len >= 100` is a chance-node marker (e.g. the flop
+//     board deal), and while the exact node this reader is asked to
+//     evaluate is indeed always still-preflop-and-open (guaranteed by the
+//     caller only ever invoking a preflop lookup before betting closes), a
+//     SIBLING action being skipped past (e.g. a check-back that closes
+//     preflop betting) can legitimately lead straight into a chance node a
+//     few levels inside its own subtree -- normal tree shape, not
+//     corruption. `skip_subtree()` below now mirrors dfs_write()'s chance-
+//     node branch (`else if (len > 100)`) exactly: a chance-node marker
+//     carries no data of its own, and is immediately followed by exactly
+//     one more node, read with clusterlen replaced by the chance node's
+//     fan-out count. `read_node_header()` (used only for nodes actually on
+//     the caller's lookup path) still throws if it ever sees `action_len >=
+//     100`, since that would mean the caller asked for a "preflop" decision
+//     at a node where preflop has already closed -- a real caller bug worth
+//     failing loudly on, not something to silently paper over.
+//
+//   PERFORMANCE NOTE: because a skipped sibling can now legitimately
+//   contain an entire postflop subgame (everything hanging off a closed
+//   preflop line), `skip_subtree()` is no longer guaranteed to cost only a
+//   few KB for every lookup -- a path that skips past an early-closing
+//   sibling (e.g. skipping over a "check back the limp" branch to reach a
+//   raise branch) will sequentially read through that sibling's full
+//   nested tree on disk (still far less than the whole ~16GB file, and
+//   still no large in-RAM allocation, but not always negligible I/O).
 //
 //   HONEST VALIDATION STATUS (see BUILD_NOTES.md for the full writeup):
 //   this reader was written by careful, byte-for-byte inspection of
-//   Save_load.h's write-side code, and its *root-level* read (empty
-//   action_path) requires reading only a few KB from the start of the file
-//   -- but it has NOT been executed against the real
-//   cluster/blueprint_strategy.dat from within this development sandbox,
-//   which lacks OS-level permission to read files on the external drive
-//   that hosts it (a sandbox-specific limitation, not a code defect -- see
-//   BUILD_NOTES.md). It must be validated by the user (who has working
-//   access) via PokerAI/tools/test_blueprint_root_read.cpp before being
-//   trusted for real play.
+//   Save_load.h's write-side code. Its *root-level* read (empty
+//   action_path) was validated by the user against the real
+//   cluster/blueprint_strategy.dat (PokerAI/tools/test_blueprint_root_read.cpp,
+//   see BUILD_NOTES.md section 18) and produced sane, non-degenerate,
+//   correctly-normalized real strategy data. The chance-node-skip fix above
+//   was written in response to a real exception the user hit during actual
+//   live play (BUILD_NOTES.md section 21) and reasoned through directly
+//   against Save_load.h's write-side code, but -- like all non-root paths
+//   through this reader -- has not yet been re-validated against the real
+//   file from within this development sandbox, which still lacks OS-level
+//   permission to read files on the external drive that hosts it. Re-test
+//   live play to confirm the fix; if any further "unexpected chance node"
+//   or "action byte not found" errors surface, they indicate either another
+//   reader bug or a `preflop_action_path` tracking bug in dh_native_ai.cpp
+//   (see resolve_preflop_decision()'s try/catch there for how these are
+//   reported without crashing the whole hand).
 //###############################################################################
 #pragma once
 #include <fstream>
@@ -124,13 +153,31 @@ inline NodeHeader read_node_header(std::ifstream& fin, int clusterlen) {
 // rooted at a node spanning `clusterlen` slots, mirroring the exact
 // recursive order Save_load.h's dfs_write() used to write it, so `fin` ends
 // up positioned exactly at whatever comes immediately after in the file.
+//
+// IMPORTANT (found via a real live-play bug report, see BUILD_NOTES.md):
+// Save_load.h's dump() serializes the *entire* game tree in one file, not
+// just the preflop portion. A SIBLING action we need to skip past (e.g. a
+// check-back that closes preflop betting) can legitimately lead straight
+// into a chance node (the flop deal) a few levels inside that sibling's own
+// subtree -- that is normal, correct tree shape, not corruption. Per
+// dfs_write()'s `else if (len > 100)` branch, a chance-node marker writes
+// ONLY the int32 `len` itself (no actionstr/regret/averegret follow for the
+// chance node), then makes EXACTLY ONE further recursive dfs_write() call
+// with clusterlen REPLACED by `len` (each of the `len` chance outcomes
+// becomes the new parallel-slot dimension for whatever betting node comes
+// next, exactly like the initial 169 preflop hand-cluster slots). This is a
+// single nested call, not a loop of `len` calls -- mirror that exactly here.
 inline void skip_subtree(std::ifstream& fin, int clusterlen) {
 	int len;
 	fin.read(reinterpret_cast<char*>(&len), sizeof(int));
 	if (!fin) throw std::runtime_error("BlueprintReader: unexpected EOF while skipping a subtree");
 	if (len <= 0) return; // terminal node -- nothing else was written for it
-	if (len >= 100)
-		throw std::runtime_error("BlueprintReader: unexpected chance node encountered while skipping a preflop-only subtree");
+	if (len >= 100) {
+		// Chance node: no data of its own besides the int32 already read;
+		// exactly one more node (with the new clusterlen) follows.
+		skip_subtree(fin, len);
+		return;
+	}
 	fin.seekg(static_cast<std::streamoff>(len), std::ios::cur); // actionstr
 	fin.seekg(static_cast<std::streamoff>(clusterlen) * len * 2 * sizeof(double), std::ios::cur); // regret+averegret, all clusters
 	for (int i = 0; i < len; i++) skip_subtree(fin, clusterlen);

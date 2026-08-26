@@ -2529,3 +2529,150 @@ registered Slumbot account instead of anonymously.)
   would happen) -- the user, who has working disk access, should run the
   command above to get an actual end-to-end result and confirm hands play
   out and a win/loss total is reported.
+
+## 21. Real bug found and fixed: `BlueprintReader::skip_subtree()` mishandled sibling chance nodes
+
+### The report
+
+While actually playing a live hand through the GUI, stderr showed:
+
+```
+[DH_PREFLOP_BLUEPRINT] real blueprint lookup failed (BlueprintReader: unexpected chance node encountered while skipping a preflop-only subtree) -- falling back to placeholder 'call' for this decision only
+python rec ai action: call
+```
+
+This directly falsified a design assumption written into section 18 and
+`BlueprintReader.h`'s own comments: "preflop betting can never produce a
+chance node — no cards are dealt until preflop closes." That assumption
+was **wrong**, and this was a real, previously-undiscovered defect in the
+new reader code, not a sandbox/environment limitation.
+
+### Root cause
+
+`Save_load.h`'s `dump()`/`dfs_write()` serializes the **entire game tree**
+into `blueprint_strategy.dat` — not a preflop-only slice. The moment any
+betting line's preflop action closes (e.g. an opponent's check-back after
+a limp), the tree's very next node **is** a chance node (the flop board
+deal), and that is completely normal, correct tree shape.
+
+`BlueprintReader::lookup_preflop_strategy()`'s target-node traversal itself
+is fine, because it is only ever invoked while preflop betting is
+genuinely still open (`getdecision()` only calls
+`resolve_preflop_decision()` while `g.betting_stage == 0`). But to reach
+the correct sibling action index at each step, it must call
+`skip_subtree()` on every *other* legal action at that node first — and if
+one of those siblings is a line that closes preflop betting, its subtree
+legitimately contains a chance node a few levels down. The old
+`skip_subtree()` treated any `action_len >= 100` marker as a hard error and
+threw, even when it was hit while skipping a sibling (as opposed to
+reading the actual target node).
+
+Re-deriving the exact write-side semantics from `Save_load.h`'s
+`dfs_write()`:
+
+```cpp
+else if (len > 100) {                       // chance-node marker
+    strategy_node** privatenode2 = new strategy_node*[len];
+    for (int j = 0; j < len; j++) privatenode2[j] = privatenode[0]->actions + j;
+    dfs_write(privatenode2, len);            // ONE recursive call, clusterlen := len
+    delete[] privatenode2;
+}
+```
+
+A chance-node marker writes **only** the `int32 len` itself (no
+actionstr/regret/averegret), and is immediately followed by **exactly one**
+more node, read with `clusterlen` replaced by the chance node's fan-out
+count (`len`) — not a loop of `len` separate nodes.
+
+### The fix
+
+`PokerAI/tree/BlueprintReader.h`'s `skip_subtree()` now mirrors this
+exactly: on `len >= 100` it no longer throws; it recurses once more with
+`clusterlen = len` and returns:
+
+```cpp
+if (len >= 100) {
+    skip_subtree(fin, len);   // exactly one more node follows, with clusterlen=len
+    return;
+}
+```
+
+`read_node_header()` (used only for nodes actually on the caller's lookup
+path) still throws on `action_len >= 100`, since the exact node being
+evaluated for a preflop decision should never legitimately be a chance
+node — if it ever is, that means a real caller-side bug (a `getdecision()`
+call after preflop should already be closed), which is still worth failing
+loudly on rather than silently misinterpreting.
+
+Also corrected the file's own top-of-header design comments, which
+previously asserted the now-falsified "preflop never produces a chance
+node" claim, and added an honest performance note: skipping a
+closed-early sibling can now legitimately read through that sibling's
+entire nested postflop subtree on disk (still far less than the full
+~16GB file and no large RAM allocation, but no longer guaranteed to be a
+"few KB" operation for every lookup).
+
+### Validation performed
+
+This sandbox still has no OS-level access to the real
+`cluster/blueprint_strategy.dat` (external-drive permission wall,
+unchanged from every earlier section). To validate the fix's logic without
+that file, a small synthetic blueprint file was generated in Python,
+byte-for-byte matching `Save_load.h`'s on-disk format with a *small*
+`clusterlen=3` (instead of 169, purely to keep the fixture tiny):
+
+- Root betting node, `actionstr = ['d','l','r']` (fold / call·limp / raise)
+- Action `'d'` (idx 0): a plain terminal (`action_len=0`) — exercises
+  skipping a trivial sibling.
+- Action `'l'` (idx 1): closes preflop into a **chance node** with fan-out
+  150, itself followed by a real betting node — exercises the exact bug
+  scenario (a sibling that legitimately contains a chance node).
+- Action `'r'` (idx 2): the **target** node, a real betting node
+  (`actionstr = ['d','l']`, probs 0.7/0.3) — what the lookup is supposed to
+  return.
+
+Compiled and ran the *original* (pre-fix) `BlueprintReader.h` against this
+fixture, requesting `action_path = ['r']`: it reproduced the **exact**
+reported error message verbatim:
+
+```
+FAIL: threw: BlueprintReader: unexpected chance node encountered while skipping a preflop-only subtree
+```
+
+Then compiled and ran the **fixed** version against the same fixture: it
+correctly skipped past both siblings (the terminal and the
+chance-node-embedding one) and returned the target node's real data:
+
+```
+OK: action_len=2
+  action=100 prob=0.7000   ('d')
+  action=108 prob=0.3000   ('l')
+PASS
+```
+
+This confirms both (a) the bug is exactly what the root-cause analysis
+above describes, and (b) the fix resolves it, using a fixture that
+exercises the precise failure mode reported — the closest validation
+possible without disk access to the real 16GB file from this sandbox.
+
+Rebuilt `dh_native_ai.dylib` (`g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER
+-shared -fPIC -o dh_native_ai.dylib tools/dh_native_ai.cpp`, per section
+19's recommended command): compiles cleanly, all 4 ABI symbols intact
+(`nm -gU`: `_restart_game`, `_Next_stage`, `_opp_take_action`,
+`_getdecision`).
+
+### What's still not directly verified
+
+The synthetic-fixture test proves the reader's *tree-navigation logic* is
+now correct for this failure mode. It does **not** by itself prove the
+real `blueprint_strategy.dat` file's actual chance-node fan-out values
+match what this reasoning assumes (e.g. the real flop fan-out count,
+whatever it is, is simply read from the file as `len` and used directly —
+there is no hardcoded assumption about its exact value, so this should
+generalize correctly regardless of the real number). The user should
+re-run live play; if any further "unexpected chance node" or "action byte
+not found" exceptions surface, they would point to either a different,
+still-undiscovered reader bug, or a `g.preflop_action_path` tracking bug in
+`dh_native_ai.cpp` (worth checking `opp_take_action()`/`resolve_preflop_decision()`
+first, per section 18's caveats) — not this specific issue, which is now
+fixed and validated against its exact failure mode.
