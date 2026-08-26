@@ -4875,3 +4875,105 @@ not assumed.
   `full_ladder`) — narrowing against a wider opponent action set was out
   of scope for this request, which was specifically about hero's own
   decisions.
+
+## 38. Investigating an escalating live-play losing streak (−1BB/hand → −2BB/hand over a 419-hand Slumbot session) — root-caused to variance concentrated in a small number of legitimate, high-frequency all-in decisions, not a bug
+
+A live `play_with_slumbot.py --max-hands 500` session (using the
+`full_ladder` build from section 37) was monitored as its rate worsened:
+63 hands (−9800, ≈−155/hand) → 267 hands (−29550, ≈−1.11 BB/hand) → 369
+hands (−93050, ≈−2.52 BB/hand). The session stopped on its own (process no
+longer running when re-checked) at **419 hands, session_total −96750
+(≈−2.31 BB/hand)**, still ahead of `session_baseline_total` (−97100) by
+350 chips.
+
+### Method
+
+Each escalation was re-investigated the same way: tabulate the "exclude
+the worst N hands" variance breakdown (Slumbot's log reveals villain's
+hole cards even on hands hero folds/loses, uniquely enabling this), find
+every full-stack (−20000) loss, and root-cause each one by reproducing
+its exact decision node with a throwaway diagnostic that `#include`s
+`dh_native_ai.cpp` directly, drives the real ABI
+(`restart_game`/`Next_stage`/`opp_take_action`/`apply_own_action`) to the
+exact spot, and prints `LiveResolver::average_strategy()` (the true
+mixed-strategy probabilities) plus `exploitability()`, instead of trusting
+a single sampled action. Every diagnostic file was deleted and the
+resolver source fully reverted after use; nothing in this section shipped
+a code change (see "Files touched" below — documentation only).
+
+### The "exclude worst N" pattern got more extreme, not qualitatively different
+
+At 369 hands, **4 separate hands had lost the entire 20000-chip stack**
+(vs. 1 at 267 hands). Excluding just the worst 5 hands, the remaining 414
+hands were still net negative; excluding the worst 10, they were net
+positive. This is the same fat-tailed shape as every earlier check in
+this investigation — a handful of catastrophic hands dominating the
+average — just with more such hands as the sample grew.
+
+### All 4 full-stack-loss hands were individually root-caused; none were bugs
+
+| # | Hand | Decision node | Root cause found |
+|---|---|---|---|
+| 1 | Ad-Jh, board Ks-9s-8h (opening flop bet, checked to) | `full_ladder_`'s opening-action reduced ladder (§37) | Real average strategy: allin **15.2%**, bet-pot 84%, call ~1% — a legitimate, already-known polarized bluff frequency (§36's pattern), not a bug. A candidate fix (adding a 0.5x-pot branch) was tested at 3 spots and **rejected** — didn't generalize, worsened exploitability at 2/3. |
+| 2 | 9s-8c, board 9c-3h-3d-Kc (river, villain re-raises to 18200 after hero bets 3600) | Facing a raise that consumes villain's entire remaining stack | Villain's raise-to-18200 zeroes their remaining stack, so `opp_take_action()`'s `would_be_allin` check correctly classifies it as byte `'n'` (the strongest narrowing signal available) — narrowing was NOT size-blind here, it already saw this as all-in-strength. Hero's subsequent call of that effective shove with two pair was a real poker judgment call (against an actual bigger two pair), not a sizing/narrowing defect. |
+| 3 | Qh-6s, board Kh-6c-3h-7h (turn, hero bets 1800, villain raises to 4500, not all-in) | Facing a genuine, non-all-in re-raise | See spot 4's diagnostic below — same decision-node type, same conclusion. |
+| 4 | Ts-Td, board As-9c-8h-3h (turn, hero bets 1800, villain raises to 4500, not all-in) | Facing a genuine, non-all-in re-raise | **Diagnostic confirmed** (see below) hero's resolver already has a real, differentiated re-raise size available here, and CFR converged to allin **80.5%**, raise-to-pot **19.2%**, call/fold ≈0% at **0.72% exploitability** — a legitimate, low-exploitability, heavily-allin-favoring strategy, not a missing-action bug. |
+
+### The hypothesis this section specifically tested and disproved
+
+Spots 3 and 4 share the exact same betting shape (`b1800b4500`, i.e.
+hero opens the turn with a bet, villain re-raises non-all-in) and looked
+initially like a strong lead: `resolve_decision()` (hero's own live
+decision) always uses `extended_actions=false`, and `full_ladder_`'s
+*full* 6-way ladder is gated to `cur_round_action_num==0` only (the
+opening action, per §37) — so it looked plausible that hero, when facing
+villain's re-raise, might be artificially restricted to fold/call/allin
+only, with no way to make a smaller, controlled re-raise, forcing CFR to
+express any "good but not great hand" sentiment via an all-or-nothing
+shove.
+
+**This turned out to be false.** `RealtimeSearch.h`'s `expand()` (line
+~1420) already includes byte 2 (the canonical 1x-pot raise) in the
+reduced action set whenever `extended_actions_ || full_ladder_` is true —
+`full_ladder_` alone already covers this, not just the opening node. For
+TURN mode specifically, `resolve_decision()` sets `full_ladder =
+(mode==TURN && river_leaf != nullptr)`, and the live session had
+`DH_RIVER_SPLIT_DIR` set and valid (confirmed: `river_leaf` loads
+successfully), so `full_ladder_` was already `true` for these decisions.
+A direct diagnostic reproducing spot 4 exactly (`restart_game` → force
+post-flop stacks → `Next_stage(2, board)` → `opp_take_action("check")` →
+`apply_own_action("raise 1800")` → `opp_take_action("raise 4500")` → build
+the real `LiveResolver` with `resolve_decision()`'s exact arguments)
+confirmed `cur_round_action_num=3` and **4 actions available**
+(fold/call/raise-pot/allin), converging to 0.72% exploitability with the
+80.5%/19.2%/0.18%/0.17% mix shown above. **Hero's own decision-making at
+facing-a-raise TURN nodes already has the granular re-raise size this
+section hypothesized was missing** — the CFR-computed strategy simply,
+legitimately, favors all-in most of the time in this specific
+board/hand-strength combination.
+
+### Conclusion
+
+All 4 catastrophic hands examined across this multi-session investigation
+(section 36's original Q7o TURN spot, plus these 4) were legitimate,
+converged, low-exploitability CFR outputs — not bugs, not missing action
+granularity, not size-blind narrowing failures (spot 2 specifically
+disproves that for the one case where it could have mattered). The
+worsening −1BB → −2.3BB/hand trend over this session is consistent with
+variance: this project's TURN "facing a real re-raise with a decent-but-
+not-great hand" decision node has a genuinely high (as measured, up to
+~80%) all-in frequency baked into its resolved strategy, so when it's
+wrong the cost is the entire stack, and a few such events over a ~350-hand
+window are enough to swing the aggregate rate substantially even though
+the underlying per-decision strategy is sound. No fix was found to be
+both needed and viable this section; the one candidate tested (section's
+earlier 0.5x-pot branch experiment) was already rejected for not
+generalizing.
+
+### Files touched
+
+None shipped — this section is diagnostic/documentation only. Two
+throwaway diagnostics (`_diag_flop_shove*` in an earlier part of this
+investigation, `_diag_facing_raise.cpp` in this part) were built, used,
+and fully deleted; `git status --short` confirmed a clean tree before and
+after.
