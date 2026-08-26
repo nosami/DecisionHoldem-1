@@ -316,7 +316,6 @@ std::string resolve_preflop_decision() {
 
 void apply_own_action(const std::string& action) {
 	int me = g.my_id;
-	int prev_facing = std::max(committed_this_street(0), committed_this_street(1));
 	if (action == "fold") {
 		g.folder = me;
 		g.betting_stage = 5;
@@ -334,7 +333,24 @@ void apply_own_action(const std::string& action) {
 		g.actions_this_street++;
 	}
 	else { // "call" (also covers "check" -- identical bookkeeping when nothing is owed)
-		g.stack[me] = g.stack_at_street_start[me] - prev_facing;
+		// A call always brings the caller's WHOLE-HAND cumulative
+		// contribution up to match whichever player has put in the most so
+		// far -- that is simply what "call" means. This MUST use the raw
+		// 20000 baseline (the same one every other whole-hand-cumulative
+		// computation in this file uses -- e.g. resolve_preflop_decision(),
+		// match_raise_action_byte(), resolve_decision()'s s.last_bigbet),
+		// NOT g.stack_at_street_start[me]-prev_facing: on preflop
+		// specifically, stack_at_street_start[] is already blind-adjusted
+		// (see restart_game()), so that street-relative formula silently
+		// no-ops the small blind's very first action (completing the blind
+		// from 50 to 100), permanently under-counting the SB's
+		// contribution by exactly the blind amount for the rest of the
+		// hand -- which then makes last_bigbet/n_chips_to_call wrong on
+		// every later street, occasionally causing legal_actions() to
+		// wrongly still offer fold when the true amount owed is 0. See
+		// BUILD_NOTES.md section 24.
+		int last_bigbet_before = std::max(20000 - g.stack[0], 20000 - g.stack[1]);
+		g.stack[me] = 20000 - last_bigbet_before;
 		g.actions_this_street++;
 	}
 }
@@ -404,7 +420,12 @@ void opp_take_action(char* actionstr_c) {
 		g.actions_this_street++;
 	}
 	else { // "call" or "check"
-		g.stack[opp] = g.stack_at_street_start[opp] - prev_facing;
+		// See apply_own_action()'s matching comment / BUILD_NOTES.md section
+		// 24: must use the raw 20000 whole-hand baseline here, not
+		// g.stack_at_street_start[opp]-prev_facing, or the small blind's
+		// preflop completing call/limp silently no-ops.
+		int last_bigbet_before = std::max(20000 - g.stack[0], 20000 - g.stack[1]);
+		g.stack[opp] = 20000 - last_bigbet_before;
 		g.actions_this_street++;
 		if (preflop && g.preflop_path_confident) g.preflop_action_path.push_back('l');
 	}

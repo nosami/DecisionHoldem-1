@@ -2932,3 +2932,128 @@ sequentially loads the four other multi-GB cluster files from the
 external drive, unchanged by this fix), but preflop decisions after a
 raise should now resolve in single-digit seconds rather than appearing to
 hang indefinitely.
+
+## 24. Real bug found and fixed: the small blind's preflop completing call/limp was silently a no-op, permanently corrupting `n_chips_to_call` for the rest of the hand (occasionally causing an illegal fold when facing a free check)
+
+### The report
+
+User played a hand where the action was: `AI, call 100` (preflop, AI is
+small blind completing the blind) / `Human, raise 300` / `AI, call 300`
+(preflop closes) / `Human, call 0` (a flop check) / `AI, fold 0`. Folding
+when facing 0 to call is never correct -- check is always weakly better
+than fold when free -- and `PokerAI/poker/State.h`'s `legal_actions()`
+(used by both the offline `Pokerstate` and the live `Searchstate`/
+`LiveResolver` path) already architecturally excludes `'d'` (fold) as a
+legal action whenever `n_chips_to_call == 0`. So if the AI genuinely
+folded facing 0, `n_chips_to_call` at the resolver's root must have been
+computed as *nonzero* even though the true amount owed was 0.
+
+### Root cause
+
+`dh_native_ai.cpp`'s `LiveGame` struct tracks each player's stack
+purely from the sequence of ABI calls the GUI makes (`restart_game`,
+`opp_take_action`, and its own `apply_own_action` after each
+`getdecision()`), and `resolve_decision()`/`resolve_preflop_decision()`
+derive `last_bigbet`/`n_chips_to_call` from those stacks using the
+**raw 20000 starting-stack baseline** (`last_bigbet = max(20000 -
+stack[0], 20000 - stack[1])`) -- a whole-hand-cumulative convention,
+matching `PokerAI/poker/State.h`'s own `n_bet_chips()`/`total_pot`
+bookkeeping, which never resets across streets.
+
+But `apply_own_action()`'s and `opp_take_action()`'s **"call"/"check"**
+branches computed the new stack a different way:
+
+```cpp
+g.stack[me] = g.stack_at_street_start[me] - prev_facing;
+```
+
+`g.stack_at_street_start[]` is reset to the *current* stack at the start
+of every street (`reset_street_counters()`), which for **preflop
+specifically** is set immediately after `restart_game()` posts the
+blinds -- i.e. it is *already* blind-adjusted (19950 for the small
+blind, 19900 for the big blind), not the raw 20000 both the raise
+branch and every other whole-hand-cumulative computation in the file
+use. `prev_facing` is computed relative to that same already-shifted
+baseline, so on the very first preflop action -- the small blind
+completing/limping in with a plain "call" (no raise) -- both sides of
+the subtraction evaluate to the *same* number the SB's stack already
+had, making the call a **silent no-op**: the SB's stack never actually
+moves from 19950 to 19900, so its tracked whole-hand contribution stays
+permanently understated by exactly the blind differential (50 chips)
+for the rest of the entire hand. Every later call in the same hand
+compounds relative to this already-wrong baseline (confirmed with a
+standalone reproduction below: after `call 100`/`raise 300`/`call 300`,
+the buggy code left the AI's tracked contribution at 250 instead of
+300). This 50-chip phantom deficit then makes `last_bigbet -
+n_bet_chips(hero)` evaluate to 50 (not 0) at the very first postflop
+decision after a check, so `legal_actions()` correctly-per-its-own-logic
+but wrongly-per-the-real-game-state includes `'d'` (fold) as legal, and
+the resolver can then sample it.
+
+Critically, this only triggers when the **small blind's very first
+preflop action is a plain call/limp** (not a raise, which already used
+the correct `street_relative_raise_baseline()` conversion) -- an
+extremely common heads-up opening, explaining why this surfaced quickly
+in real play.
+
+### The fix
+
+Replaced both buggy call/check branches with the same robust,
+already-used-elsewhere invariant: **a call always brings the caller's
+whole-hand cumulative contribution up to match whoever has put in the
+most so far**, computed directly against the raw 20000 baseline:
+
+```cpp
+int last_bigbet_before = std::max(20000 - g.stack[0], 20000 - g.stack[1]);
+g.stack[me] = 20000 - last_bigbet_before;  // (g.stack[opp] on the opponent side)
+```
+
+This eliminates the need for `g.stack_at_street_start[]`/`prev_facing`
+in the call/check case entirely (they remain needed, and untouched, for
+the raise/all-in branches' `last_raise_size`/per-street-amount
+conversion, which do not share this bug). `apply_own_action()`'s
+now-unused `prev_facing` local was removed; `opp_take_action()`'s is
+still used by its raise/all-in branches, so it was kept there.
+
+### Validation
+
+Built a dependency-free standalone reproduction (a pure copy of the
+`LiveGame` struct + the four bookkeeping functions, with no
+`Engine`/blueprint dependency, so it runs in milliseconds without
+needing any cluster data) and exercised exactly the reported sequence:
+
+- **Before the fix:** `call 100` / `raise 300` / `call 300` left the
+  AI's tracked cumulative contribution at 250 (should be 300); the
+  first flop decision after a check computed `n_chips_to_call = 50`
+  (should be 0) -- fold incorrectly offered as legal. Confirmed bug.
+- **After the fix:** the same sequence left both players' cumulative
+  contributions correctly equal at 300 after preflop closes, and
+  `n_chips_to_call = 0` after the flop check -- fold correctly excluded.
+- Additional regression scenarios also verified correct: (a) the
+  opponent (not the AI) as small blind limping in, from the AI's (big
+  blind's) perspective; (b) a normal postflop bet/call sequence (which
+  uses the per-street `"raise N"` convention, untouched by this fix)
+  still computes matching whole-hand-cumulative totals for both
+  players; (c) an all-in scenario (unaffected code path) still zeroes
+  the shover's stack correctly.
+- Rebuilt `dh_native_ai.dylib`
+  (`g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -shared -fPIC -o
+  dh_native_ai.dylib tools/dh_native_ai.cpp`, run from `PokerAI/`); all
+  4 ABI symbols (`_restart_game`, `_Next_stage`, `_opp_take_action`,
+  `_getdecision`) confirmed present via `nm -gU`.
+
+### What the user should do
+
+**Restart the server** to pick up the rebuilt `.dylib` (a live process
+keeps using whatever it already loaded at startup):
+
+```
+cd /Users/jason/src/copilot-worktrees/DecisionHoldem/nosami-fuzzy-guide/pypokergui/server
+source /tmp/dh_venv/bin/activate
+python3 ../__main__.py serve dummy --port 8000
+```
+
+This was the third real bug found and fixed by direct code inspection
+plus a targeted, no-cluster-data-needed standalone reproduction (after
+sections 21 and 22) -- all three were genuine logic errors in this
+session's own new code, not pre-existing upstream defects.
