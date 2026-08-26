@@ -34,3 +34,7 @@ PokerAI/tools/test_live_resolver_iteration_budget
 PokerAI/tools/test_resolver_exploitability
 PokerAI/tools/test_run_until_converged
 PokerAI/tools/test_partial_cluster_load
+PokerAI/tools/split_cluster_file
+PokerAI/tools/test_per_file_cluster_load
+PokerAI/tools/validate_split_against_monolith
+PokerAI/tools/time_per_file_river_load
