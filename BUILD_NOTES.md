@@ -952,20 +952,26 @@ and not once per decision.**
 
 ## 9. Experiment: can disabling river_hand_cluster.bin loading enable a flop decision?
 
-Tested directly, empirically, and safely (without risking the shared host).
+Tested directly, empirically, and safely (without risking the shared host),
+then **reverted afterward at the user's request** — `poker/Engine.h` is back
+to its original, unconditional river-loading behavior, and the temporary
+test tool has been removed. The findings below remain accurate as a record
+of what was tested and observed; they just no longer correspond to any code
+currently in this tree.
+
 **Short answer: no — not through this repository's only existing decision
 entrypoint, and not for an algorithmic reason, not just a RAM reason.**
 
-### What was tested
+### What was tested (code no longer present — see note above)
 
-`poker/Engine.h`'s `load()` now supports an opt-in build flag,
-`DH_SKIP_RIVER_CLUSTER` (default OFF — normal/Linux behavior is completely
-unchanged unless this macro is explicitly defined at compile time), which
-skips allocating and reading `river_hand_cluster.bin` (~16.86GB) entirely.
-See the `#ifndef DH_SKIP_RIVER_CLUSTER` / `#else` block in `Engine::load()`.
+`poker/Engine.h`'s `load()` was temporarily given an opt-in build flag,
+`DH_SKIP_RIVER_CLUSTER` (default OFF — normal/Linux behavior was completely
+unchanged unless this macro was explicitly defined at compile time), which
+skipped allocating and reading `river_hand_cluster.bin` (~16.86GB) entirely.
 
-A small standalone test, `PokerAI/tools/test_engine_no_river.cpp`, was built
-against this flag and run under live `ps`/`vm_stat`/disk monitoring:
+A small standalone test, `PokerAI/tools/test_engine_no_river.cpp` (also
+since removed), was built against this flag and run under live
+`ps`/`vm_stat`/disk monitoring:
 
 ```
 g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o /tmp/test_engine_no_river tools/test_engine_no_river.cpp
@@ -1045,8 +1051,11 @@ run infeasible on this 16GiB machine on its own.
   needing river data for a flop decision. This is exactly the gap that
   `Depth_limit_Search.h` was meant to fill in the original design but is
   absent from the released source (section 2).
-- No production behavior changed: `DH_SKIP_RIVER_CLUSTER` is off by default,
-  so ordinary builds behave identically to before this experiment.
+- No production behavior changed at any point, and no trace of the
+  experiment remains in the source: `DH_SKIP_RIVER_CLUSTER` was off by
+  default while present, and the guard plus the standalone test tool were
+  both fully removed afterward — `poker/Engine.h` is back to its original,
+  unconditional river-loading code, verified byte-identical via `git diff`.
 
 ## 10. Appendix: complete binary-file inventory
 

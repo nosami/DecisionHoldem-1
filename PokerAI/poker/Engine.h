@@ -121,9 +121,6 @@ public:
 				in5.read((char*)flop_cluster[i * 52 + j].values, sizeof(unsigned) * 19600);
 			}
 		in5.close();
-#ifndef DH_SKIP_RIVER_CLUSTER
-		// Normal (default) behavior: load the full ~16.86GB river_hand_cluster.bin
-		// into RAM, same as upstream. Preserved unchanged for Linux/original use.
 		for (int i = 0; i < 51; i++)
 			for (int j = i + 1; j < 52; j++) {
 				river_cluster[i * 52 + j].keys = new unsigned[river_community_total];
@@ -136,16 +133,6 @@ public:
 				in6.read((char*)river_cluster[i * 52 + j].values, sizeof(unsigned short) * river_community_total);
 			}
 		in6.close();
-#else
-		// EXPERIMENTAL / TEMPORARY (macOS RAM-budget experiment): skip allocating
-		// and reading river_hand_cluster.bin entirely. river_cluster[].keys/values
-		// are left as null pointers. This saves ~16.86GB of RAM but means any
-		// subsequent call into get_river_cluster()/find_river() will dereference
-		// a null pointer and crash -- by design, to test whether the engine can
-		// be used for flop/turn-only decisions without river data. Not intended
-        // for production use; must not be enabled by default.
-		cout << "[DH_SKIP_RIVER_CLUSTER] river_hand_cluster.bin NOT loaded (experiment mode)" << endl;
-#endif
 		for (int i = 0; i < 51; i++)
 			for (int j = i + 1; j < 52; j++) {
 				preflop_allin[i * 52 + j] = new int[2652];
