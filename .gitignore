@@ -39,3 +39,4 @@ PokerAI/tools/test_per_file_cluster_load
 PokerAI/tools/validate_split_against_monolith
 PokerAI/tools/time_per_file_river_load
 PokerAI/tools/test_villain_weight_distribution
+PokerAI/tools/test_bet_size_narrowing

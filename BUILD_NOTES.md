@@ -4088,3 +4088,169 @@ code rather than reimplementing it). Build/run (from `PokerAI/`):
 g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_villain_weight_distribution tools/test_villain_weight_distribution.cpp
 ./tools/test_villain_weight_distribution
 ```
+
+## 33. Fixing postflop villain-range narrowing so a real (non-all-in) opponent bet size actually updates the tracked range
+
+**Correction of a prior misstatement (per user pushback, already logged in
+section 32's closing note): the "postflop narrowing skips non-all-in
+raises" behavior was NOT a pre-existing constraint discovered in someone
+else's code -- it was this project's own earlier design choice, made when
+`narrow_villain_range_postflop()` was first written (commit `af602af`),
+because `RealtimeSearch.h`'s `LiveResolver` (100% assistant-authored, not
+part of the original DecisionHoldem source) reduces every postflop
+decision node down to only `'d'`/`'l'`/`'n'` (fold/call/all-in) for
+tractability. This section fixes that limitation, rather than just
+describing it.
+
+### The fix
+
+`RealtimeSearch.h`'s `LiveResolver` gained one new constructor parameter,
+`extended_actions` (default `false`, so nothing changes unless a caller
+opts in):
+
+```cpp
+LiveResolver(const Players_range& range, Engine* eng,
+             const TurnClusterLeafModel* leaf, Mode mode,
+             bool extended_actions = false)
+```
+
+When `true`, `expand()`'s action filter additionally keeps native action
+byte `2` -- a genuine, already-implemented "1x pot" raise
+(`State.h::take_action()`'s `actionstr <= 80` branch; nothing new was
+added to the poker engine itself, this byte already existed and was simply
+being filtered out). The reduced set becomes `{fold, call, raise(pot),
+allin}` -- 4 actions instead of 3 -- ONLY for resolver instances built
+with this flag set.
+
+**Scope is deliberately narrow and asymmetric:**
+- `resolve_decision()` (hero's own live decision, in `dh_native_ai.cpp`)
+  still constructs its `LiveResolver` with the plain 4-argument
+  constructor (`extended_actions` defaults to `false`). **Hero's own
+  action repertoire is completely unchanged** -- still only
+  fold/call/all-in, exactly as before. This fix is scoped strictly to
+  belief-tracking, not to giving hero a new kind of bet to make (that
+  would be a much larger, separately-riskier change: it would require
+  translating a chosen "raise-to-pot" tree action into a real GUI-facing
+  `"raise <amount>"` string, verifying chip-accounting parity with
+  `apply_own_action()`, etc. -- explicitly out of scope for "fix
+  narrowing based on opponent bet sizes").
+- `narrow_villain_range_postflop()` now ALWAYS builds its own, separate,
+  purpose-built resolver instance with `extended_actions=true`. This
+  resolver's output is used ONLY to compute the Bayesian weight multiplier
+  for `g.villain_range` -- it never feeds back into hero's own decision.
+
+`opp_take_action()`'s postflop `"raise N"` handling changed from:
+```cpp
+// OLD: any non-all-in raise -> byte '?' -> narrow_villain_range_postflop()
+// immediately rejects it (not d/l/n) and skips narrowing entirely.
+narrow_villain_range_postflop(opp, would_be_allin ? 'n' : '?');
+```
+to:
+```cpp
+// NEW: any non-all-in raise now maps onto the new byte-2 "pot raise"
+// bucket, which narrow_villain_range_postflop()'s extended-action
+// resolver has a genuine node for.
+narrow_villain_range_postflop(opp, would_be_allin ? (unsigned char)'n' : (unsigned char)2);
+```
+
+**Honest limitation, unchanged in spirit from before:** this still
+collapses every non-all-in raise size onto ONE bucket -- a min-raise and
+a 5x-pot overbet narrow identically. The full native pot-fraction ladder
+(0.5/1/2/4/10/20x pot, 6-7 actions) was already measured as
+computationally infeasible for this resolver's TURN/RIVER chance-node
+fanout (a "quick full-action attempt did not finish 5 iterations in
+several minutes" -- section 16). Adding exactly one more canonical size
+is the tractable middle ground actually implemented here: a real bet is
+no longer indistinguishable from a check, but a min-raise and a shove-sized
+non-all-in bet are still bucketed together. This is a real, disclosed
+accuracy/tractability trade-off, not a claim of finer-grained modeling
+than actually exists.
+
+### Real validation (new file: `PokerAI/tools/test_bet_size_narrowing.cpp`)
+
+`#include`s `dh_native_ai.cpp` directly (that file defines no `main()`,
+so this reuses 100% real production code, same pattern as section 32's
+test). Drives real hands through `restart_game()`/`opp_take_action()`/
+`Next_stage()` and inspects `g.villain_range` directly. Build/run (from
+`PokerAI/`):
+```
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_bet_size_narrowing tools/test_bet_size_narrowing.cpp
+./tools/test_bet_size_narrowing
+```
+
+Measured results (real, not assumed):
+
+| Check | Result |
+|---|---|
+| FLOP: villain raises "raise 700" (NOT all-in) | Max per-combo weight change **0.0157** (previously would have been exactly 0.0 -- a silent no-op); weights still sum to 1.0; **1307.8ms** wall-clock |
+| FLOP: pre-existing all-in narrowing | Still works, unchanged behavior (regression check passed) |
+| TURN: villain raises "raise 1800" (NOT all-in) | Max per-combo weight change **0.102-0.131** across runs; weights still sum to 1.0 |
+
+Both non-trivial weight changes confirm the fix actually fires and
+produces a real Bayesian update, not a no-op disguised as success.
+
+### A real, measured side-effect this fix caused, and the fix for that
+
+The 4th action increases per-iteration CFR cost. This barely matters for
+FLOP (no chance-node fanout in that mode; `run_until_converged()` already
+converges well under its 3000ms budget either way) but matters for TURN,
+where cost is already dominated by chance-node fanout (~44-48 river-card
+branches) and `run_until_converged()`'s wall-clock check only happens
+*between* batches (previously batch_size=100 for TURN):
+
+- **Before this section's adjustment**: TURN narrowing with the new 4th
+  action measured **14745-14837ms**, overshooting the intended 12000ms
+  safety cap by **~23-24%** (vs. the *pre-existing* 3-action baseline's
+  own ~10% overshoot -- e.g. `900 iterations / 13174ms` from section 28 --
+  which was already imprecise before this fix, just less so).
+- **Fix**: halved TURN's `batch_size` from 100 to 50 in
+  `convergence_config_for_mode()`, so the wall-clock cap is checked twice
+  as often. This does not change WHAT TURN converges to, only how
+  tightly the safety-cap wall-clock is honored.
+- **After the adjustment**: re-measured TURN narrowing at **13217.9-13329.3ms**,
+  back in line with (even slightly better than) the pre-existing ~10%
+  overshoot margin.
+- **Regression check**: `test_run_until_converged` (which builds its own
+  plain, non-extended-action resolver, exactly like `resolve_decision()`
+  does) reproduced almost exactly its section-28 baseline after this
+  change -- `900 iters / 13217.9ms / 2.406% exploitability / hit safety
+  cap` vs. the original `900 / 13174ms / 2.406%` -- confirming hero's own
+  decision path (default `extended_actions=false`) is completely
+  unaffected by either the new action or the batch-size tweak.
+
+### Effect on section 32's previously-reported weight-concentration numbers
+
+Re-running `test_villain_weight_distribution.cpp` (unmodified from
+section 32) against this fixed code gives **numerically different**
+concentration numbers than section 32 originally reported (e.g. FLOP
+all-in scenario: 50%-of-mass combo count moved from 58/1081 to 44/1081;
+TURN all-in scenario: 90%-of-mass moved from 161/1035 to 452/1035). This
+is expected, not a bug or a contradiction: that test's all-in narrowing
+calls now run through a resolver whose tree has a genuine extra branch
+(the pot-raise bucket), which changes the CFR equilibrium computed at
+that decision node even for an all-in observation, since the other
+player's own optimal response now accounts for a real alternative
+sizing option that didn't exist in the tree before. The qualitative
+conclusion from section 32 (concentration increases substantially,
+especially after an all-in) still holds; only the exact figures shifted.
+
+### Files touched
+
+- `PokerAI/tree/RealtimeSearch.h`: added `LiveResolver`'s
+  `extended_actions` constructor parameter/member and its `expand()`
+  filter change (byte 2 kept only when the flag is set).
+- `PokerAI/tools/dh_native_ai.cpp`: `narrow_villain_range_postflop()` now
+  accepts byte 2 and always builds its resolver with
+  `extended_actions=true`; `opp_take_action()`'s postflop raise handling
+  maps any non-all-in raise to byte 2 instead of the old always-skipped
+  `'?'` placeholder; `convergence_config_for_mode()`'s TURN `batch_size`
+  reduced 100->50; header's SCOPE/HONEST LIMITATIONS comment updated to
+  describe the new behavior accurately (previously said non-all-in raises
+  "can't be used to narrow the range" -- no longer true).
+- `PokerAI/tools/test_bet_size_narrowing.cpp` (new): the validation tool
+  described above; kept as a permanent regression test.
+- `.gitignore`: added the new test binary.
+
+Rebuilt `dh_native_ai.dylib` clean; confirmed all 4 required ABI symbols
+(`restart_game`, `Next_stage`, `opp_take_action`, `getdecision`) still
+exported via `nm -gU`.

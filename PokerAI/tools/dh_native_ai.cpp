@@ -50,13 +50,23 @@
 //       the exact node the opponent just acted from). This is still "unsafe"
 //       resolving in the classical subgame-solving sense (no equilibrium
 //       computation over hero's own strategy across the whole hand, just a
-//       fresh vanilla-CFR resolve per decision against the current belief),
-//       and postflop narrowing is itself restricted to the SAME reduced
-//       fold/call/allin action set the resolver already uses everywhere else
-//       (an opponent's non-all-in postflop raise has no corresponding node
-//       in this abstraction, so it can't be used to narrow the range; see
-//       narrow_villain_range_postflop()). Turn decisions additionally assume
-//       the river gets checked down (no river-betting subtree) purely to
+//       fresh vanilla-CFR resolve per decision against the current belief).
+//       Postflop narrowing uses its OWN, separate resolver instance with one
+//       extra genuine branch beyond hero's own fold/call/allin action set: a
+//       canonical 1x-pot raise (native action byte 2). Hero's own live
+//       decisions are unaffected (resolve_decision() always uses the
+//       original 3-action resolver) -- this extra branch exists purely so
+//       narrow_villain_range_postflop() has a real node to narrow an
+//       observed non-all-in raise against, instead of silently skipping it
+//       as earlier versions did. Any non-all-in raise size collapses onto
+//       this single bucket (a min-raise and a 5x overbet narrow the same
+//       way) -- the full native pot-fraction ladder was found computationally
+//       infeasible for this resolver's chained turn/river chance-node fanout
+//       (BUILD_NOTES.md section 16), so one extra branch is the tractable
+//       middle ground actually implemented. See narrow_villain_range_postflop()
+//       and RealtimeSearch.h's LiveResolver for the exact mechanics. Turn
+//       decisions additionally assume the river gets checked down (no
+//       river-betting subtree) purely to
 //       keep response times interactive; river decisions are resolved
 //       exactly (real showdown, no cluster approximation) since there are no
 //       more cards to deal. See BUILD_NOTES.md for the design writeup and
@@ -444,7 +454,16 @@ struct ConvergenceConfig {
 
 ConvergenceConfig convergence_config_for_mode(LiveResolver::Mode mode) {
 	if (mode == LiveResolver::Mode::FLOP)  return { 200, 10000, 3000.0 };
-	if (mode == LiveResolver::Mode::TURN)  return { 100, 2000, 12000.0 };
+	// TURN's batch_size was 100 before the bet-size-narrowing fix added a 4th
+	// (extended_actions) branch to this resolver's tree; the wall-clock cap
+	// below is only checked BETWEEN batches, so a costlier per-iteration rate
+	// makes any single batch's overshoot past max_ms bigger. Halved to 50 to
+	// keep that overshoot bounded after the extra action made each iteration
+	// more expensive (measured: batch=100 could overshoot the 12s cap by
+	// ~2.7-2.8s/~23%, vs. the pre-existing ~1.2s/~10% overshoot at 3 actions
+	// -- see BUILD_NOTES.md). This does not change what TURN converges TO,
+	// only how precisely the safety cap is honored.
+	if (mode == LiveResolver::Mode::TURN)  return { 50, 2000, 12000.0 };
 	return { 500, 20000, 6000.0 }; // RIVER
 }
 
@@ -497,12 +516,11 @@ void run_until_converged(LiveResolver& resolver, LiveResolver::Mode mode,
 // make that skip explicit and logged rather than silently ignored.
 void narrow_villain_range_postflop(int opp_slot, unsigned char observed_byte) {
 	if (g.villain_range.empty()) return;
-	if (observed_byte != 'd' && observed_byte != 'l' && observed_byte != 'n') {
+	if (observed_byte != 'd' && observed_byte != 'l' && observed_byte != 2 && observed_byte != 'n') {
 		std::fprintf(stderr,
-			"[DH_RANGE_MODEL] postflop villain-range narrowing skipped: the observed "
-			"action has no node in LiveResolver's reduced fold/call/allin action "
-			"abstraction (e.g. a non-all-in raise) -- range left unchanged for this "
-			"action\n");
+			"[DH_RANGE_MODEL] postflop villain-range narrowing skipped: action byte %d "
+			"has no node in this resolver's action abstraction -- range left unchanged "
+			"for this action\n", (int)observed_byte);
 		return;
 	}
 	try {
@@ -524,7 +542,16 @@ void narrow_villain_range_postflop(int opp_slot, unsigned char observed_byte) {
 			unsigned char flop_board[3] = { g.board[0], g.board[1], g.board[2] };
 			leaf.reset(new TurnClusterLeafModel(engine, flop_board, range));
 		}
-		LiveResolver resolver(range, engine, leaf.get(), mode);
+		// extended_actions=true: this resolver instance is used ONLY to
+		// compute a narrowing update, never to pick hero's own action (see
+		// resolve_decision(), which always uses the default/false, 3-action
+		// resolver instead) -- so it is safe to give it a genuine 4th
+		// branch (byte 2, a canonical 1x-pot raise) so an observed non-
+		// all-in raise has a real node to narrow against, instead of being
+		// silently skipped. See RealtimeSearch.h's LiveResolver constructor
+		// comment and BUILD_NOTES.md for the full design writeup and
+		// measured cost of the extra action.
+		LiveResolver resolver(range, engine, leaf.get(), mode, /*extended_actions=*/true);
 		resolver.init_root(s, g.board);
 		std::vector<double> tracked_weights;
 		tracked_weights.reserve(g.villain_range.size());
@@ -809,12 +836,21 @@ void opp_take_action(char* actionstr_c) {
 			else g.preflop_path_confident = false; // can no longer trust the tracked path this hand
 		}
 		else if (!preflop) {
-			// Postflop: only an all-in-sized raise maps onto LiveResolver's
-			// reduced fold/call/allin abstraction (see
-			// narrow_villain_range_postflop()'s header comment) -- a
-			// smaller raise has no corresponding node to narrow against.
+			// Postflop: an all-in-sized raise maps to byte 'n'; any other
+			// (non-all-in) raise now maps to byte 2, a canonical 1x-pot
+			// raise bucket that narrow_villain_range_postflop() resolves
+			// with an EXTENDED action set for exactly this purpose (see
+			// its own comment and RealtimeSearch.h's LiveResolver
+			// constructor). This does not distinguish a min-raise from a
+			// 5x overbet -- both collapse onto the same single bucket,
+			// since that's the only non-all-in raise node this reduced
+			// abstraction has room for -- but it means a real, sized
+			// opponent raise now actually narrows the tracked range,
+			// instead of being silently skipped as before. See
+			// BUILD_NOTES.md for the full design writeup, including why a
+			// single bucket (not the full native ladder) was chosen.
 			bool would_be_allin = (street_relative_raise_baseline(opp) - amount) == 0;
-			narrow_villain_range_postflop(opp, would_be_allin ? (unsigned char)'n' : (unsigned char)'?');
+			narrow_villain_range_postflop(opp, would_be_allin ? (unsigned char)'n' : (unsigned char)2);
 		}
 		g.stack[opp] = street_relative_raise_baseline(opp) - amount;
 		g.last_raise_size = std::max(0, amount - prev_facing);

@@ -761,8 +761,22 @@ class LiveResolver {
 public:
 	enum class Mode { FLOP, TURN, RIVER };
 
-	LiveResolver(const Players_range& range, Engine* eng, const TurnClusterLeafModel* leaf, Mode mode)
-		: range_(range), engine_(eng), leaf_(leaf), mode_(mode) {
+	// `extended_actions`, when true, adds ONE extra genuine tree branch to
+	// the otherwise-reduced fold/call/allin action set: a canonical
+	// pot-sized raise (native action byte 2 -- see State.h's take_action(),
+	// which already implements it exactly like every other pot-fraction
+	// raise; nothing new is added to the engine itself, only to this
+	// resolver's own action filter). Default is false, so hero's own live
+	// decisions (resolve_decision() in dh_native_ai.cpp) are completely
+	// unaffected -- this flag exists so narrow_villain_range_postflop() can
+	// build a SEPARATE, purpose-built resolver instance that gives an
+	// observed non-all-in opponent raise a real node to narrow against,
+	// without changing what hero itself is able to do. See BUILD_NOTES.md
+	// for the full writeup (why one bucket, why not the full ladder, and
+	// the measured cost of the 4th action).
+	LiveResolver(const Players_range& range, Engine* eng, const TurnClusterLeafModel* leaf, Mode mode,
+		bool extended_actions = false)
+		: range_(range), engine_(eng), leaf_(leaf), mode_(mode), extended_actions_(extended_actions) {
 		N = (int)range_.hero.size();
 		M = (int)range_.villain.size();
 	}
@@ -1106,8 +1120,14 @@ private:
 		unsigned char buf[16];
 		int n = node->state.legal_actions(buf);
 		std::vector<unsigned char> reduced;
+		// Byte 2 ("1x pot" raise, per State.h's take_action()) is included
+		// only when extended_actions_ is set -- see the constructor
+		// comment. legal_actions() already emits bytes in the real
+		// fold/call/raise-sizes-ascending/allin order, so this preserves
+		// that relative order without any extra sorting.
 		for (int i = 0; i < n; i++)
-			if (buf[i] == 'd' || buf[i] == 'l' || buf[i] == 'n') reduced.push_back(buf[i]);
+			if (buf[i] == 'd' || buf[i] == 'l' || buf[i] == 'n' ||
+				(extended_actions_ && buf[i] == 2)) reduced.push_back(buf[i]);
 		node->actions = reduced;
 		int p = node->state.player_i_index;
 		int own_n = (p == 0) ? N : M;
@@ -1213,6 +1233,7 @@ private:
 	Engine* engine_;
 	const TurnClusterLeafModel* leaf_;
 	Mode mode_;
+	bool extended_actions_;
 	int N, M;
 };
 
