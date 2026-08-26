@@ -17,3 +17,11 @@ __pycache__/
 PokerAI/dh_native_ai.dylib
 pypokergui/server/dh_native_ai.dylib
 pypokergui/server/cluster
+
+# Locally-built validation/diagnostic tools (compiled from committed .cpp
+# sources under PokerAI/tools/ -- see BUILD_NOTES.md section 18 for the
+# exact build command). Extensionless compiled binaries, not source.
+PokerAI/test_blueprint_root_read
+PokerAI/tools/test_blueprint_root_read
+PokerAI/test_realtime_search_flop
+PokerAI/test_realtime_search_chain
