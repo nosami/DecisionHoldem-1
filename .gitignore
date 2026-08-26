@@ -28,3 +28,8 @@ PokerAI/test_realtime_search_chain
 PokerAI/tools/build_preflop_cache
 PokerAI/tools/test_preflop_cache_validation
 PokerAI/tools/test_preflop_cache_timing
+PokerAI/tools/test_villain_range_model
+PokerAI/tools/test_live_resolver_range_scaling
+PokerAI/tools/test_live_resolver_iteration_budget
+PokerAI/tools/test_resolver_exploitability
+PokerAI/tools/test_run_until_converged

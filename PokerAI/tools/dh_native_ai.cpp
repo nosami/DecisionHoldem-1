@@ -85,6 +85,7 @@
 #include <string>
 #include <random>
 #include <algorithm>
+#include <chrono>
 
 using namespace RealtimeSearch;
 
@@ -400,6 +401,85 @@ Searchstate build_current_searchstate(int acting_slot) {
 	return s;
 }
 
+// Adaptive convergence control: rather than a fixed CFR iteration count
+// per street, run in small batches and stop once the MEASURED
+// exploitability (LiveResolver::exploitability() -- the real best-response
+// gap of the accumulated average strategy, weighted by the SAME villain-
+// range belief actually used for this decision, not a synthetic uniform
+// one) drops below TARGET_EXPLOITABILITY_PCT of the resolved subgame's
+// pot, or a hard safety cap (iteration count or wall-clock time) is hit --
+// whichever comes first. This replaces an earlier fixed-iteration-count
+// design (FLOP=6000/TURN=300/RIVER=10000) once real measurement
+// (tools/test_resolver_exploitability.cpp) showed exploitability isn't a
+// clean, predictable function of iteration count alone -- it depends on
+// the specific hand/board/range in front of the resolver and can even be
+// mildly non-monotonic -- so a fixed count can't reliably promise "under 1%"
+// the way actually checking the real quantity can.
+//
+// Real measured convergence curves (arbitrary synthetic full-range
+// scenario, see tools/test_resolver_exploitability.cpp and BUILD_NOTES.md
+// for the complete numbers and the earlier test-harness bug -- an
+// uninitialized Searchstate field silently made every test scenario
+// degenerate to a single legal action -- that had to be fixed before these
+// numbers meant anything):
+//   FLOP:  74.5% at 60 iters -> 3.48% at 1000 -> 1.13% at 4000 -> 0.80% at
+//          6000 -> 0.54% at 10000. Reliably crosses 1% well within 10000.
+//   RIVER: 75.3% at 60 -> 7.41% at 1000 -> 2.37% at 5000 -> 1.08% at 10000
+//          -> crosses 1% somewhere around 12000-15000 (noisy after that:
+//          0.01%/15000, 0.35%/20000, 0.72%/30000 -- vanilla CFR's average-
+//          strategy exploitability isn't perfectly monotone run-to-run).
+//   TURN:  still only down to ~3.3% after 2000 iterations (~7.8s at this
+//          mode's ~4-6ms/iteration cost, since every TURN iteration must
+//          enumerate all ~44 real river-card chance branches -- unlike
+//          FLOP's TurnClusterLeafModel shortcut or RIVER's terminal
+//          street). Genuinely reaching <1% for TURN this way would cost
+//          many more seconds than is acceptable for live play, so TURN's
+//          safety cap below is an explicit, disclosed "best effort"
+//          compromise, NOT a claim that <1% is actually reached.
+struct ConvergenceConfig {
+	int batch_size;     // iterations run per exploitability check
+	int max_iterations; // hard cap regardless of exploitability
+	double max_ms;      // hard wall-clock cap regardless of exploitability or iteration count
+};
+
+ConvergenceConfig convergence_config_for_mode(LiveResolver::Mode mode) {
+	if (mode == LiveResolver::Mode::FLOP)  return { 200, 10000, 3000.0 };
+	if (mode == LiveResolver::Mode::TURN)  return { 100, 2000, 12000.0 };
+	return { 500, 20000, 6000.0 }; // RIVER
+}
+
+const double TARGET_EXPLOITABILITY_PCT = 1.0;
+
+// Runs `resolver` (already init_root()'d) in batches, seeding/continuing
+// reach exactly as a single resolver.run(N, ...) call already would (CFR's
+// regret/strat_sum accumulation lives on the persistent Node tree and is
+// unaffected by being called across several smaller run() calls instead of
+// one big one -- validated directly in tools/test_resolver_exploitability.cpp),
+// stopping as soon as measured exploitability drops under
+// TARGET_EXPLOITABILITY_PCT of the root pot or a safety cap is hit.
+// `external_reach0`/`external_reach1` are passed straight through to both
+// run() and exploitability() so the convergence check reflects this exact
+// decision's real tracked-range belief, not a synthetic uniform one.
+void run_until_converged(LiveResolver& resolver, LiveResolver::Mode mode,
+	const std::vector<double>* external_reach0, const std::vector<double>* external_reach1) {
+	ConvergenceConfig cfg = convergence_config_for_mode(mode);
+	double pot = (double)resolver.root->state.table.total_pot;
+	auto t0 = std::chrono::steady_clock::now();
+	int done = 0;
+	while (done < cfg.max_iterations) {
+		int batch = std::min(cfg.batch_size, cfg.max_iterations - done);
+		resolver.run(batch, external_reach0, external_reach1);
+		done += batch;
+		double expl_pct = (pot > 1e-9)
+			? 100.0 * resolver.exploitability(external_reach0, external_reach1) / pot
+			: 0.0;
+		double elapsed_ms = std::chrono::duration<double, std::milli>(
+			std::chrono::steady_clock::now() - t0).count();
+		if (expl_pct < TARGET_EXPLOITABILITY_PCT) break;
+		if (elapsed_ms >= cfg.max_ms) break;
+	}
+}
+
 // Bayesian-narrows villain_range using a DEDICATED LiveResolver run rooted
 // at the state as it stood immediately before the opponent's just-observed
 // postflop action (built via build_current_searchstate(opp_slot) -- must be
@@ -449,9 +529,8 @@ void narrow_villain_range_postflop(int opp_slot, unsigned char observed_byte) {
 		std::vector<double> tracked_weights;
 		tracked_weights.reserve(g.villain_range.size());
 		for (auto& h : g.villain_range) tracked_weights.push_back(h.weight);
-		if (opp_slot == 0) resolver.run(60, &tracked_weights, nullptr);
-		else resolver.run(60, nullptr, &tracked_weights);
-
+		if (opp_slot == 0) run_until_converged(resolver, mode, &tracked_weights, nullptr);
+		else run_until_converged(resolver, mode, nullptr, &tracked_weights);
 		int idx = -1;
 		for (size_t i = 0; i < resolver.root->actions.size(); i++)
 			if (resolver.root->actions[i] == observed_byte) { idx = (int)i; break; }
@@ -511,12 +590,15 @@ std::string resolve_decision() {
 
 	LiveResolver resolver(range, engine, leaf.get(), mode);
 	resolver.init_root(s, g.board);
-	if (opp_slot == 0) resolver.run(60, &tracked_weights, nullptr);
-	else resolver.run(60, nullptr, &tracked_weights);
-	// small iteration budget -- keeps live decisions fast (see BUILD_NOTES.md 17);
-	// resolving against the full tracked range rather than a 40-hand sample is
-	// markedly more expensive per iteration -- see BUILD_NOTES.md's range-model
-	// section for measured timings.
+	if (opp_slot == 0) run_until_converged(resolver, mode, &tracked_weights, nullptr);
+	else run_until_converged(resolver, mode, nullptr, &tracked_weights);
+	// Adaptive iteration budget -- keeps iterating until measured
+	// exploitability drops under ~1% of the pot (or a safety cap is hit);
+	// see run_until_converged()'s comment above for the real measured
+	// convergence data this replaces a fixed count with, and BUILD_NOTES.md
+	// for the full writeup. Resolving against the full tracked range rather
+	// than a fixed-size sample is markedly more expensive per iteration --
+	// see BUILD_NOTES.md's range-model section for measured timings.
 
 	// my_hand was placed at index 0 of whichever range list corresponds to
 	// my slot (see above), and the root's acting player is always me (that

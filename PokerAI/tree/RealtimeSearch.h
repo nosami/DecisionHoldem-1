@@ -883,7 +883,202 @@ public:
 		return node_util;
 	}
 
+	// ---------------------------------------------------------------------
+	// Exploitability measurement: how far the AVERAGE strategy accumulated
+	// by run() so far is from a Nash equilibrium of this resolved subgame.
+	// Added to let live iteration budgets be chosen from a measured
+	// convergence target (e.g. "keep iterating until exploitability drops
+	// below 1% of the pot") instead of an arbitrary fixed iteration count.
+	// See tools/test_resolver_exploitability.cpp for the tool that uses
+	// this, and BUILD_NOTES.md for the measured per-street numbers.
+	//
+	// best_response(node, reach, traverser) computes, for each of
+	// `traverser`'s own hands, the value achievable by best-responding
+	// (choosing the single best action at every one of traverser's own
+	// decision nodes) against the OTHER player's CURRENT AVERAGE strategy
+	// (via the existing static average_strategy(), not the per-iteration
+	// regret-matching strategy cfr() itself uses). It deliberately mirrors
+	// cfr()'s control flow exactly (same terminal-node shortcuts, same
+	// mode-specific FLOP/TURN/RIVER handling) and reuses cfr()'s own
+	// terminal_fold/terminal_leaf/terminal_showdown unchanged: those three
+	// functions already only depend on the OTHER player's reach weights,
+	// never on any strategy of `traverser`, so they are exactly correct
+	// for a best-response computation with no changes at all. The only
+	// node type needing new handling is a genuine decision node: when the
+	// acting player IS traverser, take the per-hand MAX over actions (a
+	// best response is always a pure choice at every real decision point,
+	// not cfr()'s current-iteration mixed strategy); when the acting
+	// player is the OTHER player, weight by their AVERAGE strategy instead
+	// of a single iteration's regret-matching strategy.
+	std::vector<double> best_response(Node* node, std::vector<double> reach[2], int traverser) {
+		Searchstate& s = node->state;
+		if (s.betting_stage == 5) return terminal_fold(node, reach, traverser);
+		if (mode_ == Mode::FLOP && s.betting_stage >= 2) return terminal_leaf(node, reach, traverser);
+		if (mode_ == Mode::TURN && (int)node->board.size() >= 5) return terminal_showdown(node, reach, traverser);
+
+		expand(node);
+		if (node->is_chance) return chance_value_br(node, reach, traverser);
+		if (s.betting_stage >= 4) return terminal_showdown(node, reach, traverser);
+
+		int p = node->state.player_i_index;
+		int own_n = (p == 0) ? N : M;
+		int nA = (int)node->actions.size();
+
+		std::vector<std::vector<double>> avg_strategy;
+		if (p != traverser) {
+			avg_strategy.resize(own_n);
+			for (int h = 0; h < own_n; h++) average_strategy(node, h, avg_strategy[h]);
+		}
+
+		std::vector<std::vector<double>> action_util(nA);
+		for (int a = 0; a < nA; a++) {
+			if (!node->children[a]) {
+				node->children[a].reset(new Node());
+				node->children[a]->state = s;
+				node->children[a]->state.take_action(node->actions[a]);
+				node->children[a]->board = node->board;
+			}
+			std::vector<double> new_reach[2] = { reach[0], reach[1] };
+			if (p != traverser) {
+				for (int h = 0; h < own_n; h++) new_reach[p][h] *= avg_strategy[h][a];
+			}
+			// When p == traverser, reach is left untouched: a best
+			// response's own hand-conditional value doesn't depend on any
+			// mixed strategy traverser might assign to their own actions
+			// -- we're computing the max, not an expectation over a
+			// traverser-side mixture.
+			action_util[a] = best_response(node->children[a].get(), new_reach, traverser);
+		}
+
+		int out_n = (traverser == 0) ? N : M;
+		std::vector<double> node_util(out_n, 0.0);
+		if (p == traverser) {
+			for (int h = 0; h < own_n; h++) {
+				double best = action_util[0][h];
+				for (int a = 1; a < nA; a++) if (action_util[a][h] > best) best = action_util[a][h];
+				node_util[h] = best;
+			}
+		}
+		else {
+			for (int h = 0; h < out_n; h++) {
+				double v = 0.0;
+				for (int a = 0; a < nA; a++) v += action_util[a][h];
+				node_util[h] = v;
+			}
+		}
+		return node_util;
+	}
+
+	// Full exploitability of the average strategy accumulated so far, in
+	// raw chips: BR0 (player 0's best-response value against player 1's
+	// current average strategy, weighted by `prior0` -- a probability
+	// distribution over player 0's own hand range) plus BR1 (the mirror
+	// for player 1, weighted by `prior1`). In this zero-sum resolve (no
+	// rake, chips only change hands) this equals the textbook
+	// exploitability formula (BR0 - v0) + (BR1 - v1), where v0/v1 are the
+	// average-strategy-vs-average-strategy values for each player: because
+	// v0 + v1 = 0 exactly in a zero-sum game, those two terms cancel and
+	// BR0 + BR1 IS the exploitability directly, with no separate
+	// average-vs-average value computation needed. Pass nullptr for
+	// `prior0`/`prior1` to use a uniform prior over each side's
+	// non-board-colliding hands (the right choice for a general
+	// convergence measurement); pass a real tracked-range weight vector
+	// (e.g. dh_native_ai.cpp's LiveGame::villain_range weights) to measure
+	// exploitability of THIS specific live decision's actual belief state
+	// instead. Supplied priors are defensively re-masked for board
+	// collisions and renormalized here -- callers are not required to have
+	// already done so (board cards can outpace a range snapshot taken
+	// earlier in the street).
+	double exploitability(const std::vector<double>* prior0 = nullptr, const std::vector<double>* prior1 = nullptr) {
+		std::vector<double> reach0(N, 1.0), reach1(M, 1.0);
+		for (int h = 0; h < N; h++) if (collides_with_board(range_.hero[h], root->board)) reach0[h] = 0.0;
+		for (int h = 0; h < M; h++) if (collides_with_board(range_.villain[h], root->board)) reach1[h] = 0.0;
+
+		std::vector<double> prior0_v = normalize_prior(prior0, reach0, N);
+		std::vector<double> prior1_v = normalize_prior(prior1, reach1, M);
+
+		// IMPORTANT: the terminal value functions (terminal_fold/leaf/
+		// showdown, reused unmodified from cfr()) sum the traverser's
+		// payoff directly over reach[1-traverser] with no normalization
+		// of their own -- during ordinary CFR training that's fine
+		// (regret-matching's action ratios are invariant to a uniform
+		// rescaling of the opponent's reach), but here we need an actual
+		// chip-denominated expected value, so the OPPONENT'S reach must
+		// already be a normalized probability distribution (sums to 1),
+		// not the raw board-collision 0/1 mask -- otherwise the returned
+		// value scales up by the opponent's range size (off by ~1000x for
+		// a full ~1000-combo range) instead of being a proper average.
+		std::vector<double> reach_for_br0[2] = { reach0, prior1_v };
+		std::vector<double> br0_per_hand = best_response(root.get(), reach_for_br0, 0);
+		double br0 = 0.0;
+		for (int h = 0; h < N; h++) br0 += prior0_v[h] * br0_per_hand[h];
+
+		std::vector<double> reach_for_br1[2] = { prior0_v, reach1 };
+		std::vector<double> br1_per_hand = best_response(root.get(), reach_for_br1, 1);
+		double br1 = 0.0;
+		for (int h = 0; h < M; h++) br1 += prior1_v[h] * br1_per_hand[h];
+
+		return br0 + br1;
+	}
+
 private:
+	static std::vector<double> uniform_prior(const std::vector<double>& reach_mask) {
+		int valid = 0;
+		for (double r : reach_mask) if (r > 0.0) valid++;
+		std::vector<double> out(reach_mask.size(), 0.0);
+		if (valid == 0) return out;
+		double w = 1.0 / valid;
+		for (size_t i = 0; i < reach_mask.size(); i++) if (reach_mask[i] > 0.0) out[i] = w;
+		return out;
+	}
+
+	// If `prior` is supplied, mask it to zero out any board-colliding hand
+	// (index-aligned with `reach_mask`, whose sign already encodes that)
+	// and renormalize to sum to 1; otherwise fall back to a uniform prior
+	// over the non-colliding hands. `expected_n` guards against a
+	// caller-supplied prior of the wrong size (e.g. stale from a previous
+	// street with a different tracked-range length) by falling back to
+	// uniform in that case too, rather than indexing out of bounds.
+	static std::vector<double> normalize_prior(const std::vector<double>* prior,
+		const std::vector<double>& reach_mask, int expected_n) {
+		if (!prior || (int)prior->size() != expected_n) return uniform_prior(reach_mask);
+		std::vector<double> out(expected_n, 0.0);
+		double sum = 0.0;
+		for (int i = 0; i < expected_n; i++) {
+			double v = (reach_mask[i] > 0.0) ? (*prior)[i] : 0.0;
+			out[i] = v;
+			sum += v;
+		}
+		if (!(sum > 1e-12)) return uniform_prior(reach_mask);
+		for (int i = 0; i < expected_n; i++) out[i] /= sum;
+		return out;
+	}
+
+	// Mirrors chance_value() exactly, but recurses into best_response()
+	// instead of cfr() -- chance nodes have no strategy of their own (a
+	// dealt card isn't chosen by either player), so the only change needed
+	// is which function the recursion calls.
+	std::vector<double> chance_value_br(Node* node, std::vector<double> reach[2], int traverser) {
+		int out_n = (traverser == 0) ? N : M;
+		std::vector<double> total(out_n, 0.0);
+		int nC = (int)node->chance_cards.size();
+		for (int ci = 0; ci < nC; ci++) {
+			unsigned char c = node->chance_cards[ci];
+			if (!node->children[ci]) {
+				node->children[ci].reset(new Node());
+				node->children[ci]->state = node->state;
+				node->children[ci]->board = node->board;
+				node->children[ci]->board.push_back(c);
+			}
+			std::vector<double> new_reach[2] = { reach[0], reach[1] };
+			for (int h = 0; h < N; h++) if (range_.hero[h][0] == c || range_.hero[h][1] == c) new_reach[0][h] = 0.0;
+			for (int h = 0; h < M; h++) if (range_.villain[h][0] == c || range_.villain[h][1] == c) new_reach[1][h] = 0.0;
+			std::vector<double> child_util = best_response(node->children[ci].get(), new_reach, traverser);
+			for (int h = 0; h < out_n; h++) total[h] += child_util[h] / nC;
+		}
+		return total;
+	}
+
 	static bool collides_with_board(const std::array<unsigned char, 2>& hand, const std::vector<unsigned char>& board) {
 		for (unsigned char b : board) if (hand[0] == b || hand[1] == b) return true;
 		return false;

@@ -3406,3 +3406,205 @@ the command above, not source. Covered by the existing
 tool binaries (`build_preflop_cache`, `test_preflop_cache_validation`,
 `test_preflop_cache_timing`) are individually gitignored, matching the
 existing pattern for this repo's other locally-built diagnostic tools.
+
+## 28. Live Slumbot losses traced to under-converged CFR; fixed iteration counts replaced with adaptive exploitability-based convergence
+
+**Trigger.** While section 25's opponent-range belief model was running
+live against Slumbot, the user reported large ongoing losses. Reviewing
+`/tmp/slumbot_run.log` showed a real (not purely variance-driven) pattern:
+noisy all-in shoves on weak hands, especially on TURN. Root cause: TURN's
+resolve budget was a **fixed 300-iteration CFR run** (a compromise chosen
+earlier when a requested 6000/10000/10000 FLOP/TURN/RIVER schedule proved
+too slow for TURN specifically — TURN's per-iteration cost is far higher
+than FLOP/RIVER because it has no leaf-abstraction shortcut and must
+enumerate all ~44 real river-card chance branches every iteration). At 300
+iterations CFR has barely begun to converge; its average strategy on a
+single hand can recommend a wildly wrong action.
+
+**The user's proposed fix, adopted as the design going forward:** stop
+picking iteration counts by guesswork or a fixed schedule. Instead, keep
+running CFR **until measured exploitability drops below a target threshold
+(~1% of the pot)**, since exploitability — not iteration count — is the
+actual thing that determines strategy quality, and the right iteration
+count genuinely varies hand-to-hand.
+
+**New machinery added to implement this, in `PokerAI/tree/RealtimeSearch.h`
+(`LiveResolver` class):**
+- `best_response(node, reach[2], traverser)` — walks the same tree
+  `cfr()` does (same FLOP/TURN/RIVER terminal shortcuts, same lazy child
+  creation), but instead of regret-matching, takes the per-hand **MAX**
+  over actions when the acting player is the traverser, and weights by the
+  **other** player's `average_strategy()` (not live regrets) otherwise.
+  This is the textbook best-response value: "the most this player could
+  win by deviating optimally against the other's current average
+  strategy."
+- `exploitability(prior0=nullptr, prior1=nullptr)` — computes the
+  standard CFR exploitability metric `BR0 + BR1` (best-response value for
+  each player against the other's average strategy), in raw chips.
+  Defensively re-masks and renormalizes any caller-supplied prior for
+  board collisions (falls back to a uniform prior if none/invalid) via a
+  new `normalize_prior()` helper, since live callers pass real tracked
+  villain-range beliefs (section 25) that may predate a newly-revealed
+  board card.
+- `chance_value_br()` / `uniform_prior()` — internal helpers mirroring
+  `chance_value()`/existing reach-mask conventions for the best-response
+  path.
+
+**Two real bugs found and fixed while building/validating this** (via a
+new standalone measurement tool, `tools/test_resolver_exploitability.cpp`,
+and a throwaway direct-probe tool used only for diagnosis and since
+deleted):
+1. **Units/normalization bug.** `exploitability()` initially passed
+   `cfr()`'s internal convention for reach — a raw "1.0 per board-
+   noncolliding hand" mask, fine for regret-matching since action ratios
+   are scale-invariant — directly into `best_response()`'s terminal-value
+   calls, which need an actual **normalized probability distribution**
+   (sums to 1). This inflated computed exploitability by roughly the
+   range size (~1000x), producing nonsensical multi-thousand-percent
+   readings. Fixed by normalizing all priors (both the caller-supplied/
+   uniform own-range prior, and the opponent's reach fed into
+   `best_response()`) via `normalize_prior()`.
+2. **Test-harness degeneracy bug (more serious, affected 4 different test
+   tools).** `Searchstate`'s default constructor (`poker/State.h`) only
+   sets `small_blind`/`big_blind` — it leaves `has_allin`, `n_raises`,
+   `cur_round_action_num`, and `last_raise` as **uninitialized stack
+   garbage**. Every hand-rolled test `Searchstate s;` in this repo's test
+   tools built its state without setting these fields. When `has_allin`
+   happened to read as garbage-true, `legal_actions()`/
+   `legal_actions_river()` silently suppressed the entire bet/raise/
+   all-in branch, leaving only `'l'` (check/call) as a legal action — a
+   degenerate 1-action tree where best-response trivially equals the
+   average strategy's value, producing an exact, frozen 0.00%
+   exploitability regardless of iteration count (this is what RIVER/TURN
+   modes showed before the fix; FLOP happened to read non-garbage in that
+   run and showed a real curve, which is what first exposed the
+   discrepancy). Confirmed the fix by cross-referencing the real
+   production `build_current_searchstate()` in `dh_native_ai.cpp`, which
+   correctly derives these fields from live game state. Patched all four
+   affected test tools (`test_resolver_exploitability.cpp`,
+   `test_live_resolver_iteration_budget.cpp`,
+   `test_live_resolver_range_scaling.cpp`, and the now-deleted diagnostic
+   probe) to explicitly set `has_allin=false; n_raises=0;
+   cur_round_action_num=0; last_raise=0;` for a genuine start-of-street
+   state.
+   - **This means the FLOP=898.9ms/TURN=3735.4ms/RIVER=3113.9ms per-
+     decision timing numbers reported earlier this project (from
+     `test_live_resolver_iteration_budget.cpp`) were measured against a
+     degenerate 1-action tree and are superseded** by this section's
+     real, non-degenerate measurements below.
+   - Also incidentally fixed a synthetic test board bug shared by these
+     same tools: `{0,13,26,39,2}` is literally all four 2's plus a 4 —
+     fully degenerate quads-on-board (harmless for pure timing, but
+     useless for exploitability, which needs real decision-relevant
+     hands). Replaced with `{0,14,28,42,5}` = 2s,3c,4d,5h,7s (5 distinct
+     ranks). Card encoding: `rank = card % 13`, `suit = card / 13`
+     (confirmed via `tree/Visualize_Tree.h`).
+
+**Real, validated exploitability-vs-iterations curves** (after both fixes;
+arbitrary fixed synthetic scenario: hero holds Ah,Th; board 2s,3c,4d,5h,7s;
+full board-noncolliding villain range; pot=200 chips), from
+`tools/test_resolver_exploitability.cpp`:
+
+| Mode | Iterations → exploit(% pot) |
+|---|---|
+| FLOP | 60→74.5%, 1000→3.48%, 4000→1.13%, **6000→0.80%** (first <1%), 10000→0.54% |
+| RIVER | 60→75.3%, 1000→7.41%, 5000→2.37%, 10000→1.08%, **15000→0.007%** (first <1%), 20000→0.35%, 30000→0.72% |
+| TURN | 20→173.2%, 200→6.66%, 300→15.1% (non-monotone), 500→3.93%, 1000→5.79%, 2000→3.30% (never crosses 1% in the tested range) |
+
+Per-iteration cost (corrected, non-degenerate tree): FLOP ~0.065ms/iter,
+RIVER ~0.18ms/iter, TURN ~5.98ms/iter (roughly 30-90x more expensive per
+iteration than FLOP/RIVER, since every TURN iteration enumerates all ~44
+real river-card chance branches with no leaf-abstraction shortcut). TURN's
+non-monotonicity (200→6.66%, 300→15.1%, 500→3.93%) is expected vanilla-CFR
+noise on a single fixed scenario, not a bug.
+
+**Implementation: adaptive `run_until_converged()` loop, replacing the old
+fixed-iteration-count `run_iterations_for_mode()` in
+`PokerAI/tools/dh_native_ai.cpp`:**
+```cpp
+struct ConvergenceConfig { int batch_size; int max_iterations; double max_ms; };
+// Runs resolver.run() in small batches, checking resolver.exploitability()
+// against the SAME external_reach0/external_reach1 (real tracked villain-
+// range beliefs, section 25) the live decision already uses, stopping when
+// exploitability < TARGET_EXPLOITABILITY_PCT (1.0) OR a per-mode safety cap
+// (iteration count or wall-clock time) fires -- whichever comes first.
+```
+Per-mode safety caps (chosen from the measured curves above, as a floor a
+live decision can never exceed even if convergence is unusually slow on a
+given hand): FLOP `{batch=200, max_iter=10000, max_ms=3000}`, TURN
+`{batch=100, max_iter=2000, max_ms=12000}`, RIVER `{batch=500,
+max_iter=20000, max_ms=6000}`. Both call sites that resolve a live decision
+(`narrow_villain_range_postflop()` and `resolve_decision()`) now call
+`run_until_converged(resolver, mode, ...)` instead of the old
+`resolver.run(run_iterations_for_mode(mode), ...)`.
+
+**Real end-to-end measurement of the new adaptive loop** (new tool,
+`tools/test_run_until_converged.cpp` — duplicates the small
+`ConvergenceConfig`/`run_until_converged()` logic standalone, since
+`dh_native_ai.cpp` also defines the C ABI exports and a global `LiveGame`
+and can't be `#include`d directly; same fixed synthetic scenario as
+above):
+
+| Mode | Villain range | Iterations run | Final exploit | Wall time | Outcome |
+|---|---|---|---|---|---|
+| FLOP | 1081 | 4800 | 0.962% | 802ms | converged under target |
+| RIVER | 990 | 12500 | 0.595% | 4635ms | converged under target |
+| TURN | 1035 | 900 | 2.406% | 13174ms | **hit safety cap, did NOT reach target** |
+
+**Disclosed limitation (TURN mode, real and unavoidable given the current
+architecture):** TURN cannot reliably reach <1% exploitability within a
+live-play-tolerable time budget — its per-iteration cost is too high. The
+new adaptive loop still substantially improves on the old fixed-300-
+iteration budget's quality (2.4% vs. an interpolated ~15% at 300
+iterations from the table above) but takes up to ~12-13 seconds in the
+worst case to do so (vs. the old ~3.7s fixed cost), and is not guaranteed
+to actually cross the 1% target — it is a documented best-effort
+trade-off, not a guarantee. No hard request-timeout was found in
+`pypokergui/play_with_slumbot.py` or Slumbot's API that this would
+violate, but it is a real, user-visible pacing change for TURN decisions
+specifically. FLOP and RIVER both reliably converge under target well
+within their safety-cap budgets. Revisiting this would require either a
+leaf-abstraction shortcut for TURN (mirroring FLOP's
+`TurnClusterLeafModel`) or accepting a lower TURN quality target — out of
+scope for this change.
+
+**New/modified files:**
+- `PokerAI/tree/RealtimeSearch.h` — added `best_response()`,
+  `exploitability()`, `chance_value_br()`, `uniform_prior()`,
+  `normalize_prior()` to `LiveResolver`.
+- `PokerAI/tools/dh_native_ai.cpp` — replaced `run_iterations_for_mode()`
+  with `ConvergenceConfig`/`convergence_config_for_mode()`/
+  `TARGET_EXPLOITABILITY_PCT`/`run_until_converged()`; added
+  `#include <chrono>`; both live-decision call sites rewired.
+- `PokerAI/tools/test_resolver_exploitability.cpp` (new) — permanent
+  exploitability-vs-iterations sweep tool, kept as a regression/reference
+  tool for future changes to `LiveResolver` or the live decision code.
+  Build/run: `g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_resolver_exploitability tools/test_resolver_exploitability.cpp && ./tools/test_resolver_exploitability` (from `PokerAI/`).
+- `PokerAI/tools/test_run_until_converged.cpp` (new) — permanent
+  end-to-end adaptive-loop timing tool (table above). Build/run:
+  `g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_run_until_converged tools/test_run_until_converged.cpp && ./tools/test_run_until_converged` (from `PokerAI/`).
+- `PokerAI/tools/test_live_resolver_iteration_budget.cpp`,
+  `PokerAI/tools/test_live_resolver_range_scaling.cpp` — patched with the
+  same `Searchstate` field-initialization fix (correctness fix only; these
+  pre-existing tools measured the OLD fixed-iteration design and are now
+  largely superseded by the two new tools above, but kept since they still
+  give valid raw per-iteration timing/scaling data).
+- A throwaway direct best-response probe tool used only to diagnose the
+  two bugs above was deleted after use — not a lasting artifact.
+- `.gitignore` — added the new compiled test binaries (extensionless,
+  locally-built from committed `.cpp` sources, matching this repo's
+  existing convention for diagnostic tools).
+
+**Rebuilt `dh_native_ai.dylib`** (`g++ -std=c++17 -O2 -Wall -Wextra
+-DDH_SKIP_RIVER_CLUSTER -shared -fPIC -o dh_native_ai.dylib
+tools/dh_native_ai.cpp`, from `PokerAI/`): compiles clean (only the
+pre-existing, unrelated `-Wunused-parameter` warning in `poker/State.h`).
+Confirmed all 4 required ABI symbols present via
+`nm -gU dh_native_ai.dylib`: `_Next_stage`, `_getdecision`,
+`_opp_take_action`, `_restart_game`.
+
+**Not yet in effect on the live Slumbot server.** The running Python
+server process loaded the OLD `dh_native_ai.dylib` at its own startup and
+has not been restarted as part of this work (per the established rule not
+to restart it without being asked). None of this section's fixes take
+effect until the user manually restarts that server process.

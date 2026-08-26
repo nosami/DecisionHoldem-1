@@ -65,6 +65,18 @@ int main() {
 		s.table.total_pot = 200;
 		s.last_bigbet = 100;
 		s.player_i_index = 1;
+		// A fresh Searchstate leaves has_allin/n_raises/cur_round_action_num/
+		// last_raise as UNINITIALIZED garbage (Searchstate's constructor only
+		// sets small_blind/big_blind) -- without this, legal_actions_river()/
+		// legal_actions() silently degenerate to a single legal action ('l'
+		// check/call) if has_allin happens to read as garbage-true, which is
+		// exactly what happened here before this fix. Explicitly initialize a
+		// genuine start-of-street state (mirrors Searchstate::reset_betting_
+		// round_state() and dh_native_ai.cpp's build_current_searchstate()).
+		s.has_allin = false;
+		s.n_raises = 0;
+		s.cur_round_action_num = 0;
+		s.last_raise = 0;
 
 		LiveResolver resolver(range, engine, &leaf, LiveResolver::Mode::FLOP);
 		resolver.init_root(s, std::vector<unsigned char>(flop_board, flop_board + 3));
