@@ -905,3 +905,42 @@ this machine's 16GB). It was benchmarked here as evidence of feasibility but
 was not implemented in `Engine.h`, per direction to keep this investigation
 analysis/documentation-only rather than modify the real engine's loading
 strategy.
+
+## 9. Appendix: complete binary-file inventory
+
+A consolidated list of every binary (non-source-code) file relevant to this
+repository, its purpose, and its size, gathered by direct filesystem
+inspection (`ls -la`, `du -h`, `file`) rather than inferred from documentation.
+
+### Pretrained data (`PokerAI/cluster/`) — git-ignored, never committed
+
+Obtained from the unofficial community mirror described in section 2; not
+present in this repository's git history or any official release.
+
+| File | Size | Purpose |
+|---|---|---|
+| `river_hand_cluster.bin` | 16.86 GB (16,856,854,560 B) | Maps (hole cards, river board) to a hand-strength cluster ID; the largest lookup table, used for river-street decisions |
+| `blueprint_stgy.dat` / `blueprint_strategy.dat` | 16.12 GB (16,123,074,125 B) | The trained MCCFR blueprint strategy tree — hard-linked under both names (same inode); `blueprint_strategy.dat` is the path `Main.cpp`/`Save_load.h` expect |
+| `turn_hand_cluster.bin` | 2.44 GB (2,443,022,400 B) | Same clustering scheme, for the turn street |
+| `sevencards_strength.bin` | 1.34 GB (1,337,845,600 B) | Static table ranking all `C(52,7)` = 133,784,560 seven-card hand combinations by raw strength |
+| `flop_hand_cluster.bin` | 208 MB (207,916,800 B) | Same clustering scheme, for the flop street |
+| `preflopallin1326.1225.bin` | 13.4 MB (14,066,208 B) | Precomputed preflop all-in equities for all 1,326 hole-card combos — the **only** cluster file actually committed to this repository |
+| `preflop_hand_cluster.bin` | 10.6 KB (10,608 B) | Maps 1,326 hole-card combos to 169 canonical preflop hand clusters |
+
+### Compiled binaries
+
+| File | Size | Type | Purpose |
+|---|---|---|---|
+| `PokerAI/blueprint.so` | 1.84 MB | ELF 64-bit LSB shared object, x86_64 (Linux), not stripped | Precompiled real-time blueprint-strategy interface; **no source included** in this repo; will not load on macOS/arm64 without a Linux x86_64 runtime |
+| `PokerAI/AlascasiaHoldem.so` | 1.84 MB | ELF 64-bit LSB shared object, x86_64 (Linux), not stripped | Precompiled real-time search/runtime engine; **no source included**; same Linux-only limitation |
+| `PokerAI/Main.o` | ~494 KB | Mach-O 64-bit executable, arm64 (macOS) | This session's local build output of `Main.cpp`; git-ignored (`*.o`), not committed, rebuildable via the command in section 1 |
+
+### Non-data images (GUI/documentation assets — not investigated further, self-explanatory by filename)
+
+| Location | Count | Total size | Purpose |
+|---|---|---|---|
+| `PokerAI/img/*.png,*.jpg` | 6 files | 1.3 MB | README diagrams/screenshots (game tree, results) |
+| `pypokergui/server/static/images/*.png,*.jpg` | 55 files | 2.3 MB | Standard 52-card playing-card sprites plus table/pot/fold graphics for the web GUI |
+
+No other binary file types (`.exe`, `.dll`, `.dylib`, `.a`) exist anywhere in
+the repository. This is a complete inventory as of this investigation.
