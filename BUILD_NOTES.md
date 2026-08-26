@@ -5050,3 +5050,137 @@ DH_VERBOSE_STRATEGY=1 DH_RIVER_SPLIT_DIR=/path/to/river_cluster_split \
   `narrow_villain_range_preflop()`, `narrow_villain_range_postflop()`).
 - Rebuilt `dh_native_ai.dylib`; confirmed all 4 required ABI symbols
   still exported via `nm -gU`.
+
+## 40. Re-testing the "add a 0.5x-pot size to the reduced facing-a-check menu" fix idea against 3 new catastrophic live losses — reproduces §38's rejection with a larger, decisive sample
+
+A continuing live `play_with_slumbot.py` session (using `DH_VERBOSE_STRATEGY=1`
+from §39) reached 290 hands at session total −53,150 (≈−1.83 BB/hand).
+Parsing `/tmp/run.log` into per-hand blocks and ranking by `Hand winnings:`
+found **3 full-stack (−20000) losses**: hand 88 (Qs8s, TURN shove), hand 158
+(Kd5s, FLOP shove on Qs5h2c), hand 250 (JsTs, FLOP shove on 7s5s3d). All
+three shared the identical shape: villain checked first (making hero's
+decision node `cur_round_action_num == 1`, not the true opening action),
+hero's own resolved strategy showed roughly call ~1-2% / bet-pot ~60-66% /
+allin ~33-38%, and the sampled action was "allin" each time. Removing just
+these 3 hands from the session (−60,000 of the −53,150 total) leaves the
+other 287 hands at **+6,850** — i.e. without these 3 shoves the session
+would be winning. A broader scan found 20 total such "reduced-menu allin
+shove" events this session: 17 folded out small (+200 to +900), 3 busted the
+full stack, net **−54,700** from this one behavior pattern — this session's
+loss is *entirely* attributable to it.
+
+### The suspected gap, and why it looked different from §38's rejected fix
+
+`RealtimeSearch.h`'s `expand()` gates the full 6-way opening ladder to
+`cur_round_action_num == 0` only (§37); once villain checks first, hero's
+own reduced menu (`resolve_decision()` always passes `extended_actions=false`)
+collapsed to `{fold, call, bet-pot (byte 2), allin}` — **byte 1 (0.5x pot)
+was never included in this branch**, even though `State.h`'s `legal_actions()`
+already offers it "for free" here (its gate is `n_raises < 2`, independent
+of `cur_round_action_num`). This looked like a different code path from
+§38's rejected experiment (which concluded facing-a-*raise* nodes already
+had byte 2 available via `full_ladder_`, and only tested the 0.5x idea at
+opening-action nodes) — so it was tried again, against these 3 *new* hands,
+on the theory it might close a genuinely un-tested gap specific to
+facing-a-*check* nodes.
+
+### What was done
+
+Added `buf[i] == 1` alongside the existing `buf[i] == 2` in the reduced-menu
+condition (same `extended_actions_ || full_ladder_` gate, same modest
+per-node cost as §37's byte-2 addition). Rebuilt a test dylib
+(`g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -shared -fPIC`), confirmed all 4
+ABI symbols intact, and ran the existing regression tests
+(`test_realtime_search_flop`, `test_run_until_converged`) — both passed with
+sane convergence numbers.
+
+**Reproducing the 2 FLOP bust hands directly** (via `ctypes`-driven
+`restart_game`/`opp_take_action`/`getdecision` against the exact hero
+cards/board): hand 158 (Kd5s / Qs5h2c) allin dropped from the real bust's
+36.48% → 0.01% (0.5x pot absorbed 80.83% of the aggression), exploitability
+0.94%→0.94% (unchanged/slightly better). Hand 250 (JsTs / 7s5s3d) allin
+dropped 37.68% → 0.27% (0.5x pot absorbed 94.38%), exploitability
+0.96%→0.78% (better). Both looked like a clean, uncomplicated win.
+
+### The broader test that overturned it
+
+Per this project's own standing rule ("verify before claiming success" —
+and precisely because §38 already rejected what looked like a similar idea
+once), a wider, less cherry-picked comparison was run before shipping: 15
+**randomly generated** hero-hand/flop combinations, same shape (preflop
+raise to 200/300, villain checks first on the flop), OLD (pre-fix) vs. NEW
+(with the 0.5x-pot addition) dylib, comparing allin% and exploitability%
+side by side:
+
+```
+hand     board      | OLD allin%  OLD expl% | NEW allin%  NEW expl%
+3h9s     3sTh6c     |       0.02       0.99 |       0.01       0.96
+4c3c     TsTh8s     |       0.00       0.98 |       0.01       1.89
+6hTh     Td7sKd     |       0.02       0.94 |       0.01       0.99
+3d4s     3s7s2c     |       0.02       0.95 |       0.14       0.98
+3c8d     Ad3sJd     |       0.02       0.99 |       0.01       0.97
+As8h     4h7hTd     |       0.03       0.82 |       0.01       0.95
+2d3c     4dKd6c     |       0.01       0.98 |       0.01       0.99
+Ah2s     JhQs7h     |       0.07       0.75 |       0.02       0.93
+3dTc     6cJs2c     |       0.02       0.93 |       0.01       0.90
+JhTc     8s7sKc     |       0.02       0.70 |       0.02       0.93
+8sJc     Ad5cAh     |       0.03       0.85 |       0.02       0.95
+4s9h     5dTd9s     |       0.02       0.89 |       0.01       0.97
+Kc7s     Jd7c3h     |       0.02       0.98 |       0.01       0.95
+2hQc     QdAs8h     |       0.02       0.96 |       0.01       0.92
+6s4s     5h3cQh     |       0.03       0.83 |       0.03       0.89
+```
+
+**Baseline (OLD) allin% at a random facing-a-check flop node is already
+negligible** — mean 0.023%, max 0.07% across all 15 — nothing like the
+33-38% seen on the 3 real bust hands. Adding the 0.5x-pot size barely moved
+this already-near-zero number (mean 0.022% with the fix), but **worsened
+exploitability in 10 of 15 scenarios (67%)** — mean exploitability rose from
+0.90% to 1.01%, i.e. from just under to just over this project's own 1.0%
+convergence target. This is the same "didn't generalize, worsened
+exploitability at 2/3" shape §38 already found and rejected for what turned
+out to be the identical underlying idea, just applied to a different
+specific code branch — now confirmed with a 5x larger, randomly-sampled
+test instead of 3 hand-picked spots.
+
+### Reconciling this with hands 88/158/250's real 33-38% allin frequencies
+
+If a random facing-a-check flop node essentially never wants to shove
+(≈0.02%), but 3 *specific* real hands showed 33-38% allin, those 3 hands are
+themselves the outliers, not evidence of a systemic missing-action bug — the
+same conclusion §38 already reached for its own 15.2%/80.5%-allin hands
+(legitimate, high-variance, polarized/value-heavy strategies at specific
+board textures, e.g. paired boards and double-flush-draw boards, which
+concentrate CFR's aggression into all-in precisely because intermediate
+sizes are *not* what a converged strategy wants there). Adding a universally
+available 0.5x-pot size to try to "catch" those 3 outliers instead taxes
+every other facing-a-check decision with slightly worse convergence,
+which is a bad trade — confirmed, not just theorized, by the 15-scenario
+table above.
+
+### Conclusion — fix reverted
+
+Both the `RealtimeSearch.h` source change and the rebuilt production
+`dh_native_ai.dylib` were reverted (`git checkout -- tree/RealtimeSearch.h`;
+dylib restored from the pre-experiment backup taken before rebuilding). The
+3 real bust hands remain unexplained by any code defect found so far — they
+are consistent with §38's standing conclusion that this project's
+converged strategies sometimes carry genuinely high (30-80%) all-in
+frequencies at specific board textures, and that concentrated variance from
+those specific spots, not a sizing/narrowing bug, is what is driving the
+session's losing streak. No fix is currently known that closes this gap
+without a broader convergence-quality cost; if revisited, the productive
+next step is widening the *opening-node* full ladder itself (§37) to also
+cover `cur_round_action_num == 1` nodes with an increased time budget
+(rather than bolting one extra branch onto the reduced menu), and measuring
+whether the extra convergence time offsets the added per-iteration cost —
+not yet attempted.
+
+### Files touched
+
+None shipped. `tree/RealtimeSearch.h` was modified, built, tested, and then
+fully reverted (`git status --short` confirms a clean tree). Two throwaway
+test dylibs (`/tmp/dh_native_ai_test.dylib`, backup at
+`/tmp/dh_native_ai.dylib.bak`) and several one-off Python/ctypes analysis
+scripts (`/tmp/find_big_losses.py`, `/tmp/compare_fix.py`, etc.) were used
+for this investigation and are not part of the repo.
