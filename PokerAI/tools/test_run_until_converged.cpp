@@ -37,24 +37,31 @@ static ConvergenceConfig convergence_config_for_mode(LiveResolver::Mode mode) {
 
 static const double TARGET_EXPLOITABILITY_PCT = 1.0;
 
-// Returns { iterations run, final exploitability % of pot, total wall ms }.
-static std::tuple<int, double, double> run_until_converged(LiveResolver& resolver, LiveResolver::Mode mode) {
+// Returns { iterations run, final exploitability % of pot, total wall ms,
+// ms spent inside resolver.run(), ms spent inside resolver.exploitability() }.
+static std::tuple<int, double, double, double, double> run_until_converged(LiveResolver& resolver, LiveResolver::Mode mode) {
 	ConvergenceConfig cfg = convergence_config_for_mode(mode);
 	double pot = (double)resolver.root->state.table.total_pot;
 	auto t0 = std::chrono::steady_clock::now();
 	int done = 0;
 	double expl_pct = 100.0;
+	double run_ms = 0.0, expl_ms = 0.0;
 	while (done < cfg.max_iterations) {
 		int batch = std::min(cfg.batch_size, cfg.max_iterations - done);
+		auto r0 = std::chrono::steady_clock::now();
 		resolver.run(batch);
+		auto r1 = std::chrono::steady_clock::now();
+		run_ms += std::chrono::duration<double, std::milli>(r1 - r0).count();
 		done += batch;
 		expl_pct = (pot > 1e-9) ? 100.0 * resolver.exploitability() / pot : 0.0;
-		double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		auto r2 = std::chrono::steady_clock::now();
+		expl_ms += std::chrono::duration<double, std::milli>(r2 - r1).count();
+		double elapsed_ms = std::chrono::duration<double, std::milli>(r2 - t0).count();
 		if (expl_pct < TARGET_EXPLOITABILITY_PCT) break;
 		if (elapsed_ms >= cfg.max_ms) break;
 	}
 	double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-	return { done, expl_pct, total_ms };
+	return { done, expl_pct, total_ms, run_ms, expl_ms };
 }
 
 static void build_range(int count, unsigned char exclude1, unsigned char exclude2,
@@ -111,9 +118,9 @@ static void run_mode(const char* label, LiveResolver::Mode mode) {
 	LiveResolver resolver(range, engine, leaf.get(), mode);
 	resolver.init_root(s, std::vector<unsigned char>(board5, board5 + n_board));
 
-	auto [iters, expl_pct, ms] = run_until_converged(resolver, mode);
-	std::printf("%-6s villain range=%4zu  iters_run=%6d  final_exploit=%7.3f%%  wall=%9.1fms  %s\n",
-		label, filtered.size(), iters, expl_pct, ms,
+	auto [iters, expl_pct, ms, run_ms, expl_ms] = run_until_converged(resolver, mode);
+	std::printf("%-6s villain range=%4zu  iters_run=%6d  final_exploit=%7.3f%%  wall=%9.1fms  (run=%.1fms expl=%.1fms, expl=%.1f%% of total)  %s\n",
+		label, filtered.size(), iters, expl_pct, ms, run_ms, expl_ms, 100.0 * expl_ms / ms,
 		(expl_pct < TARGET_EXPLOITABILITY_PCT) ? "(converged under target)" : "(hit safety cap first)");
 }
 

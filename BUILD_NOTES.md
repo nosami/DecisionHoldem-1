@@ -3551,22 +3551,76 @@ above):
 | RIVER | 990 | 12500 | 0.595% | 4635ms | converged under target |
 | TURN | 1035 | 900 | 2.406% | 13174ms | **hit safety cap, did NOT reach target** |
 
-**Disclosed limitation (TURN mode, real and unavoidable given the current
-architecture):** TURN cannot reliably reach <1% exploitability within a
-live-play-tolerable time budget — its per-iteration cost is too high. The
-new adaptive loop still substantially improves on the old fixed-300-
-iteration budget's quality (2.4% vs. an interpolated ~15% at 300
-iterations from the table above) but takes up to ~12-13 seconds in the
-worst case to do so (vs. the old ~3.7s fixed cost), and is not guaranteed
-to actually cross the 1% target — it is a documented best-effort
-trade-off, not a guarantee. No hard request-timeout was found in
-`pypokergui/play_with_slumbot.py` or Slumbot's API that this would
-violate, but it is a real, user-visible pacing change for TURN decisions
-specifically. FLOP and RIVER both reliably converge under target well
-within their safety-cap budgets. Revisiting this would require either a
-leaf-abstraction shortcut for TURN (mirroring FLOP's
-`TurnClusterLeafModel`) or accepting a lower TURN quality target — out of
-scope for this change.
+**Disclosed limitation (TURN mode) — precisely stated.** Vanilla
+(full-traversal) CFR has a real convergence theorem behind it: average
+regret shrinks as O(1/√T), so exploitability of the average strategy **is
+mathematically guaranteed to approach 0 as iterations → ∞.** That is not
+in question and is not what limits TURN here. What is NOT guaranteed is
+reaching <1% within a **bounded, live-play-tolerable wall-clock budget**
+— the safety cap exists precisely because, if convergence happens to be
+slow on a given hand, the loop must still return SOME decision in a
+finite time rather than stall indefinitely. TURN needs a larger such cap
+than FLOP/RIVER because it costs roughly 30-90x more per iteration (see
+below), so its measured worst case in testing (900 iterations, 2.4%
+exploit, ~13s) hit that time cap before crossing the 1% target — it would
+have kept improving with more time, just not within what a live decision
+can reasonably wait. This is still a substantial real improvement over
+the old fixed-300-iteration budget's quality (2.4% vs. an interpolated
+~15% at 300 iterations from the table above).
+
+**Why TURN costs so much more per iteration than FLOP/RIVER — exact
+mechanism** (`RealtimeSearch.h`'s `cfr()`/`best_response()`, mode-dependent
+terminal checks):
+```cpp
+if (mode_ == Mode::FLOP && s.betting_stage >= 2) return terminal_leaf(...);   // FLOP: stop here
+if (mode_ == Mode::TURN && (int)node->board.size() >= 5) return terminal_showdown(...); // TURN: keep going
+```
+- **FLOP** stops the instant flop betting closes and reads a value off
+  `TurnClusterLeafModel` — a precomputed table comparing each side's
+  turn-hand-cluster id, built once up front. It never deals a turn or
+  river card at all inside the resolve loop; every FLOP iteration is just
+  a small betting-tree walk plus a table lookup at the leaf. This is the
+  "leaf abstraction": a flat estimate substituting for continuing the
+  tree.
+- **TURN** has no such substitute for its own next street. Once turn
+  betting closes, it must deal a **real river card via a genuine chance
+  node** (~48 non-colliding branches) and recurse into each one, valuing
+  every resulting hand at an exact showdown (`Engine::compute_winner()` /
+  `sevencards_strength.bin`). There is nothing cheaper standing in for
+  "what happens on every possible river card" — that full branching
+  happens on every single CFR iteration.
+- **RIVER** is cheap again, but for an unrelated reason: there are no
+  cards left to deal (zero chance-node branching), even though it also
+  computes an exact showdown.
+- This is confirmed, not inferred, by direct measurement: per-iteration
+  cost (non-degenerate tree, section above) is FLOP ~0.065ms, RIVER
+  ~0.18ms, TURN ~5.98ms.
+
+**Is `exploitability()` itself adding meaningfully to this cost? Measured
+directly — no.** Instrumented `run_until_converged()` to separately time
+`resolver.run()` vs. `resolver.exploitability()` per batch
+(`test_run_until_converged.cpp`):
+
+| Mode | `run()` time | `exploitability()` time | overhead |
+|---|---|---|---|
+| FLOP | 782.2ms | 6.0ms | 0.8% |
+| RIVER | 4575.4ms | 14.0ms | 0.3% |
+| TURN | 12921.7ms | 212.7ms | 1.6% |
+
+The periodic convergence check is a rounding error next to the CFR
+iterations themselves in every mode. TURN's wall-clock cost is entirely
+explained by the per-iteration chance-node expansion above, not by how
+often it's checked for convergence.
+
+No hard request-timeout was found in `pypokergui/play_with_slumbot.py` or
+Slumbot's API that TURN's worst-case ~12-13s would violate, but it is a
+real, user-visible pacing change for TURN decisions specifically. FLOP
+and RIVER both reliably converge under target well within their
+safety-cap budgets. Removing this limitation would require either a leaf
+model for TURN's own next street (mirroring FLOP's
+`TurnClusterLeafModel`, i.e. estimating river outcomes via cluster
+comparison instead of exact enumeration) or accepting a lower TURN
+quality/time target — out of scope for this change.
 
 **New/modified files:**
 - `PokerAI/tree/RealtimeSearch.h` — added `best_response()`,
@@ -3581,7 +3635,10 @@ scope for this change.
   tool for future changes to `LiveResolver` or the live decision code.
   Build/run: `g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_resolver_exploitability tools/test_resolver_exploitability.cpp && ./tools/test_resolver_exploitability` (from `PokerAI/`).
 - `PokerAI/tools/test_run_until_converged.cpp` (new) — permanent
-  end-to-end adaptive-loop timing tool (table above). Build/run:
+  end-to-end adaptive-loop timing tool (tables above), instrumented to
+  separately report time spent in `resolver.run()` vs.
+  `resolver.exploitability()` per batch, to isolate the convergence
+  check's own overhead from CFR's iteration cost. Build/run:
   `g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_run_until_converged tools/test_run_until_converged.cpp && ./tools/test_run_until_converged` (from `PokerAI/`).
 - `PokerAI/tools/test_live_resolver_iteration_budget.cpp`,
   `PokerAI/tools/test_live_resolver_range_scaling.cpp` — patched with the
