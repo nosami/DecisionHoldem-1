@@ -3720,3 +3720,115 @@ separately, but per-decision TURN cost should then drop close to FLOP's,
 since it stops at the same kind of table lookup instead of a full
 chance-node expansion. Not implemented here — purely a design note for
 future work on suitable hardware.
+
+## 30. Answering "can `river_hand_cluster.bin` be partitioned and loaded a piece at a time?" — yes, confirmed and validated with a working proof of concept
+
+**Short answer: yes.** The file's own on-disk layout is already naturally
+partitioned per hole-hand, with zero format changes needed — you can load
+an arbitrary SUBSET of hole-hand blocks directly via `fseek`, skipping the
+rest entirely, exactly mirroring the `skip_subtree()` pattern already
+proven correct for the preflop blueprint cache (section 27/section 21).
+
+**Format, derived and verified byte-exact against the real file (§28's
+math, re-confirmed here against the smaller, locally-accessible
+`turn_hand_cluster.bin`, which has the identical per-hand block layout):**
+a flat concatenation of exactly 1326 fixed-size blocks (one per 2-card
+hole-hand combo `(i,j)`, `i<j` over 52 cards), written in `Engine.h`'s own
+load-loop order (`for i in 0..50: for j in i+1..51`). Each block is an
+independent, self-contained sorted `(keys[], values[])` table — a
+hole-hand's block never references any other block. This means block
+`(i,j)`'s byte offset is computable in **closed form**, with no scan or
+index required:
+```cpp
+// rank of (i,j) in the file's own i<j, i outer/j inner write order
+long long combo_rank(int i, int j) {
+    long long rank = (long long)i * 51 - (long long)i * (i - 1) / 2;
+    rank += (j - i - 1);
+    return rank;
+}
+long long offset = combo_rank(i, j) * block_size; // block_size = community_total * (key_bytes+val_bytes)
+```
+
+**Validated with a new tool, `tools/test_partial_cluster_load.cpp`**
+(river_hand_cluster.bin itself lives on a Seagate external volume this
+sandboxed environment cannot read raw bytes from — `dd`/Python `open()`
+both fail with `Operation not permitted` despite normal-looking Unix file
+permissions, almost certainly a macOS TCC/Full-Disk-Access restriction on
+this tool's process for external volumes, not a real access-control
+choice; listing/`ls`/`stat` on the file works fine, only reading its
+bytes is blocked. So this was proven against `turn_hand_cluster.bin`,
+which is on local SSD and has an **identical** per-hand block layout,
+just different per-entry sizes/counts — the exact same code applies
+unchanged to `river_hand_cluster.bin` once run somewhere with real access
+to it, e.g. the user's own terminal):
+- **Correctness**: for 30 random hole-hand/board combinations, seeking
+  directly to that hand's block and reading ONLY it, then running the
+  same binary search `find_turn()` uses, produced results identical to
+  `Engine`'s fully-loaded in-RAM arrays in all 30/30 cases.
+- **Format check**: predicted block size (`230300 * (4+4) = 1,842,400
+  bytes`) times 1326 combos exactly matched the real file's size on disk.
+- **Timing** (measured on local SSD, values below are almost certainly
+  inflated by OS page-cache warming — this same file had just been read
+  fully and sequentially by `Engine::load()` moments earlier in the same
+  process — so treat the throughput as an upper bound, not a
+  representative cold-disk number):
+
+  | Hole-hands loaded | Turn-sized data touched | Wall time (measured, cache-warm) |
+  |---|---|---|
+  | 50 | 87.9 MiB | 12.7ms |
+  | 200 | 351.4 MiB | 53.5ms |
+  | 500 | 878.5 MiB | 128.1ms |
+  | 1000 | 1757.0 MiB | 255.9ms |
+  | 1326 (all) | 2329.8 MiB | 353.1ms |
+
+**Extrapolated to `river_hand_cluster.bin`'s much larger per-hand block**
+(`2,118,760 * (4+2) = 12,712,560 bytes ≈ 12.12 MiB/hand`, vs. turn's 1.76
+MiB/hand — river blocks are ~6.9x bigger, since river tracks every
+possible 5-card board rather than a 4-card one), with a **conservative,
+deliberately pessimistic 400MB/s sustained-random-read assumption**
+(rather than reusing the cache-inflated ~6.8GB/s measured above) to give
+a defensible worst case:
+
+  | Hole-hands loaded | RAM footprint | Conservative uncached estimate |
+  |---|---|---|
+  | 50 | 606 MiB | ~1.5s |
+  | 100 | 1.18 GiB | ~3.0s |
+  | 200 | 2.37 GiB | ~6.1s |
+  | 500 | 5.92 GiB | ~15.2s |
+  | 1000 | 11.84 GiB | ~30.3s |
+  | 1326 (all) | 15.70 GiB | ~40.2s (≈ loading the whole file) |
+
+**The real trade-off, honestly stated:** this only pays off to the extent
+the villain's currently-tracked range (section 25's persistent belief
+model) has actually narrowed by the time TURN resolves. Section 28's
+synthetic test scenario had ~990-1081 villain combos (near the full 1326)
+— in that regime, partial loading saves little (you'd still need almost
+the whole file). The benefit is real but **range-width-dependent**: a
+hand where villain's tracked range has narrowed to, say, 100-200 combos
+by the turn would need only ~1.2-2.4GiB (very workable on this 16GB
+host) instead of the full 16.86GB (impossible here, per section 29); a
+hand where the range is still wide would see little to no benefit. There
+is also a genuine one-time cost to weigh against the payoff: loading even
+a modest 200-hand subset is estimated at ~6s (conservative), which eats
+meaningfully into TURN's existing ~12s safety-cap budget before a single
+CFR iteration runs — this would need to be netted against the
+per-iteration savings a `RiverClusterLeafModel` built from that partial
+load would then provide (analogous to `TurnClusterLeafModel`'s FLOP
+speedup), not assumed free.
+
+**Status: validated as technically sound and format-compatible, NOT yet
+wired into the live decision path.** Building on this would mean: (1) a
+new partial-loader in `Engine.h` (or a standalone helper, to avoid
+touching `Engine::load()`'s existing all-or-nothing contract) that loads
+only the hole-hand blocks in a given villain range + hero hand; (2) a
+`RiverClusterLeafModel` mirroring `TurnClusterLeafModel`, using it for
+TURN mode's terminal shortcut instead of the current exact chance-node
+expansion; (3) re-measuring TURN's real end-to-end convergence cost with
+this in place. Left as validated future work, not implemented, since it
+is a genuinely new feature (not a bugfix) whose net benefit depends on
+real, hand-varying villain-range widths not modeled by this proof of
+concept's synthetic scenario.
+
+New file: `PokerAI/tools/test_partial_cluster_load.cpp` (kept as a
+permanent reference/regression tool proving the partial-load technique).
+Build/run: `g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_partial_cluster_load tools/test_partial_cluster_load.cpp && ./tools/test_partial_cluster_load` (from `PokerAI/`).

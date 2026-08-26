@@ -33,3 +33,4 @@ PokerAI/tools/test_live_resolver_range_scaling
 PokerAI/tools/test_live_resolver_iteration_budget
 PokerAI/tools/test_resolver_exploitability
 PokerAI/tools/test_run_until_converged
+PokerAI/tools/test_partial_cluster_load
