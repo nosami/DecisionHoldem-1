@@ -1537,3 +1537,183 @@ these `.so` files. Only that narrow, specific 21-function/1-struct surface
 would still require disassembly-based reverse engineering with no source and
 no ground-truth output to validate against — the same caveats as section 13,
 just now scoped to the actual missing piece rather than the whole binary.
+
+## 15. An original, from-scratch implementation of the missing depth-limited real-time search
+
+Sections 12-14 established that the *proprietary* real-time search (the ~21
+functions and the `Players_range` struct behind `AlascasiaHoldem.so` /
+`blueprint.so`) cannot legitimately be recovered from the compiled binaries.
+That remains true. This section is a different, legitimate thing: **new,
+original source code**, written from scratch for this repository, that
+implements a *published* algorithm family (depth-limited subgame-solving via
+Counterfactual Regret Minimization — Zinkevich et al. 2007 for vanilla CFR;
+Brown & Sandholm 2017 and Moravčík et al. 2017 for depth-limited/"Modicum"-
+and DeepStack-style real-time resolving; Ganzfried & Sandholm 2013 for
+pseudo-harmonic bet-size action translation), reusing this repo's own
+already-public building blocks. It is explicitly **not** presented as a
+recovery or validation of the original `Depth_limit_Search.h` / `Search.h` /
+`PlaySearch.h` — its leaf-value technique, in particular, is a deliberate,
+documented substitute chosen to fit this host's RAM budget, not a guess at
+what those withheld files actually did.
+
+### What's new vs. what's reused
+
+New files (both AGPLv3-licensed, matching the rest of the repo):
+- **`PokerAI/tree/RealtimeSearch.h`** — `pseudo_harmonic_prob_lower()` /
+  `randomized_pseudo_harmonic()` (standalone action-translation formula),
+  `TurnClusterLeafModel` (the leaf-value estimator, see below), and
+  `FlopResolver` (a small range-vs-range vanilla CFR solver over one flop
+  betting round).
+- **`PokerAI/tools/test_realtime_search_flop.cpp`** — a test/demo tool that
+  sets up one concrete flop decision point and runs the resolver.
+
+Reused, unmodified, from the existing public source:
+- `poker/State.h`'s `Searchstate` — its real betting mechanics
+  (`legal_actions()`, `take_action()`, `betting_stage`, `player_i_index`,
+  the `'d'`/`'l'`/`'n'`/pot-fraction action encoding) drive the whole
+  subgame tree. `FlopResolver` never reimplements betting rules; it calls
+  these methods directly.
+- `poker/Engine.h`'s `get_turn_cluster()` over the already-public,
+  already-documented `turn_hand_cluster.bin`.
+- The general "compare ordinal hand-cluster ids to rank relative hand
+  strength" idea already used (for a different, *offline* purpose) by
+  `tree/Exploitability.h`'s `getnode_cfv_river/turn/holdem` — reimplemented
+  locally and much more simply for this new, different use case rather than
+  calling those functions directly (they're batch-array-indexed for
+  best-response computation against a frozen strategy, not a drop-in
+  real-time leaf estimator).
+
+Deliberately **not** reused: `tree/Node.h`'s `strategy_node`/`subgame_node`
+raw-pointer batch-array machinery, and `tree/Bulid_Tree.h`'s subgame-building
+functions. Those are real, working, and directly relevant (they contain the
+existing blueprint-continuation depth-limit mechanism — see below) but their
+indexing conventions are intricate and built for a different code path;
+reusing them directly was judged higher bug-risk than a smaller, from-scratch
+implementation for a first working version.
+
+### The leaf-value model: what it is, and why it isn't the original's method
+
+Reading `tree/Bulid_Tree.h` shows the *original* design's depth-limit
+mechanism: `subgame_node::leaf`/`leafnode` point into the loaded **blueprint**
+strategy tree once a subgame's search horizon is reached, i.e. the original
+almost certainly continued past the depth limit by consulting blueprint
+strategy/regret (also visible in the `node->averegret[j] / 10` warm-start
+already present in that file). That approach needs `blueprint_strategy.dat`
+loaded — **16.1GB** on disk (confirmed by direct measurement of the symlinked
+file), which does not fit in this host's 16GB of RAM alongside the cluster
+files used during search.
+
+So `TurnClusterLeafModel` uses a different, self-contained substitute: when
+the flop betting round ends (call, or all remaining chips go in) without a
+fold, instead of dealing/solving the turn and river, it estimates the
+continuation value by comparing each side's **turn-hand-cluster id** —
+looked up via the *already-loaded* `turn_hand_cluster.bin` — averaged over
+every possible next (turn) card that doesn't collide with either player's
+hole cards or the known flop. This reuses the same "cluster order
+approximates relative hand strength" idea the repo's own offline
+exploitability code already relies on, just one street earlier and averaged
+over the unknown card instead of using a fixed river. It is intentionally
+simple and RAM-cheap; it is **not verified to match** whatever the original
+`.so`'s actual continuation values were.
+
+Verified independently before wiring it into CFR: a standalone check
+constructed two mirrored `Players_range`s (roles swapped) and confirmed
+`expected_showdown_sign(hero, villain) == -expected_showdown_sign(villain, hero)`
+exactly, across several hand pairs, with values spanning the full range
+(observed -1.0 to +1.0, not degenerate) — i.e. the estimator is internally
+consistent (correctly zero-sum/antisymmetric) and actually discriminates
+between different hand strengths rather than returning a constant.
+
+### The resolver: vanilla range-vs-range CFR, not the original's MCCFR
+
+`FlopResolver::cfr()` is the standard "vector-form" vanilla CFR recursion
+(see e.g. Neller & Lanctot's CFR tutorial), generalized from a single hidden
+hand to explicit ranges on both sides: it tracks per-player reach-probability
+vectors over each player's own range, and returns per-hand expected utility
+vectors, updating regret only at nodes belonging to the current traversal's
+`traverser` (both players' regrets get updated once per iteration via two
+alternating traversals in `FlopResolver::run()`). This is full-traversal
+(no sampling), unlike the `.so`'s evidently Monte-Carlo-sampled originals
+(`search_mccfr`/`search_mccfrp` — see section 14) — a simpler, lower-risk
+choice appropriate for a small, explicit-range subgame.
+
+Terminal handling, verified against the actual invariants `Searchstate`
+enforces (`table.total_pot == table.total()`, i.e. pot size is *derived*
+from cumulative per-player chip contributions, not independently settable):
+- `betting_stage == 5` → a fold occurred; payout is the pot split by chip
+  contribution, independent of hole cards, scaled by opponent reach.
+- `betting_stage >= 2` (the flop round completed normally, or all chips went
+  in) → the `TurnClusterLeafModel` continuation estimate above.
+
+### Build and validated run
+
+```
+# One-line, opt-in, default-OFF macro (poker/Engine.h) skips allocating/
+# reading river_hand_cluster.bin (~16.86GB) -- unneeded here since this demo
+# never calls get_river_cluster(). Same flag documented (then reverted) in
+# section 9; this time it's kept because the new tool's own documented build
+# command depends on it. Normal (flag-undefined) behavior is unchanged.
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER \
+    -o /tmp/test_realtime_search_flop PokerAI/tools/test_realtime_search_flop.cpp
+cd PokerAI && /tmp/test_realtime_search_flop
+```
+
+Actual measured output (200bb-effective, blinds 50/100, pot=600 at the flop,
+30 hero combos x 30 villain combos, fixed 3-card board, macOS/M4/arm64):
+
+```
+Hero range: 30 combos, Villain range: 30 combos, board=[10,23,41]
+Running vanilla-CFR over the flop subgame, reporting convergence checkpoints...
+  after   25 iterations: root avg|regret|=964572.1  (38582.886 per iteration)
+  after  100 iterations: root avg|regret|=3420256.6  (34202.566 per iteration)
+  after  300 iterations: root avg|regret|=8501864.9  (28339.550 per iteration)
+  after  500 iterations: root avg|regret|=13369957.4  (26739.915 per iteration)
+CFR search time (excludes Engine load + leaf-model precompute): 680.6 ms for 500 iterations
+Legal root actions (player 1 to act): 108 1 2 4 8 20 40 110    (ASCII 108='l'/call, 110='n'/allin)
+```
+
+Per-iteration average |regret| decreases monotonically across all four
+checkpoints (38583 → 34203 → 28340 → 26740) — the standard CFR convergence
+signature (cumulative regret keeps growing, but sublinearly). Root strategies
+are sane and hand-dependent (mostly checking, with small variation in
+raise/allin frequency across the sampled hands), not degenerate/uniform.
+Peak RSS measured at **2.8GB** (`/usr/bin/time -l`), comfortably inside this
+host's 16GB — well under the ~4GB estimate from section 9 and nowhere near
+the ~20GB that including the full blueprint would require.
+
+**Timing answer** (the specific question asked earlier in this session,
+"the time it takes excluding the initial lookup"): ~1.4ms/iteration for a
+30x30-combo flop subgame on this host, i.e. **680ms for 500 CFR iterations**,
+excluding `Engine` construction (which happens once, at process startup, via
+the global static initializer, and is dominated by reading the cluster files
+from disk — from the external drive here) and excluding the leaf-model
+precompute (3-11ms for this range size, also a one-time-per-decision cost).
+
+### Honest scope and limitations
+
+- Solves **one flop betting round only** — does not chain into turn/river
+  betting, does not implement the live `getdecision`/`opp_take_action` API,
+  and is not wired into `Main.cpp`.
+- Leaf continuation value is a **documented approximation** (turn-cluster
+  comparison averaged over the unknown card), not the original's presumed
+  blueprint-continuation technique, which remains infeasible here due to
+  `blueprint_strategy.dat`'s 16.1GB size.
+- Hero/villain ranges are small, explicit combo lists (here, 30 vs 30),
+  not the full 1326-combo unabstracted range or this repo's production
+  clustering/abstraction pipeline.
+- Full-traversal vanilla CFR, not Monte-Carlo sampled (the `.so`'s
+  `search_mccfr` naming implies sampling was the original's actual method).
+- **Unsafe resolving only** — no safe/"gadget game" subgame solving
+  (Burch, Johanson & Bowling 2014); matches `Searchstate`'s own existing
+  hidden-card-sampling methods, which are explicitly commented as unsafe
+  search in the original source (see section 14's summary).
+- No correctness ground truth exists to compare against (same caveat as
+  section 13); validation here is standard CFR sanity checks (regret
+  convergence trend, antisymmetric/non-degenerate leaf values, sane and
+  hand-differentiated output strategies) rather than exact-answer matching.
+
+**Bottom line**: this is a genuine, working, original implementation of a
+real published real-time-search technique, running end-to-end on this host
+in well under a second per resolve and comfortably within its RAM budget —
+not a recovery of DecisionHoldem's specific proprietary algorithm, and not
+claimed to produce the same decisions the original binary would.

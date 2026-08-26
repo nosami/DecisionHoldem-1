@@ -121,6 +121,7 @@ public:
 				in5.read((char*)flop_cluster[i * 52 + j].values, sizeof(unsigned) * 19600);
 			}
 		in5.close();
+#ifndef DH_SKIP_RIVER_CLUSTER
 		for (int i = 0; i < 51; i++)
 			for (int j = i + 1; j < 52; j++) {
 				river_cluster[i * 52 + j].keys = new unsigned[river_community_total];
@@ -133,6 +134,13 @@ public:
 				in6.read((char*)river_cluster[i * 52 + j].values, sizeof(unsigned short) * river_community_total);
 			}
 		in6.close();
+#else
+		// DH_SKIP_RIVER_CLUSTER: temporary, opt-in, build-time-only flag used to validate
+		// components that never call get_river_cluster() without paying the ~16.86GB RAM
+		// cost of river_hand_cluster.bin. Default (undefined) behavior is completely
+		// unchanged. See BUILD_NOTES.md for how/why this is used and reverted afterward.
+		cout << "[DH_SKIP_RIVER_CLUSTER] river_hand_cluster.bin NOT loaded (build/test mode)" << endl;
+#endif
 		for (int i = 0; i < 51; i++)
 			for (int j = i + 1; j < 52; j++) {
 				preflop_allin[i * 52 + j] = new int[2652];
