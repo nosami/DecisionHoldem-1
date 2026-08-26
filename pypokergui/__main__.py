@@ -8,6 +8,14 @@ root = os.path.join(os.path.dirname(__file__), "..")
 src = os.path.join(root, "pypokergui")
 sys.path.append(root)
 sys.path.append(src)
+# server/poker.py does a bare "import poker_conf" (poker_conf.py lives
+# alongside it in pypokergui/server/), which only resolves when
+# pypokergui/server/ itself is on sys.path. Without this, running the GUI
+# through this CLI (as opposed to invoking server/poker.py directly, which
+# implicitly puts its own directory on sys.path[0]) fails with
+# "ModuleNotFoundError: No module named 'poker_conf'" the moment start_server()
+# runs -- a pre-existing bug in this sys.path setup, unrelated to platform.
+sys.path.append(os.path.join(src, "server"))
 
 import click
 import webbrowser

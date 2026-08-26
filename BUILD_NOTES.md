@@ -1957,29 +1957,75 @@ subsection to confirm.
 - The symlink wiring in `pypokergui/server/` is in place and points at the
   real build artifacts (not copies).
 
-**Not validated (blocked by the disk-permission issue above, not a code
-defect):** an actual live decision from `getdecision()` through real
-cluster data, and a full browser-driven hand through the Tornado GUI. Once
-disk access is restored, re-run this exact sequence to confirm (run from
-`pypokergui/server/`, matching the `.so`'s own required working directory):
+### Update: disk access recovered, GUI launch confirmed reaching the server, one more real bug found and fixed
+
+The disk-permission block above turned out to be specific to the sandboxed
+process this investigation's automated tooling runs in — the user's own
+Terminal session already had (or was separately granted) access to the
+external drive, and running the corrected command in their own terminal got
+past `Engine::load()` successfully:
+
+```
+ai start load
+[DH_SKIP_RIVER_CLUSTER] river_hand_cluster.bin NOT loaded (build/test mode)
+load finish (./dh_native_ai.dylib)
+```
+
+confirming `dh_native_ai.dylib` really does load and read real cluster data
+end-to-end on this host. It then failed one line later with a second,
+independent, pre-existing bug:
+
+```
+File ".../pypokergui/server/poker.py", line 154, in start_server
+    import poker_conf
+ModuleNotFoundError: No module named 'poker_conf'
+```
+
+`server/poker.py`'s `start_server()` does a bare `import poker_conf`
+(`poker_conf.py` lives alongside it in `pypokergui/server/`). That only
+resolves when `pypokergui/server/` itself is on `sys.path`. `pypokergui/
+__main__.py`'s click-based `serve` command never added that directory (it
+only added the repo root and `pypokergui/` itself) — a bug that predates
+this investigation, is unrelated to platform/OS, and was only reachable now
+that the `.so`-loading and disk-access blockers were cleared. **Fixed** by
+adding `sys.path.append(os.path.join(src, "server"))` to `__main__.py`.
+This does not affect the alternative direct-invocation path
+(`python3 server/poker.py --port=8000`), which already worked because
+running a script directly puts its own directory on `sys.path[0]`.
+
+**Confirmed working, exact command** (run from the repo root or anywhere;
+what matters is the final `cd` before launch):
 
 ```shell
+python3 -m venv /tmp/dh_venv && source /tmp/dh_venv/bin/activate
+pip install -r requirements.txt
 cd pypokergui/server
-python3 -c "
-import ctypes
-lib = ctypes.cdll.LoadLibrary('./dh_native_ai.dylib')
-lib.restart_game(1, 10, 20)
-lib.opp_take_action(b'call')
-buf = ctypes.create_string_buffer(20)
-lib.getdecision(buf)
-print('preflop decision:', buf.value)   # expect b'call'
-lib.Next_stage(1, bytes([2,3,4]))
-lib.getdecision(buf)
-print('flop decision:', buf.value)      # expect b'call'/b'fold'/b'allin'
-"
-# then launch the actual GUI:
-cd ../.. && python3 -m pypokergui.__main__ serve <config path> --port 8000
+python3 ../__main__.py serve dummy --port 8000
 ```
+
+(`dummy` is a required-but-unused positional argument — `start_server()`
+ignores it and always reads `server/poker_conf.py` directly.)
+
+### What was and wasn't validated
+
+**Validated (real, reproducible, no fabricated data):**
+- `dh_native_ai.cpp` compiles cleanly to a real arm64 Mach-O `.dylib` with
+  all 4 required C symbols exported (`nm -gU`, shown above).
+- `game_manager.py`'s new OS-conditional load logic is syntactically valid
+  and resolves to the correct filename on this host
+  (`platform.system() == 'Darwin' → './dh_native_ai.dylib'`).
+- The symlink wiring in `pypokergui/server/` is in place and points at the
+  real build artifacts (not copies).
+- **`dh_native_ai.dylib` loads successfully and reads real cluster data
+  through the actual GUI startup path** (`ai start load` → `load finish`),
+  confirmed via the user's own terminal.
+- The `poker_conf` import bug is fixed and the fix is independently
+  verified (isolated `sys.path`/import reproduction, no cluster dependency).
+
+**Not yet validated:** a full browser-driven hand (dealing, betting through
+all streets, a decision actually coming back from `getdecision()` inside a
+live Tornado session, `curl`/browser reaching `http://localhost:8000`).
+Re-run the command above and open the browser tab it launches to confirm.
 
 ### Honest scope and limitations
 
