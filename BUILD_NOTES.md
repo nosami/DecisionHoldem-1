@@ -906,6 +906,39 @@ was not implemented in `Engine.h`, per direction to keep this investigation
 analysis/documentation-only rather than modify the real engine's loading
 strategy.
 
+### 8.1 `blueprint_strategy.dat` is a different case: loaded once, not queried per-hand
+
+Unlike the four `*_hand_cluster.bin`/`sevencards_strength.bin` lookup tables
+above (static arrays, binary-searchable per query without loading them
+whole), `blueprint_strategy.dat` is **deserialized once into an in-memory
+tree** and never touched on disk again for the rest of the process:
+
+```cpp
+// Main.cpp:39
+load(root, "cluster/blueprint_strategy.dat");   // single call, at startup
+check_subgame(root, state);
+cout << getcfv_whole_holdem(root, state, 0);
+```
+
+`load()` (`tree/Save_load.h:111`) opens the file once and `bulid_bluestrategy()`
+recursively `fin.read()`s it **sequentially, front-to-back**, reconstructing
+every `strategy_node`'s `regret`/`averegret` arrays in RAM (this sequential,
+whole-file deserialization is why this one file alone accounts for ~16GB of
+the engine's ~19.4GiB RAM requirement from section 2/6 — it cannot be
+binary-searched like the cluster files, because it is a tree of variable-
+length per-node arrays, not a fixed-stride sorted array). The file handle is
+closed at the end of `load()`; there is no re-opening or seeking back into it.
+
+After that one-time load, every further consultation of the blueprint
+(`check_subgame`, `getcfv_whole_holdem`'s recursive CFV walk, and — by
+analogy — any real-time decision during actual play) is a plain in-memory
+pointer/array dereference (`root->actions + i`), costing zero additional
+disk I/O, no matter how many decision points or hands are subsequently
+processed in that run.
+
+**Answer: once per process/session, at engine startup — not once per hand
+and not once per decision.**
+
 ## 9. Appendix: complete binary-file inventory
 
 A consolidated list of every binary (non-source-code) file relevant to this
