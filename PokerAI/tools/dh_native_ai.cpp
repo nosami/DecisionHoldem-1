@@ -229,6 +229,102 @@ std::string river_split_dir() {
 	return env ? std::string(env) : std::string();
 }
 
+// ---------------------------------------------------------------------------
+// Optional, purely-additive verbose diagnostic logging: prints hero's real
+// average-strategy distribution (every legal action's actual probability,
+// not just whichever one gets sampled) and a compact summary of every
+// villain_range narrowing update, to stderr. Off by default (matches this
+// file's other opt-in DH_* env vars, e.g. DH_RIVER_SPLIT_DIR); enable with:
+//   DH_VERBOSE_STRATEGY=1
+// This is read-only instrumentation -- it never changes what action gets
+// sampled/returned or how villain_range is narrowed, only what gets printed.
+// Since Python's ctypes calls straight into this same process (no pipe/
+// subprocess boundary), these stderr lines appear directly in whatever
+// terminal/log is already capturing play_with_slumbot.py's own output (the
+// same way the existing [DH_RANGE_MODEL]/[DH_PREFLOP_CACHE] messages
+// already do) -- no changes to the Python driver are needed to see them.
+bool dh_verbose_enabled() {
+	const char* env = std::getenv("DH_VERBOSE_STRATEGY");
+	return env && env[0] != '\0' && std::string(env) != "0";
+}
+
+// Renders a card id (this file's convention: id = suit*13 + rank, suits
+// "scdh", ranks "23456789TJQKA", matching Visualize_Tree.h) as "Ts"/"Ah"/etc.
+std::string dh_card_str(unsigned char c) {
+	static const char suits[] = "scdh";
+	static const char ranks[] = "23456789TJQKA";
+	if (c >= 52) return "??";
+	char buf[3] = { ranks[c % 13], suits[c / 13], '\0' };
+	return std::string(buf);
+}
+
+// Human-readable name for one of this resolver's action bytes: 'd' fold,
+// 'l' call/check, 'n' allin, anything else is a pot-fraction raise byte
+// (byte/2.0 = the fraction of pot, per State.h's take_action() convention).
+std::string dh_action_name(unsigned char act) {
+	if (act == 'd') return "fold";
+	if (act == 'l') return "call";
+	if (act == 'n') return "allin";
+	char buf[32];
+	std::snprintf(buf, sizeof(buf), "raise(%.2fx pot)", act / 2.0);
+	return std::string(buf);
+}
+
+// Prints hero's full average-strategy distribution for the decision that's
+// about to be sampled -- every legal action's real probability, plus the
+// resolved subgame's measured exploitability, so a single sampled action
+// (e.g. "allin") can be told apart from a 99%-certain shove vs. a 20%-of-
+// the-time bluff. `label` distinguishes preflop vs. postflop/mode.
+void dh_log_strategy(const char* label, const std::vector<unsigned char>& actions,
+	const std::vector<double>& probs, double exploitability_pct, int pot) {
+	if (!dh_verbose_enabled()) return;
+	std::fprintf(stderr, "[DH_STRATEGY] %s hand=%s%s pot=%d expl=",
+		label, dh_card_str(g.my_hole[0]).c_str(), dh_card_str(g.my_hole[1]).c_str(), pot);
+	if (exploitability_pct < 0.0) std::fprintf(stderr, "n/a:"); // preflop: direct lookup, no CFR resolve here
+	else std::fprintf(stderr, "%.2f%%:", exploitability_pct);
+	for (size_t i = 0; i < actions.size(); i++)
+		std::fprintf(stderr, " %s=%.2f%%", dh_action_name(actions[i]).c_str(), probs[i] * 100.0);
+	std::fprintf(stderr, "\n");
+}
+
+// Prints a compact summary of a villain_range narrowing update: how
+// concentrated the tracked belief was before/after (effective # of combos,
+// via the inverse Herfindahl index 1/sum(w_i^2) -- a uniform range over N
+// combos scores N, a range collapsed onto 1 combo scores 1), plus the
+// top-5 most-weighted combos after the update. `weights_before` must be
+// g.villain_range's weights captured immediately before narrowing (already
+// normalized to sum to 1 from the previous step).
+void dh_log_narrowing(const char* label, unsigned char observed_byte,
+	const std::vector<double>& weights_before) {
+	if (!dh_verbose_enabled()) return;
+	auto effective_n = [](const std::vector<double>& w) {
+		double sum_sq = 0.0;
+		for (double x : w) sum_sq += x * x;
+		return (sum_sq > 1e-15) ? 1.0 / sum_sq : 0.0;
+	};
+	double eff_before = effective_n(weights_before);
+	std::vector<double> weights_after;
+	weights_after.reserve(g.villain_range.size());
+	for (auto& h : g.villain_range) weights_after.push_back(h.weight);
+	double eff_after = effective_n(weights_after);
+
+	std::vector<size_t> idx(g.villain_range.size());
+	for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
+	size_t top_k = std::min<size_t>(5, idx.size());
+	std::partial_sort(idx.begin(), idx.begin() + top_k, idx.end(),
+		[&](size_t a, size_t b) { return g.villain_range[a].weight > g.villain_range[b].weight; });
+
+	std::fprintf(stderr,
+		"[DH_RANGE_MODEL] %s narrow observed=%s combos=%zu effective_hands %.1f -> %.1f, top:",
+		label, dh_action_name(observed_byte).c_str(), g.villain_range.size(), eff_before, eff_after);
+	for (size_t k = 0; k < top_k; k++) {
+		const WeightedHand& h = g.villain_range[idx[k]];
+		std::fprintf(stderr, " %s%s=%.2f%%",
+			dh_card_str(h.c1).c_str(), dh_card_str(h.c2).c_str(), h.weight * 100.0);
+	}
+	std::fprintf(stderr, "\n");
+}
+
 int committed_this_street(int slot) {
 	return g.stack_at_street_start[slot] - g.stack[slot];
 }
@@ -394,6 +490,11 @@ void narrow_villain_range_preflop(unsigned char observed_byte) {
 			if (res.actionstr[i] == observed_byte) { idx = (int)i; break; }
 		if (idx < 0)
 			throw std::runtime_error("observed action byte not found among this node's legal actions");
+		std::vector<double> weights_before;
+		if (dh_verbose_enabled()) {
+			weights_before.reserve(g.villain_range.size());
+			for (auto& h : g.villain_range) weights_before.push_back(h.weight);
+		}
 		double sum = 0.0;
 		for (auto& h : g.villain_range) {
 			unsigned char hand[2] = { h.c1, h.c2 };
@@ -405,6 +506,7 @@ void narrow_villain_range_preflop(unsigned char observed_byte) {
 		if (!(sum > 1e-12))
 			throw std::runtime_error("villain range collapsed to ~0 total weight after this update -- refusing to apply");
 		for (auto& h : g.villain_range) h.weight /= sum;
+		dh_log_narrowing("preflop", observed_byte, weights_before);
 	}
 	catch (const std::exception& e) {
 		std::fprintf(stderr,
@@ -641,6 +743,9 @@ void narrow_villain_range_postflop(int opp_slot, unsigned char observed_byte) {
 		if (!(sum > 1e-12))
 			throw std::runtime_error("villain range collapsed to ~0 total weight after this update -- refusing to apply");
 		for (auto& h : g.villain_range) h.weight /= sum;
+		// tracked_weights (captured above, before this update) doubles as
+		// the "before" snapshot dh_log_narrowing needs -- no extra copy.
+		dh_log_narrowing("postflop", observed_byte, tracked_weights);
 	}
 	catch (const std::exception& e) {
 		std::fprintf(stderr,
@@ -726,6 +831,17 @@ std::string resolve_decision() {
 	// addresses my own hand's strategy regardless of which slot I'm in.
 	std::vector<double> avg;
 	LiveResolver::average_strategy(resolver.root.get(), 0, avg);
+
+	if (dh_verbose_enabled()) {
+		double pot = (double)resolver.root->state.table.total_pot;
+		double expl_pct = (pot > 1e-9)
+			? 100.0 * resolver.exploitability(opp_slot == 0 ? &tracked_weights : nullptr,
+				opp_slot == 0 ? nullptr : &tracked_weights) / pot
+			: 0.0;
+		const char* mode_name = (mode == LiveResolver::Mode::FLOP) ? "FLOP"
+			: (mode == LiveResolver::Mode::TURN) ? "TURN" : "RIVER";
+		dh_log_strategy(mode_name, resolver.root->actions, avg, expl_pct, (int)pot);
+	}
 
 	// Root actions may not literally be [fold, call, allin] in that order or
 	// even all present (e.g., no fold offered if nothing is owed) -- match
@@ -815,6 +931,12 @@ std::string resolve_preflop_decision() {
 		int total_pot_before = (20000 - g.stack[0]) + (20000 - g.stack[1]);
 		int last_bigbet_before = std::max(20000 - g.stack[0], 20000 - g.stack[1]);
 		int my_bet_before = 20000 - g.stack[g.my_id];
+
+		// Preflop has no live resolver/exploitability figure here (it's a
+		// direct trained-blueprint lookup, not a CFR resolve) -- pass -1 as
+		// a sentinel so dh_log_strategy's printed line reads "expl=n/a"
+		// rather than a fabricated 0.00%.
+		dh_log_strategy("PREFLOP", res.actionstr, res.probs, -1.0, total_pot_before);
 
 		double r = std::uniform_real_distribution<double>(0.0, 1.0)(g.rng);
 		double cum = 0.0;

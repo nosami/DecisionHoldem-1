@@ -4977,3 +4977,76 @@ throwaway diagnostics (`_diag_flop_shove*` in an earlier part of this
 investigation, `_diag_facing_raise.cpp` in this part) were built, used,
 and fully deleted; `git status --short` confirmed a clean tree before and
 after.
+
+## 39. Adding opt-in verbose diagnostic logging for hero's strategy distribution and villain-range narrowing (`DH_VERBOSE_STRATEGY`)
+
+The user asked to see, live, both the real average-strategy probabilities
+behind each of hero's decisions (not just the one sampled action) and
+what each `narrow_villain_range_postflop()`/`narrow_villain_range_preflop()`
+call actually did to the tracked `villain_range` belief.
+
+### The fix
+
+Added to `PokerAI/tools/dh_native_ai.cpp` (no ABI change — same 4
+functions, same signatures — and no behavioral change to what action gets
+sampled or how narrowing is computed; this is read-only instrumentation):
+
+- `dh_verbose_enabled()`: gates everything below on the `DH_VERBOSE_STRATEGY`
+  environment variable (unset/`0`/empty = off, matching this file's other
+  opt-in `DH_*` vars like `DH_RIVER_SPLIT_DIR`). **Off by default — zero
+  output, zero extra cost, unless explicitly enabled.**
+- `dh_log_strategy()`: called from both `resolve_decision()` (FLOP/TURN/
+  RIVER) and `resolve_preflop_decision()` right before the actual sample
+  is drawn. Prints hero's hole cards, the resolved subgame's pot and
+  measured exploitability (`n/a` for preflop, which is a direct blueprint
+  lookup, not a CFR resolve), and **every legal action's real average-
+  strategy probability** (e.g. `fold=0.17% call=0.18% raise(1.00x
+  pot)=19.15% allin=80.50%`) — not just whichever one gets sampled.
+- `dh_log_narrowing()`: called from both `narrow_villain_range_preflop()`
+  and `narrow_villain_range_postflop()` right after the Bayesian update +
+  renormalization. Prints the observed action, the tracked range's size,
+  its concentration before/after as an "effective hand count" (the
+  inverse Herfindahl index `1/sum(w_i^2)` — a uniform range over N combos
+  scores N, a range collapsed onto 1 combo scores 1, so this is a single
+  intuitive number for "how much did this narrow the belief"), and the
+  top-5 highest-weighted combos after the update.
+- `dh_card_str()`/`dh_action_name()`: small formatting helpers (`"Ts"`,
+  `"raise(1.00x pot)"`) shared by both loggers.
+
+### Real validation (throwaway ctypes scripts, deleted after use)
+
+Ran short synthetic hands through the rebuilt `.dylib` via Python
+`ctypes` (mirroring exactly how `pypokergui/fish_player_setup.py` loads
+it) with `DH_VERBOSE_STRATEGY=1` set, and confirmed real, sensible output,
+e.g.:
+```
+[DH_RANGE_MODEL] preflop narrow observed=call combos=1225 effective_hands 1225.0 -> 938.4, top: 8s4c=0.23% ...
+[DH_RANGE_MODEL] postflop narrow observed=call combos=1081 effective_hands 830.9 -> 653.6, top: 2sTc=0.32% ...
+[DH_STRATEGY] FLOP hand=TsTd pot=150 expl=1.08%: fold=0.00% call=0.00% raise(1.00x pot)=66.15% allin=33.85%
+```
+Also confirmed with the env var unset, these tools produce **zero** of
+these log lines (grep count 0) — the feature is fully silent by default.
+
+### No changes needed to play_with_slumbot.py or fish_player_setup.py
+
+These lines are `fprintf(stderr, ...)` calls inside the same process
+Python's `ctypes.CDLL(...)` loaded the library into — there is no pipe or
+subprocess boundary, so they appear directly in whatever terminal/log
+already captures the Python driver's own output (exactly like the
+pre-existing `[DH_RANGE_MODEL]` failure messages and the
+`[DH_PREFLOP_CACHE]`/`[DH_SKIP_RIVER_CLUSTER]` load-time messages already
+do). To see this output live:
+```
+cd PokerAI
+DH_VERBOSE_STRATEGY=1 DH_RIVER_SPLIT_DIR=/path/to/river_cluster_split \
+  python3 ../pypokergui/play_with_slumbot.py --max-hands 5
+```
+(add `2>&1 | tee /tmp/run.log` as usual to also capture it to a file).
+
+### Files touched
+
+- `PokerAI/tools/dh_native_ai.cpp`: added the 4 helper functions above and
+  4 call sites (`resolve_decision()`, `resolve_preflop_decision()`,
+  `narrow_villain_range_preflop()`, `narrow_villain_range_postflop()`).
+- Rebuilt `dh_native_ai.dylib`; confirmed all 4 required ABI symbols
+  still exported via `nm -gU`.
