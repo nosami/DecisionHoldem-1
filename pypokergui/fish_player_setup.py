@@ -1,4 +1,5 @@
 import sys
+import platform
 from ctypes import *
 import math
 
@@ -67,8 +68,20 @@ class FishPlayer():  # Do not forget to make parent class as "BasePokerPlayer"
     def __init__(self):
         '''display history and current which action'''
         print('start load')
-        self.playsearch = cdll.LoadLibrary('./AlascasiaHoldem.so')
-        print('finish load')
+        # AlascasiaHoldem.so is a Linux x86_64 ELF shared object (confirmed via
+        # `file`, see BUILD_NOTES.md section 4/17) and cannot load on macOS.
+        # On Darwin, load dh_native_ai.dylib instead: a from-scratch, original
+        # macOS-native library (PokerAI/tools/dh_native_ai.cpp) implementing
+        # the same four-function C ABI (restart_game/Next_stage/
+        # opp_take_action/getdecision) via this repo's own PokerAI engine +
+        # RealtimeSearch.h/BlueprintReader.h -- NOT a port/reconstruction of
+        # the original proprietary binary. Linux behavior is unchanged.
+        # Must be run with cwd=PokerAI/ so the relative "cluster/..." paths
+        # Engine::load() uses resolve correctly (same convention as the GUI's
+        # game_manager.py and every other tool in this repo).
+        lib_name = './dh_native_ai.dylib' if platform.system() == 'Darwin' else './AlascasiaHoldem.so'
+        self.playsearch = cdll.LoadLibrary(lib_name)
+        print('finish load (%s)' % lib_name)
         self.ai_id = '0'
 
     #  we define the logic to make an action through this method. (so this method would be the core of your AI)

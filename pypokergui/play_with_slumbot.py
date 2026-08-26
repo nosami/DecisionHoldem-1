@@ -455,13 +455,44 @@ def PlayHand(token):
         r = Act(token, actionstr)
 
 import time
+import argparse
+
 def main():
-    username = 'zqbDec'
-    password = 'zqbDec@2021'
-    token = Login(username, password)
+    parser = argparse.ArgumentParser(
+        description="Play hands against Slumbot's public research API "
+                    "(https://slumbot.com). No account is required -- the "
+                    "API supports anonymous play (see BUILD_NOTES.md). "
+                    "Run this from PokerAI/ so the native library's relative "
+                    "cluster/... paths resolve, e.g.:\n"
+                    "  cd PokerAI && python3 ../pypokergui/play_with_slumbot.py --max-hands 5")
+    parser.add_argument('--max-hands', type=int, default=10,
+                         help='Number of hands to play, then stop (default: 10). '
+                              'Use 0 for unlimited (runs until interrupted).')
+    parser.add_argument('--username', default=None,
+                         help='Optional Slumbot account username. Omit to play '
+                              'anonymously (no account needed).')
+    parser.add_argument('--password', default=None,
+                         help='Optional Slumbot account password (required only '
+                              'if --username is given).')
+    args = parser.parse_args()
+
+    # No hardcoded credentials: previously this called Login() with a
+    # baked-in username/password (someone else's registered account, not
+    # ours to use). Slumbot's API makes the token optional on the first
+    # /api/new_hand request, so anonymous play needs no login at all --
+    # confirmed live: `curl -X POST -d '{}' https://slumbot.com/api/new_hand`
+    # returns a fresh token with no prior login step. Only login if the
+    # user explicitly supplies their own credentials via --username/
+    # --password (e.g. to track results under a registered account).
+    token = None
+    if args.username:
+        if not args.password:
+            parser.error('--password is required when --username is given')
+        token = Login(args.username, args.password)
+
     total_winnings = 0
     play_times = 0
-    while True:
+    while args.max_hands <= 0 or play_times < args.max_hands:
         try:
             (token, hand_winnings) = PlayHand(token)
             total_winnings += hand_winnings
@@ -472,6 +503,8 @@ def main():
             time.sleep(1)
         except Exception as e:
             print('未知异常',e)
+    print('Finished %d hand(s). Total winnings: %i chips (%.2f big blinds)' %
+          (play_times, total_winnings, total_winnings / BIG_BLIND))
 
 
 

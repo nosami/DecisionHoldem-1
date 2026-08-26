@@ -2428,3 +2428,104 @@ blueprint feature** — they are fully independent:
 host (16GB unified memory) going forward — it is not a reduced-fidelity
 mode for anything this codebase's resolver actually uses, only a RAM/swap
 optimization that removes a genuinely large, genuinely unused load.
+
+## 20. Porting `play_with_slumbot.py` to macOS; no Slumbot account needed
+
+The user asked whether there's a script for playing Slumbot and whether an
+account is required. There is a script
+(`pypokergui/play_with_slumbot.py`), but as committed it had two real,
+independent problems that would prevent it from running here, plus a
+question about whether external play against slumbot.com's live server
+should happen automatically at all.
+
+### No account is required — confirmed live against the real API
+
+Slumbot's API makes the session token optional on the very first
+`/api/new_hand` request; a fresh guest token is issued in the response.
+Confirmed directly:
+
+```shell
+$ curl -i -X POST -d '{}' -H "Content-Type: application/json" https://slumbot.com/api/new_hand
+HTTP/1.1 200 OK
+...
+{"old_action": "", "action": "b200", "client_pos": 0, "hole_cards": ["9s","7s"], "board": [], "token": "09915fc4-8472-4e55-a043-27f3bc2df9a7"}
+```
+
+No login, registration, or credentials are needed to play informally
+against the bot via this API.
+
+### Problem 1: hardcoded credentials for someone else's account
+
+`play_with_slumbot.py`'s `main()` unconditionally called
+`Login('zqbDec', 'zqbDec@2021')` — a real-looking username/password pair
+baked into source, presumably the original paper authors' own registered
+Slumbot account (used to appear on Slumbot's public leaderboard as
+`zqbAgent`, per the README). Since login isn't required at all for
+anonymous play, and reusing someone else's credentials isn't something
+this investigation should do, **this call is removed by default**.
+`main()` now only calls `Login()` if the user explicitly supplies their
+own `--username`/`--password` on the command line (e.g. to appear under
+their own registered identity) — anonymous play is now the default,
+matching what the API actually supports.
+
+### Problem 2: hardcoded Linux `.so`, not OS-conditional
+
+`play_with_slumbot.py` imports `FishPlayer` from
+`pypokergui/fish_player_setup.py` (the top-level one — a different,
+simpler file than `pypokergui/server/fish_player_setup.py`, which is
+wired for the GUI's `pypokerengine`-flavored callback interface and
+cannot be reused here directly). That top-level file's constructor
+unconditionally did `cdll.LoadLibrary('./AlascasiaHoldem.so')` — the same
+Linux x86_64 ELF binary problem documented in sections 4/12/17, just
+never fixed in this particular file (only `game_manager.py`, used by the
+GUI path, had received the Darwin/Linux conditional). **Fixed** using the
+exact same pattern already proven in `game_manager.py`:
+
+```python
+lib_name = './dh_native_ai.dylib' if platform.system() == 'Darwin' else './AlascasiaHoldem.so'
+self.playsearch = cdll.LoadLibrary(lib_name)
+```
+
+Linux behavior (loading the original `.so`) is completely unchanged.
+
+### Problem 3 (design, not a bug): an unbounded automated loop against a live external server
+
+The original `main()` was a bare `while True:` loop with no exit
+condition, i.e. running the script would play hands against slumbot.com
+indefinitely until manually interrupted. Per this investigation's own
+scope (avoid unnecessary/unbounded automated external play; a small,
+sanctioned benchmark is fine), `main()` now takes a `--max-hands N`
+argument (**default 10**, not unlimited) and stops cleanly after that
+many hands, printing a total-winnings summary. `--max-hands 0` restores
+the original unlimited behavior for anyone who deliberately wants it.
+
+### Exact run command (from this repo, on macOS)
+
+```shell
+cd PokerAI   # required: dh_native_ai.dylib and its relative cluster/... paths live here
+python3 ../pypokergui/play_with_slumbot.py --max-hands 5
+```
+
+(`--username`/`--password` are optional, only needed to play under a
+registered Slumbot account instead of anonymously.)
+
+### Validation performed
+
+- Both modified files (`play_with_slumbot.py`, `fish_player_setup.py`)
+  parse cleanly (`ast.parse`) and the new `--help`/argparse wiring works.
+- Confirmed the OS-conditional fix actually takes effect and reaches the
+  correct next failure point: run from the wrong directory, it correctly
+  reports `dlopen(./dh_native_ai.dylib, ...) — no such file` (proving the
+  Darwin branch is chosen and it is genuinely trying the right filename,
+  rather than a silent import-time crash); run from `PokerAI/` (the
+  documented correct cwd), it proceeds past that point and begins
+  `Engine::load()` reading real cluster files from the external drive --
+  which this sandbox cannot do (the same disk-permission limitation
+  documented in section 17, not a new or different problem). This is
+  consistent with every other native-library-loading tool in this repo
+  and is not a regression introduced by this fix.
+- **Not run against the live Slumbot server from this sandbox** for the
+  same reason (`Engine::load()` blocks first, before any network call
+  would happen) -- the user, who has working disk access, should run the
+  command above to get an actual end-to-end result and confirm hands play
+  out and a win/loss total is reported.
