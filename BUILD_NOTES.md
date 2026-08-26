@@ -1087,6 +1087,83 @@ are (a) more free disk/RAM on this shared host, or (b) running on the
 user's separate 32GB machine (see section 2/6), where the ~34.4GiB minimum
 requirement fits far more comfortably within RAM + ordinary swap headroom.
 
+### 9.2 Re-test after relocating cluster files to external storage, and a measurement correction
+
+Re-ran the exact same experiment from section 9 (same opt-in
+`DH_SKIP_RIVER_CLUSTER` macro guard temporarily reapplied to
+`poker/Engine.h::load()`, same standalone `tools/test_engine_no_river.cpp`
+harness rebuilt from scratch, then both fully reverted/removed again
+afterward — `git diff` against `poker/Engine.h` confirmed byte-identical
+before and after) to confirm this still works now that
+`turn_hand_cluster.bin`, `flop_hand_cluster.bin`, and
+`sevencards_strength.bin` are symlinks to the external drive (section 11).
+
+```
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o /tmp/test_engine_no_river tools/test_engine_no_river.cpp
+cd PokerAI && /tmp/test_engine_no_river
+```
+
+Result:
+
+```
+[DH_SKIP_RIVER_CLUSTER] river_hand_cluster.bin NOT loaded (experiment mode)
+Engine() construction completed. Peak RSS so far: 3.783 GB
+get_flop_cluster(hole={0,21}, flop={30,47,8}) = 1422  (flop cluster lookup OK, river not needed)
+get_turn_cluster(hole={0,21}, turn={30,47,8,12}) = 220  (turn cluster lookup OK, river not needed)
+Final peak RSS: 3.783 GB
+```
+
+**Still works, same results** (identical flop/turn cluster values as the
+original run). Two things changed, both worth recording:
+
+1. **The `load()` call itself is now much slower** — it took roughly 2
+   minutes instead of a couple of seconds, because `turn_hand_cluster.bin`
+   (2.44GB) and `sevencards_strength.bin` (1.34GB) are now read from the
+   external USB drive at its observed ~30-35MB/s (section 11) instead of
+   the internal SSD. This is expected and matches the disk-vs-RAM tradeoff
+   documented in section 11: moving files off the internal disk trades disk
+   space for load-time I/O speed. It has no effect on peak RSS or on
+   whether the lookups succeed.
+
+2. **Correction to section 9's originally-reported "peak RSS 1.634 GB"
+   figure — that number was wrong.** Cross-checking against the exact,
+   known on-disk sizes of the files actually loaded when river is skipped
+   (`sevencards_strength.bin` 1.338GB + `turn_hand_cluster.bin` 2.443GB +
+   `flop_hand_cluster.bin` 0.208GB + `preflopallin1326.1225.bin` 0.014GB —
+   each of which is a raw dump of the exact in-memory key/value arrays, so
+   file size and resident size match almost exactly) gives an expected
+   total of **~4.00 GB**, matching this re-test's measured 3.783GB far more
+   closely than the previously-recorded 1.634GB. It is also the only figure
+   consistent with section 9's own previously-stated ~20.86GB
+   all-cluster-files total: 20.86 − 4.00 (non-river) = 16.86GB, which is
+   exactly `river_hand_cluster.bin`'s size — whereas 20.86 − 1.634 = 19.2GB
+   does not match anything. The original 1.634GB figure from this same
+   session's earlier (now-reverted) test is superseded by this re-measurement;
+   treat 3.78-4.0GB as the correct river-skip Engine() footprint going
+   forward.
+
+**Bottom line unchanged from section 9**: this confirms flop/turn cluster
+lookups work correctly and cheaply in isolation (now ~3.8GB instead of the
+full ~19.4GiB), but does not by itself give the repository's actual
+decision entrypoint (`getnode_cfv_holdem()`) a working flop-only decision —
+that still requires the depth-limited/subgame-resolving rewrite discussed
+in section 9 and section 7, since the shipped code always recurses to the
+river. Also note the external-drive relocation only changes *where the
+bytes physically live*, not the *arithmetic* in section 9.1: attempting the
+**full, unmodified engine** (all cluster files + the ~16GB blueprint tree)
+is a separate, much larger ask than this narrow flop/turn-only test, and
+the ~18.4GiB swap requirement computed there is unaffected by this
+migration. The one relevant change is that the previously-cited disk-space
+blocker for even attempting that under swap (13GB free, 5.4GB short) is no
+longer present — internal disk free space is now ~98GB, comfortably above
+the ~18.4GiB swap requirement. This does **not** mean the attempt is now
+advisable: physical RAM is still 16GiB against a ~34.4GiB requirement, so
+it would still mean heavy, sustained swapping for an unknown and
+potentially very long duration, with a real risk of making this shared
+host sluggish or unresponsive while it runs and no guarantee of completion.
+That tradeoff was intentionally left for an explicit, informed decision
+rather than attempted by default.
+
 ## 10. Appendix: complete binary-file inventory
 
 A consolidated list of every binary (non-source-code) file relevant to this
