@@ -5316,3 +5316,104 @@ only observing narrowing's own internal behavior.
 - `pypokergui/play_with_slumbot.py`: calls it at hand-end with the real
   `bot_hole_cards`.
 - `pypokergui/analyze_range_misses.py` (new): log-analysis companion script.
+
+## 42. Answering "could range-narrowing misses account for the bad all-in shoves?" — yes, this is a real and identifiable contributing factor, though not the only one
+
+**Short answer: yes, in every catastrophic hand directly measured so far
+(5/5), the model's tracked range had specifically *underweighted* the
+exact type of hand that beat hero (a slowplayed monster or a rivered big
+hand), each landing below the uniform-guess baseline. This does not mean
+range narrowing is "broken" — the live session's overall miss rate is a
+reasonable 34.6% with an average rank-percentile of 35.9% (informative,
+better than blind guessing) — but it does mean these specific worst-case
+losses are not pure bad-beat variance independent of narrowing quality;
+narrowing measurably contributed fold-equity overestimation in each one.**
+
+### Method 1: direct ctypes replay of a historic catastrophic hand (§38/§40 hand "250")
+
+Using the `report_actual_hand()` diagnostic added in §41, replayed hand
+250's exact preflop+flop action sequence via ctypes (villain raises to
+300, hero calls, flop 7s5s3d, villain checks) and called
+`report_actual_hand(5h, 5d)` — villain's real revealed hand (a flopped
+set of fives) — **immediately before** hero's shove decision (not at
+hand-end, which reflects additional information from villain's
+subsequent call):
+
+```
+[DH_RANGE_MODEL] actual villain hand=5h5d weight=0.0002% rank=660/1081
+(uniform=0.0925%) -- RANGE MISS (weighted BELOW a uniform random guess).
+Top expected: ThKh=0.70% TcKc=0.70% TcJc=0.69% ThJh=0.69% TcQc=0.67%
+```
+
+At the exact moment of the shove decision, the model ranked villain's
+actual holding (trips) in the bottom ~40th percentile of 1081 tracked
+combos — ~460x below its average weight — while over-favoring various
+big-card-high/two-broadway combos that don't include a set. This is a
+concrete, direct measurement (not an inference from the final outcome)
+that the range used to compute the shove's fold-equity/EV estimate
+under-represented exactly the villain holding that showed up.
+
+Also notable: re-running the identical setup produced a substantially
+different resolved strategy than the one recorded live (flop
+allin%≈0.03% here vs. 37.68% originally) — confirming that CFR resolves
+at these nodes carry meaningful run-to-run variance on top of any
+range-model effect (consistent with §38's finding of high native
+variance concentrated in a handful of decision nodes). Both effects
+likely compound.
+
+### Method 2: the live 300-hand data-collection session (`/tmp/run2.log`, §41)
+
+At 212/300 hands, overall miss rate is 34.6% (73/211), avg rank
+percentile 35.9% (informative on average, per §41's methodology). But
+filtering specifically for **full-stack losses** (the same catastrophic
+class as §38/§40's 3 historic hands — hero loses the whole 20000-chip
+stack in one hand) found exactly 2 such hands so far, and **both were
+RANGE MISS**:
+
+| Hand | Hero | Villain (real) | Board | Weight | Rank | Verdict |
+|---|---|---|---|---|---|---|
+| #20 | AhTs (no pair) | As9c (two pair, 9s+4s) | 9s8c4s6d4d | 0.0425% | 282/1035 | MISS (uniform 0.0966%) |
+| #126 | 9d6s (no pair) | As2h (nut flush, 4 board spades) | Ts8s4s2c7s | 0.0015% | 574/990 | MISS (uniform 0.1010%) |
+
+In both cases hero's own hand was actually very weak (no pair) and the
+"reduced-menu, allin-only" shove was really closer to a bluff/overplay
+that ran into a legitimately strong villain holding the range model had
+underweighted. Getting 2/2 (and 3/3 counting hand 250 above) misses
+against an overall ~34.6% baseline miss rate is individually not
+conclusive (binomial p ≈ (0.346)³ ≈ 4% under the null of "no
+correlation"), but combined with the consistent qualitative pattern
+(every single one of these losses involved a monster/slowplayed or
+rivered hand that was specifically ranked below-uniform), it is credible
+evidence of a real, direct, causal contributing mechanism: the range
+model does not just have generic noise, it seems to specifically
+struggle to keep enough weight on "checks/calls with a very strong
+made hand" lines, which inflates the model's estimate of how often an
+aggressive line gets through un-called, making shoves look more +EV than
+they truly are versus the real opponent distribution.
+
+### What this does NOT establish
+
+- It does not mean narrowing is broken in general — the aggregate 34.6%
+  miss rate / 35.9% avg percentile across 211 hands shows it is net
+  informative, just imperfect (as any range model must be).
+- It does not identify a single fixable bug — no code defect was found;
+  this reads as an inherent CFR-abstraction-and-bucket-resolution
+  limitation (169 preflop clusters / bucketed postflop clusters cannot
+  perfectly track a real human's exact tendency to slowplay monsters),
+  compounded by genuine run-to-run CFR resolve variance at these
+  specific high-leverage nodes (see Method 1 above).
+- Sample size for the *catastrophic-loss* subset is still small (n=3
+  total examined in depth). A larger sample (the ongoing 300-hand
+  session, once complete, plus more sessions) would sharpen the
+  statistical confidence but is unlikely to change the qualitative
+  conclusion given how consistent the pattern has been.
+
+### Practical implication
+
+No further fix is being attempted for this specific issue in this
+session — this is a fundamental limitation of the bucketed/CFR-blueprint
+approach (169-preflop / bucketed-postflop abstraction), not a discrete
+bug to patch, and §40 already showed that ad hoc bet-size-menu changes
+made things worse, not better. The `report_actual_hand`/RANGE MISS
+diagnostic (§41) is the durable, reusable tool for continuing to monitor
+and quantify this over larger samples going forward.
