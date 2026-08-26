@@ -17,15 +17,26 @@
 //   TurnClusterLeafModel and the new LiveResolver class), decided upon by
 //   inspecting the *calling* Python code's contract, not the .so's contents.
 //
-//   SCOPE / HONEST LIMITATIONS (see BUILD_NOTES.md section 17 for the full
-//   writeup):
-//     - PREFLOP is NOT solved. In the original DeepStack/Libratus/Alascasia
-//       family of architectures (which this repo's own preflop_hand_cluster
-//       + a since-unavailable 16GB blueprint_strategy.dat fit), preflop
-//       decisions come from an offline-solved blueprint and only POSTFLOP
-//       streets use real-time search. Without that blueprint, this library
-//       always "call"s (or "check"s, functionally identical here) preflop --
-//       a deliberate, clearly-labeled placeholder, not a solved strategy.
+//   SCOPE / HONEST LIMITATIONS (see BUILD_NOTES.md section 17/18 for the
+//   full writeup):
+//     - PREFLOP now uses the REAL trained blueprint (cluster/
+//       blueprint_strategy.dat, ~16.1GB -- this file DOES exist in this
+//       repo's data set; an earlier draft of this comment incorrectly
+//       claimed it was unobtainable, which was wrong and has been
+//       corrected) via PokerAI/tree/BlueprintReader.h, a new, targeted,
+//       streaming reader that only reads the handful of node headers on
+//       the path actually taken this hand -- never the whole ~16GB tree.
+//       This works for the opening decision and for any preflop history
+//       made only of calls/folds/allins/exactly-tree-modeled raise sizes.
+//       If the history contains a raise whose size doesn't exactly match
+//       one of the trained abstraction's discrete pot-fraction buckets (a
+//       human GUI player can enter any arbitrary size), or if the file/
+//       lookup fails for any reason, this falls back to the original,
+//       clearly-labeled "call" placeholder for that decision only -- never
+//       a guess. See BlueprintReader.h and BUILD_NOTES.md for the full
+//       format writeup and honest validation status (this reader has not
+//       been executed against the real file from within this development
+//       sandbox, which lacks disk access to it -- see BUILD_NOTES.md).
 //     - FLOP/TURN/RIVER decisions use LiveResolver (RealtimeSearch.h): a
 //       small, fast, REDUCED-ACTION (fold / call / all-in only -- no
 //       intermediate bet sizes) range-vs-range vanilla CFR resolve against a
@@ -52,6 +63,7 @@
 //   river_hand_cluster.bin is not needed and is skipped for RAM.
 //###############################################################################
 #include "../tree/RealtimeSearch.h"
+#include "../tree/BlueprintReader.h"
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -85,6 +97,18 @@ struct LiveGame {
 	unsigned char my_hole[2] = { 0, 0 };
 	std::vector<unsigned char> board;
 	std::mt19937_64 rng{ std::random_device{}() };
+
+	// Real preflop blueprint bookkeeping (see BlueprintReader.h): the exact
+	// sequence of action bytes (PokerAI/poker/State.h convention: 'd' fold,
+	// 'l' call/check, 'n' allin, or a raise pot-fraction byte code) taken so
+	// far this preflop street, from the tree's root. `preflop_path_confident`
+	// goes false (permanently, for the rest of this hand) the moment a
+	// raise is seen whose size can't be matched EXACTLY to one of the
+	// trained abstraction's discrete byte codes -- at that point the path
+	// can no longer be trusted, so preflop decisions fall back to the
+	// original "call" placeholder rather than guess.
+	std::vector<unsigned char> preflop_action_path;
+	bool preflop_path_confident = true;
 };
 
 LiveGame g;
@@ -99,6 +123,41 @@ void reset_street_counters() {
 	g.n_raises_this_street = 0;
 	g.actions_this_street = 0;
 	g.last_raise_size = 0;
+}
+
+// pypokergui's "raise N" amount is always the TOTAL bet for the CURRENT
+// street (mirrors pypokerengine's Player.paid_sum(), which is computed from
+// action_histories that are cleared at the start of every new street) --
+// but for PREFLOP specifically, the blind-posting entries are themselves
+// part of that first street's action_histories, so "amount" already
+// includes the blind. stack_at_street_start[] here is set (in
+// reset_street_counters(), called from restart_game()) AFTER blinds are
+// already deducted, so for every OTHER street it is the correct baseline to
+// subtract "amount" from, but for preflop specifically the correct
+// baseline is the ORIGINAL 20000 stack (subtracting from an
+// already-blind-adjusted baseline would double-count the blind). This
+// distinction only matters for parsing/emitting "raise N" strings.
+int street_relative_raise_baseline(int slot) {
+	return (g.betting_stage == 0) ? 20000 : g.stack_at_street_start[slot];
+}
+
+// Determines which discrete preflop raise byte-code (mirrors
+// PokerAI/poker/State.h's take_action() EXACTLY) would produce the observed
+// new whole-hand total bet for a player, given the true state immediately
+// before their action. Returns -1 if no exact match exists (e.g. a human
+// GUI player chose an arbitrary custom size the training abstraction never
+// modeled) -- callers must treat that as "can't use the real blueprint for
+// the rest of this preflop street," never round/guess a nearby bucket.
+int match_raise_action_byte(int total_pot_before, int last_bigbet_before, int my_bet_before, int observed_new_total_bet) {
+	int n_chips_to_call = last_bigbet_before - my_bet_before;
+	int pot = total_pot_before + n_chips_to_call;
+	static const int candidates[] = { 1, 2, 3, 4, 8, 20, 40 };
+	for (int byte : candidates) {
+		int last_raise = (byte != 3) ? (pot * byte / 200 * 100) : (pot / 400 * 100);
+		if (last_bigbet_before + last_raise == observed_new_total_bet)
+			return byte;
+	}
+	return -1;
 }
 
 // Samples a small representative opponent range: `count` random 2-card hands
@@ -199,6 +258,62 @@ std::string resolve_decision() {
 	return "call"; // defensive fallback, should be unreachable
 }
 
+// Facing hero's very first preflop decision, or having watched only
+// calls/folds/allins/exactly-tree-modeled raises so far this preflop street
+// (see LiveGame::preflop_path_confident), this queries the REAL trained CFR
+// blueprint (cluster/blueprint_strategy.dat, via the new targeted
+// BlueprintReader.h -- NOT the original Save_load.h full-tree loader) for
+// hero's actual average strategy at this exact decision node, instead of
+// the "always call" placeholder. Falls back to that placeholder, for this
+// decision only, if the lookup fails for ANY reason (file missing/
+// unreadable, path inconsistent with the tree, non-positive strategy sum,
+// etc.) -- see BUILD_NOTES.md for the full honest writeup, including this
+// reader's unvalidated-from-this-sandbox status.
+std::string resolve_preflop_decision() {
+	if (!g.preflop_path_confident) {
+		return "call"; // an earlier raise this street didn't match the trained
+		                // abstraction's discrete sizing ladder -- see header.
+	}
+	try {
+		int hand_cluster = engine->get_preflop_cluster(g.my_hole);
+		BlueprintReader::LookupResult res = BlueprintReader::lookup_preflop_strategy(
+			"cluster/blueprint_strategy.dat", g.preflop_action_path, hand_cluster);
+
+		int total_pot_before = (20000 - g.stack[0]) + (20000 - g.stack[1]);
+		int last_bigbet_before = std::max(20000 - g.stack[0], 20000 - g.stack[1]);
+		int my_bet_before = 20000 - g.stack[g.my_id];
+
+		double r = std::uniform_real_distribution<double>(0.0, 1.0)(g.rng);
+		double cum = 0.0;
+		for (size_t a = 0; a < res.actionstr.size(); a++) {
+			cum += res.probs[a];
+			if (r <= cum || a + 1 == res.actionstr.size()) {
+				unsigned char act = res.actionstr[a];
+				g.preflop_action_path.push_back(act);
+				if (act == 'd') return "fold";
+				if (act == 'n') return "allin";
+				if (act == 'l') return "call";
+				// raise byte-code: compute the real chip total using the
+				// EXACT same formula PokerAI/poker/State.h's take_action()
+				// uses to apply this same byte.
+				int n_chips_to_call = last_bigbet_before - my_bet_before;
+				int pot = total_pot_before + n_chips_to_call;
+				int last_raise = (act != 3) ? (pot * act / 200 * 100) : (pot / 400 * 100);
+				int new_total_bet = last_bigbet_before + last_raise;
+				return "raise " + std::to_string(new_total_bet);
+			}
+		}
+		return "call"; // defensive, should be unreachable (probs sum to 1)
+	}
+	catch (const std::exception& e) {
+		std::fprintf(stderr,
+			"[DH_PREFLOP_BLUEPRINT] real blueprint lookup failed (%s) -- "
+			"falling back to placeholder 'call' for this decision only\n",
+			e.what());
+		return "call";
+	}
+}
+
 void apply_own_action(const std::string& action) {
 	int me = g.my_id;
 	int prev_facing = std::max(committed_this_street(0), committed_this_street(1));
@@ -209,6 +324,12 @@ void apply_own_action(const std::string& action) {
 	else if (action == "allin") {
 		g.stack[me] = 0;
 		g.has_allin = true;
+		g.n_raises_this_street++;
+		g.actions_this_street++;
+	}
+	else if (action.rfind("raise ", 0) == 0) {
+		int amount = std::stoi(action.substr(6));
+		g.stack[me] = street_relative_raise_baseline(me) - amount;
 		g.n_raises_this_street++;
 		g.actions_this_street++;
 	}
@@ -232,6 +353,8 @@ void restart_game(int myid, int c1id, int c2id) {
 	g.my_hole[0] = (unsigned char)c1id;
 	g.my_hole[1] = (unsigned char)c2id;
 	g.board.clear();
+	g.preflop_action_path.clear();
+	g.preflop_path_confident = true;
 	reset_street_counters();
 }
 
@@ -246,9 +369,11 @@ void opp_take_action(char* actionstr_c) {
 	std::string a(actionstr_c);
 	int opp = 1 - g.my_id;
 	int prev_facing = std::max(committed_this_street(0), committed_this_street(1));
+	bool preflop = (g.betting_stage == 0);
 	if (a == "fold") {
 		g.folder = opp;
 		g.betting_stage = 5;
+		if (preflop && g.preflop_path_confident) g.preflop_action_path.push_back('d');
 	}
 	else if (a == "allin") {
 		g.stack[opp] = 0;
@@ -257,10 +382,23 @@ void opp_take_action(char* actionstr_c) {
 		g.last_raise_size = std::max(0, amount - prev_facing);
 		g.n_raises_this_street++;
 		g.actions_this_street++;
+		if (preflop && g.preflop_path_confident) g.preflop_action_path.push_back('n');
 	}
 	else if (a.rfind("raise ", 0) == 0) {
 		int amount = std::stoi(a.substr(6));
-		g.stack[opp] = g.stack_at_street_start[opp] - amount;
+		if (preflop && g.preflop_path_confident) {
+			// See street_relative_raise_baseline()'s comment: this must use
+			// the whole-hand-cumulative (20000 - stack) convention, matching
+			// PokerAI/poker/State.h's own Pokerstate::n_bet_chips()/total_pot
+			// bookkeeping, which never resets across streets.
+			int total_pot_before = (20000 - g.stack[0]) + (20000 - g.stack[1]);
+			int last_bigbet_before = std::max(20000 - g.stack[0], 20000 - g.stack[1]);
+			int my_bet_before = 20000 - g.stack[opp];
+			int byte = match_raise_action_byte(total_pot_before, last_bigbet_before, my_bet_before, amount);
+			if (byte >= 0) g.preflop_action_path.push_back((unsigned char)byte);
+			else g.preflop_path_confident = false; // can no longer trust the tracked path this hand
+		}
+		g.stack[opp] = street_relative_raise_baseline(opp) - amount;
 		g.last_raise_size = std::max(0, amount - prev_facing);
 		g.n_raises_this_street++;
 		g.actions_this_street++;
@@ -268,6 +406,7 @@ void opp_take_action(char* actionstr_c) {
 	else { // "call" or "check"
 		g.stack[opp] = g.stack_at_street_start[opp] - prev_facing;
 		g.actions_this_street++;
+		if (preflop && g.preflop_path_confident) g.preflop_action_path.push_back('l');
 	}
 }
 
@@ -275,8 +414,7 @@ void getdecision(char* out_buf) {
 	std::memset(out_buf, 0, 20);
 	std::string action;
 	if (g.betting_stage == 0) {
-		// Documented simplification -- see file header. No preflop solve.
-		action = "call";
+		action = resolve_preflop_decision();
 	}
 	else {
 		action = resolve_decision();

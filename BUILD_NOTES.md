@@ -1843,14 +1843,25 @@ same tractability reason):
   betting-round layer at interactive latency.
 - **`Mode::RIVER`** — resolves the real (final) betting round exactly; no
   chance nodes fire since the board is already complete.
-- **Preflop is not resolved at all** — `dh_native_ai.cpp` always returns
-  `"call"` preflop, by explicit design, not oversight. Every real
-  DeepStack/Libratus/Alascasia-style architecture in this genre precomputes
-  preflop strategy offline (from `blueprint_strategy.dat`, a 16GB file this
-  investigation was never able to obtain — see section 2) and only uses
-  real-time search postflop; without that file there is nothing legitimate
-  to search preflop against, so this is left as an honest, clearly-labeled
-  placeholder rather than something invented to look more complete.
+- **Preflop is now resolved with the REAL trained blueprint** — `dh_native_ai.cpp`
+  originally always returned `"call"` preflop under the belief that
+  `blueprint_strategy.dat` (the ~16GB file every DeepStack/Libratus/
+  Alascasia-style architecture in this genre needs for its offline-solved
+  preflop strategy) was never obtainable. **That belief was wrong and is
+  corrected here**: section 2 already documents that this file WAS
+  downloaded and byte-size-verified earlier in this same investigation
+  (as `blueprint_stgy.dat`, hard-linked to `cluster/blueprint_strategy.dat`
+  — the exact path `Main.cpp`/`Save_load.h` expect) — it sat unused only
+  because fully loading it (via `Save_load.h`'s `load()`, which
+  materializes the ENTIRE recursive tree in RAM before any single lookup)
+  was judged too RAM/swap-risky in combination with the full cluster set.
+  **Section 18 replaces the placeholder** with a new, much smaller,
+  targeted reader (`PokerAI/tree/BlueprintReader.h`) that queries the real
+  file directly for hero's actual trained strategy at the specific
+  decision point reached, without loading the rest of the tree. See
+  section 18 for the full writeup, including what preflop histories it
+  can and can't currently use, and its honest, from-this-sandbox
+  validation status.
 - The opponent's range for every resolve is a **uniformly sampled** set of
   ~40 hole-card combos consistent with the known board/hero cards (the
   opponent's true range is unknown — there is no belief-tracking blueprint
@@ -2078,8 +2089,12 @@ Re-run the command above and open the browser tab it launches to confirm.
 - Flop/turn/river decisions are genuine CFR resolves against a **uniformly
   sampled, unknown-true opponent range** — unsafe resolving, same caveat as
   every other resolver in this file.
-- **Preflop is always "call"** — an explicit placeholder, not a solved
-  strategy (no blueprint data available — see section 2).
+- **Preflop uses the real trained blueprint when the tracked action history
+  is unambiguous** (see section 18) — falls back to the original "call"
+  placeholder, for that decision only, when a raise size can't be matched
+  exactly to the trained abstraction's discrete sizing ladder, or the
+  lookup fails for any other reason (no blueprint data available was the
+  OLD, now-corrected, claim — see section 2 and section 18).
 - **Turn-mode decisions assume a river check-down** (no river-betting
   subtree) — a deliberate latency tradeoff, documented in code.
 - The reduced `{fold, call, all-in}` action set (sections 16/17) means the
@@ -2090,3 +2105,196 @@ Re-run the command above and open the browser tab it launches to confirm.
   `.so`'s specific strategy or strength, and its live-play correctness has
   not yet been end-to-end verified on this host due to the disk-permission
   issue above, not due to any known defect in the new code.
+
+## 18. Correction: `blueprint_strategy.dat` exists — a targeted reader for real preflop decisions
+
+Section 17 shipped with `dh_native_ai.cpp`'s preflop decision hardcoded to
+`"call"`, justified at the time as "no legitimate `blueprint_strategy.dat`
+was obtainable." **That justification was factually wrong**, and was only
+caught because the user pointed it out directly. Section 2 of this same
+document already recorded, in detail, that this file WAS downloaded earlier
+in this investigation — under the mirror's filename, `blueprint_stgy.dat`
+(16,123,074,125 bytes) — hard-linked to `cluster/blueprint_strategy.dat`
+(the exact relative path `PokerAI/Main.cpp`/`PokerAI/tree/Save_load.h`
+expect), and byte-size-verified against the other five cluster files as a
+"strong signal" of legitimacy (no official hash was ever available to check
+against — see section 2 for the full provenance caveat). Section 9.1 also
+records an actual, real attempt to load it via the original loader
+(`./Main.o 1`), which was deliberately killed after ~20s when swap grew to
+~19.4GB, back when free disk was only ~13GB and cluster files hadn't yet
+been relocated externally — a real, cautious decision, not a fabricated
+"couldn't obtain it" one. Conflating "judged too risky to fully load, once,
+under much tighter disk headroom" with "never obtainable" was the mistake.
+
+### Why the file was still unused: `Save_load.h::load()` has no random access
+
+`PokerAI/tree/Save_load.h`'s `load()` is the *only* deserializer the
+original codebase ships. It works by recursively rebuilding the **entire**
+`strategy_node` tree in memory (`bulid_bluestrategy()`) before a single
+lookup is possible — there is no index, no seek table, nothing that lets
+you ask for "just hero's strategy at this one decision point." Combining
+that with the ~20.9GB cluster-file requirement (section 17's swap-
+feasibility subsection) would mean materializing roughly the file's own
+16.1GB on disk *plus* per-node pointer/`double[]` heap overhead
+(conservatively estimated in section 9.1 as noticeably larger than the raw
+file) simultaneously with the cluster tables — tens of GB of working set
+against 16GB of physical RAM. That is a real, still-unresolved cost of
+*fully* loading the blueprint the way the original authors' own tooling
+does; it says nothing about whether the file exists or is legitimate.
+
+### A much smaller alternative: read only the node(s) actually needed
+
+`Save_load.h`'s own write side (`dfs_write()`) writes the tree **depth-first,
+action-major**: for one "batch" of `clusterlen` parallel private-hand-cluster
+info sets (169 at the root), it writes one shared `int32 action_len`, then
+(if `action_len` is in the ordinary 1-99 range) one shared `actionstr[action_len]`,
+then, for *each* of the `clusterlen` slots in turn, that slot's
+`double[action_len] regret` and `double[action_len] averegret` arrays — and
+only *after* all of that, recursively, `action_len` complete subtrees (one
+per legal action), each written in full before the next begins.
+
+This means the ROOT node's own header (hero's very first preflop decision,
+shared by all 169 clusters) sits in the first few KB of the file, and any
+DEEPER node's header can be reached by reading a chain of ancestor headers
+plus **skipping** (not reading into memory, just walking past) whichever
+earlier sibling subtrees weren't taken. None of this requires reading, let
+alone holding in RAM, the other ~16GB of the file.
+
+`PokerAI/tree/BlueprintReader.h` is a new, additive header implementing
+exactly this: `read_node_header()` reads one node's `action_len`/`actionstr`/
+`averegret` (only `averegret` — the CFR average-strategy accumulator — is
+kept; `regret` is read-and-discarded just to stay aligned with the file),
+`skip_subtree()` walks past one full subtree without allocating anything,
+and `lookup_preflop_strategy(path, action_path, hand_cluster)` chains both
+to walk from the root down a specific sequence of action bytes and return
+the normalized average strategy for one specific 169-way hand cluster. It
+never touches `Save_load.h` itself (that file is left completely
+unmodified) and never handles the `action_len >= 100` chance-node case
+(reserved for board-card deals) — preflop betting can never produce one
+(no cards are dealt until preflop closes), so encountering that marker
+during a preflop-only walk means the navigation took a wrong turn, and the
+reader throws rather than silently trusting nearby bytes.
+
+### Wiring into `dh_native_ai.cpp`
+
+- `LiveGame` now tracks `preflop_action_path` (the exact byte-coded
+  sequence of actions taken so far this preflop street, root-relative) and
+  `preflop_path_confident` (goes false, for the rest of the hand, the
+  moment a raise can't be matched to the trained ladder — see below).
+- `resolve_preflop_decision()` (replaces the hardcoded `"call"` branch in
+  `getdecision()`) calls `BlueprintReader::lookup_preflop_strategy()` with
+  hero's actual `Engine::get_preflop_cluster()` bucket and the tracked
+  path, samples an action from the returned real strategy, and — for a
+  raise byte — computes the actual chip total using the **exact same
+  pot-fraction formula** `PokerAI/poker/State.h`'s `take_action()` uses
+  (`last_raise = pot * byte / 200 * 100`, except byte `3` which is
+  `pot / 400 * 100`), so the GUI receives a properly sized `"raise N"`
+  string, not just fold/call/allin.
+- Any failure at all (file missing/unreadable, path inconsistent with the
+  tree, non-positive strategy sum, — anything `BlueprintReader.h` throws)
+  is caught and falls back to the original `"call"` placeholder for that
+  one decision, with a one-line diagnostic on stderr. Never a crash, never
+  a guess.
+- **Matching an opponent's (or the AI's own) raise to a real byte code**:
+  `match_raise_action_byte()` recomputes the same `take_action()` formula
+  for every plausible byte (`1,2,3,4,8,20,40`) against the exact pre-action
+  chip state and looks for an **exact** match to the observed new total
+  bet — never a nearest-neighbor guess. If a human GUI player enters an
+  arbitrary custom size that doesn't land on the trained ladder, the match
+  fails, `preflop_path_confident` goes false, and every remaining preflop
+  decision this hand uses the honest placeholder instead of extrapolating
+  from an unreliable path.
+- **Currently-usable histories**: the opening decision (no history at all),
+  and any all-call/all-check history (e.g. limping), are always usable —
+  `'l'`/`'d'`/`'n'` need no size matching. Histories containing a raise are
+  usable exactly when that raise's size exactly matches the trained
+  ladder's formula; otherwise that hand's preflop reverts to the
+  placeholder from that point on. Facing *arbitrary* raise sizes with full
+  fidelity would need either the exact same discretization the original
+  training used for its own bet-size abstraction (not fully known without
+  the original tree-construction driver code) or accepting nearest-bucket
+  approximation — deliberately **not** implemented here to avoid silently
+  guessing.
+
+### A related pre-existing bug found and fixed while doing this
+
+Building `match_raise_action_byte()` required reconstructing the exact
+whole-hand chip state before an action, which surfaced a genuine,
+already-committed bug in section 17's original `opp_take_action()`: for
+**preflop** raises specifically, `pypokergui`'s reported `"raise N"` amount
+is the *whole-preflop-street* cumulative total (confirmed by reading
+`pypokergui/pypokerengine/engine/player.py`'s `paid_sum()`, which is
+computed from `action_histories` — cleared at the start of every street,
+but the blind-posting entries are themselves part of *preflop's*
+`action_histories`, so blinds are already included in preflop's `amount`).
+The original code subtracted that amount from `stack_at_street_start[opp]`,
+which was itself *already* blind-adjusted (set in `restart_game()` after
+deducting blinds) — double-counting the blind and under-crediting the
+opponent's remaining stack by exactly the blind amount for the rest of the
+hand whenever the opponent raised preflop. **Fixed** via
+`street_relative_raise_baseline()`, which uses the original `20000` stack
+(not the blind-adjusted `stack_at_street_start`) as the subtraction
+baseline specifically for preflop, since that is the only street where the
+two differ; every other street is unaffected (its `paid_sum()` already
+starts at zero, matching `stack_at_street_start`).
+
+### Validation performed
+
+**Could not be run against the real file** — this development sandbox
+still lacks OS-level disk permission to read `cluster/blueprint_strategy.dat`
+(external drive; see section 17's disk-permission subsection — a sandbox-
+specific limitation, not a code defect). Everything below is what could
+honestly be validated without it:
+
+- `dh_native_ai.cpp` (with `BlueprintReader.h` included) compiles cleanly
+  to `.dylib`, all 4 required C symbols still present (`nm -gU`).
+- **`BlueprintReader.h`'s reader was validated against hand-built synthetic
+  files matching the documented format exactly** (built directly with
+  Python's `struct.pack`, mirroring `dfs_write()`'s byte order field-for-
+  field): a flat 169-cluster root read correctly reproduced distinct,
+  correctly-normalized (`sum == 1.0`) per-cluster strategies from
+  deliberately cluster-varying `averegret` values; a 2-level-deep tree
+  (root offering `['d','l']`, `'d'` a terminal, `'l'` leading to a real
+  child node offering `['l','n']`) correctly skipped the sibling `'d'`
+  subtree and descended into `'l'`'s subtree, again reproducing the exact
+  expected per-cluster normalized values. This confirms the reader's logic
+  is correct **for the documented format** — it does not confirm the real
+  16GB file matches that documented format in every respect, since it
+  could not be opened from this sandbox.
+- A new standalone tool, `PokerAI/tools/test_blueprint_root_read.cpp`,
+  reads *only* the root node (a few KB) from a given blueprint path and
+  prints, for a handful of sample clusters, the legal actions and
+  normalized strategy. **The user should run this before trusting real
+  preflop decisions in play**:
+
+  ```shell
+  cd PokerAI
+  g++ -std=c++17 -O2 -o test_blueprint_root_read tools/test_blueprint_root_read.cpp
+  ./test_blueprint_root_read            # uses cluster/blueprint_strategy.dat by default
+  ```
+
+  A sane result: small `action_len` per cluster (2-8ish), byte codes
+  matching `State.h` (`'d'`=fold, `'l'`=call, `'n'`=allin, small ints for
+  raise sizes), probabilities summing to ~1.0, and **not** every cluster
+  producing an identical distribution (169 clusters getting the exact same
+  numbers would suggest either a corrupt/placeholder file or a reader bug,
+  even though the byte-level parsing tested clean above).
+
+### Honest scope after this change
+
+- Preflop decisions are now backed by the real trained blueprint for the
+  opening action and for pure call/check preflop histories; raised pots use
+  it only when the raise size exactly matches the trained ladder, else fall
+  back to the original placeholder for the rest of that hand's preflop.
+- This is **still not validated against the real 16.1GB file** from within
+  this development sandbox — only against synthetic files built to the
+  documented format. The user, who has working disk access, should run
+  `test_blueprint_root_read` and report back before relying on this for
+  real decisions; if it reveals a format mismatch, the fallback path (the
+  original "call" placeholder) remains fully intact and this is a
+  net-neutral, safe change either way.
+- The full-tree, arbitrary-raise-size feature (loading/consulting the
+  entire blueprint, or handling any custom bet size) remains explicitly
+  out of scope for the reasons above — this section only replaces the
+  narrowest, safest, highest-value slice (the most common preflop
+  decisions) with real data, not the whole preflop game tree.
