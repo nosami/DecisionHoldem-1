@@ -1881,14 +1881,56 @@ other tool in this repo):
 
 ```shell
 cd PokerAI
-g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -shared -fPIC \
-    -o dh_native_ai.dylib tools/dh_native_ai.cpp
+g++ -std=c++17 -O2 -shared -fPIC -o dh_native_ai.dylib tools/dh_native_ai.cpp
 ```
 
 This compiles cleanly (0 errors, 1 pre-existing unrelated unused-parameter
 warning shared with every other file that includes `State.h`), and
 `nm -gU dh_native_ai.dylib` confirms all four required symbols are exported:
 `_restart_game`, `_Next_stage`, `_opp_take_action`, `_getdecision`.
+
+**Note on `DH_SKIP_RIVER_CLUSTER`:** an earlier revision of this build
+command included `-DDH_SKIP_RIVER_CLUSTER` (the opt-in, default-off macro
+from section 9) to skip loading the 16.86GB `river_hand_cluster.bin` for a
+faster build/test cycle. **That flag has been removed from the real build**
+so `dh_native_ai.dylib` loads the full, real river cluster — see the swap
+feasibility analysis immediately below for why this is now a reasonable
+default, unlike section 9.1's full-blueprint scenario.
+
+#### Is running with the full cluster set (via swap) actually feasible here?
+
+Section 9.1 declined running the *entire* engine (all cluster files **plus**
+the ~15GB `blueprint_strategy.dat` in-memory tree, ~34.4GiB total) under
+swap, because at the time available disk was only 13GB against an ~18.4GiB
+shortfall. **`dh_native_ai.dylib`/`LiveResolver` is a materially smaller
+ask than that scenario** — it never loads `blueprint_strategy.dat` at all
+(preflop is a hardcoded placeholder, not blueprint-driven; see below), so
+its only large in-memory footprint is the `Engine()` cluster tables:
+
+| File | Size |
+|---|---|
+| `sevencards_strength.bin` | 1.338 GB |
+| `preflop_hand_cluster.bin` | ~0.01 GB |
+| `flop_hand_cluster.bin` | ~0.21 GB |
+| `turn_hand_cluster.bin` | ~2.44 GB |
+| `river_hand_cluster.bin` | 16.86 GB |
+| **Total** | **~20.9 GB** |
+
+Against this host's 16GB physical RAM, that's a **~5GB swap shortfall** —
+not the ~18.4GB shortfall of the declined full-blueprint scenario — and
+current internal disk free space is **~91GB** (re-measured at the time of
+this decision), comfortably covering it many times over. On this basis,
+building and running `dh_native_ai.dylib` with the real river cluster
+loaded (no `DH_SKIP_RIVER_CLUSTER`) was judged reasonable to attempt, where
+the earlier full-blueprint attempt was not. Expect the very first library
+load (whichever process — a smoke test or the GUI itself — triggers
+`Engine()`'s global static constructor) to take noticeably longer than the
+river-skipped build while ~5GB gets paged to swap and `river_hand_cluster.bin`
+streams in from the external USB drive at its previously-measured
+~30-35MB/s (section 11); subsequent lookups against already-resident pages
+should be fast. Monitor with `vm_stat`/`sysctl vm.swapusage` during the
+first load, same as section 2's methodology, and be ready to stop the
+process if swap usage or disk free trend somewhere unexpected.
 
 ### GUI wiring: `pypokergui/server/game_manager.py`
 
@@ -1970,6 +2012,10 @@ ai start load
 [DH_SKIP_RIVER_CLUSTER] river_hand_cluster.bin NOT loaded (build/test mode)
 load finish (./dh_native_ai.dylib)
 ```
+
+(this log line reflects the *first* build, which still had the
+river-skipping flag enabled — see the swap-feasibility subsection above for
+why that flag has since been removed so the real river cluster loads.)
 
 confirming `dh_native_ai.dylib` really does load and read real cluster data
 end-to-end on this host. It then failed one line later with a second,
