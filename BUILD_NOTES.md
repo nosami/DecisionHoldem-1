@@ -3229,3 +3229,49 @@ standalone timing above suggests they should) and that no
 `[DH_RANGE_MODEL] ... narrowing failed` warnings appear on stderr under
 normal play (occasional warnings for non-all-in postflop raises are
 EXPECTED and documented above, not a bug).
+
+## 26. Cluster-data file placement: moved flop/turn/sevencards back to local SSD
+
+Following section 25's file-location audit (SSD vs. Seagate), the user asked
+to move the Seagate-hosted files back to local SSD storage, **except** for
+`river_hand_cluster.bin` (16.86GB), which is never loaded into RAM at
+runtime (`DH_SKIP_RIVER_CLUSTER` is always defined in this build) and so has
+no measurable performance benefit from being on faster local storage.
+
+**Action taken** (2024, this session): copied the following three files from
+`/Volumes/Seagate Desktop Drive/DecisionHoldem_cluster_data/` to
+`/Users/jason/dh_local_data/` via `cp -p`, verified byte-for-byte with
+`shasum -a 256` before deleting the Seagate originals, then repointed the
+`PokerAI/cluster/*.bin` symlinks:
+
+| File | Size | New location |
+|---|---|---|
+| `flop_hand_cluster.bin` | 207,916,800 bytes (~194MB) | `/Users/jason/dh_local_data/` |
+| `turn_hand_cluster.bin` | 2,443,022,400 bytes (~2.27GB) | `/Users/jason/dh_local_data/` |
+| `sevencards_strength.bin` | 1,337,845,600 bytes (~1.24GB) | `/Users/jason/dh_local_data/` |
+
+**Left on Seagate** (`/Volumes/Seagate Desktop Drive/DecisionHoldem_cluster_data/`):
+- `river_hand_cluster.bin` (16,856,854,560 bytes, ~15.7GB) — unused at
+  runtime due to `DH_SKIP_RIVER_CLUSTER`; kept external since local SSD
+  speed provides no benefit for a file that's never read into RAM.
+- `blueprint_stgy.dat` (16,123,074,125 bytes, ~15.0GB) — a redundant
+  duplicate of the SSD copy already at `/Users/jason/dh_local_data/blueprint_stgy.dat`
+  (the live copy actually used at runtime). Left untouched per section 25's
+  decision (treated as a backup; not deleted without explicit user
+  confirmation).
+
+**Current `PokerAI/cluster/` symlink targets after this change**:
+```
+blueprint_stgy.dat      -> /Users/jason/dh_local_data/blueprint_stgy.dat       (15.0GB)
+blueprint_strategy.dat  -> /Users/jason/dh_local_data/blueprint_stgy.dat       (alias, same target)
+flop_hand_cluster.bin   -> /Users/jason/dh_local_data/flop_hand_cluster.bin    (194MB)
+turn_hand_cluster.bin   -> /Users/jason/dh_local_data/turn_hand_cluster.bin    (2.27GB)
+sevencards_strength.bin -> /Users/jason/dh_local_data/sevencards_strength.bin  (1.24GB)
+river_hand_cluster.bin  -> /Volumes/Seagate Desktop Drive/DecisionHoldem_cluster_data/river_hand_cluster.bin (15.7GB, external, unused at runtime)
+```
+
+Local SSD (`/Users/jason/dh_local_data/`) now holds ~18.7GB total
+(blueprint + flop + turn + sevencards). Verified 76GB free on the SSD
+before the move (post-move: ~72GB free), so ample headroom remained.
+No functional change to the app: symlink targets changed, not the
+`PokerAI/cluster/` paths the code reads, so no source changes were needed.
