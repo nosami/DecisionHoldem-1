@@ -184,6 +184,18 @@ public:
 	// Average showdown sign (+1 hero wins / -1 hero loses / 0 tie) for hero
 	// hand index hi vs villain hand index vi, averaged over all sampled turn
 	// cards that don't collide with either hand's hole cards.
+	//
+	// POLARITY (found via a real live-play bug, see BUILD_NOTES.md section
+	// 22): a LOWER `get_turn_cluster()` id is the STRONGER hand, not a
+	// higher one. This was verified two independent ways: (1) the
+	// original authors' own offline `tree/Exploitability.h::getnode_cfv_river()`
+	// treats `clusters[mycard] > clusters[j]` as hero LOSING; (2) a direct
+	// empirical test against the real `turn_hand_cluster.bin` for a known
+	// weak hand (ten-high + a gutshot on a random flop) found the old
+	// `hc > vc` convention here reported hero as a ~76% favorite, while
+	// real Monte-Carlo equity for that exact spot is ~33% -- i.e. the old
+	// code had the comparison backwards for every flop decision that
+	// reaches this leaf model, not just one hand.
 	double expected_showdown_sign(int hi, int vi) const {
 		const auto& hh = range_.hero[hi];
 		const auto& vh = range_.villain[vi];
@@ -195,8 +207,8 @@ public:
 			int hc = hero_clusters[hi][k];
 			int vc = villain_clusters[vi][k];
 			if (hc < 0 || vc < 0) continue; // collided with own hole cards
-			if (hc > vc) sum += 1.0;
-			else if (hc < vc) sum -= 1.0;
+			if (hc < vc) sum += 1.0;      // lower cluster id = stronger hand = hero wins
+			else if (hc > vc) sum -= 1.0;
 			n++;
 		}
 		if (n == 0) return 0.0;

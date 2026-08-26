@@ -2676,3 +2676,130 @@ still-undiscovered reader bug, or a `g.preflop_action_path` tracking bug in
 `dh_native_ai.cpp` (worth checking `opp_take_action()`/`resolve_preflop_decision()`
 first, per section 18's caveats) — not this specific issue, which is now
 fixed and validated against its exact failure mode.
+
+## 22. Real bug found and fixed: `TurnClusterLeafModel` had an inverted cluster-strength comparison (systematically bad flop decisions)
+
+### The report
+
+The user flagged a specific hand as suspicious: on the flop (board `8h 6h 9s`
+at decision time), holding `3c Td` (ten-high, no pair, only a backdoor
+gutshot straight draw), the AI **called an effectively-full-stack all-in
+shove** (19000 into a ~2000 pot). This looked like a bad call worth
+investigating directly, not dismissing as "the known unsafe-resolving
+simplification."
+
+### Investigation and root cause
+
+This was investigated with the external drive now accessible from this
+sandbox (a change from every earlier section), which made it possible to
+test directly against the real cluster files for the first time.
+
+First, a plain Monte Carlo simulation (independent of any DecisionHoldem
+code, using a from-scratch hand evaluator) found hero's actual equity in
+this exact spot against a **uniform random opponent hand** (the resolver's
+own stated, already-documented simplifying assumption, section 17) is only
+**~32.8%** — far short of the ~47.5% pot odds required to profitably call.
+So even under the model's own most-generous assumption, this call should
+have been a clear fold. That ruled out "unsafe/uniform-range resolving" as
+the explanation and pointed at a real defect in the decision math itself.
+
+Reviewed `PokerAI/tree/RealtimeSearch.h`'s `TurnClusterLeafModel` (the
+class that estimates a flop decision's continuation value once flop
+betting closes, by comparing each side's `Engine::get_turn_cluster()` id
+averaged over the possible next card — this repo's own "ordinal cluster id
+approximates hand strength" idea, reused from the original authors'
+offline `tree/Exploitability.h`). Its `expected_showdown_sign()` compared
+`hc > vc` (hero's cluster id greater than villain's) as **hero wins**.
+
+Cross-checking against the *original authors'* own `Exploitability.h`
+(`getnode_cfv_river()`, lines ~37-75) revealed the opposite convention:
+`if (clusters[mycard] > clusters[j]) actionicfvs1[j] = -pot*0.5;` — i.e. a
+**greater** cluster id there results in a **loss**. That is: a **lower**
+cluster id is the **stronger** hand, not a higher one.
+
+To settle this empirically rather than by code-reading alone (`to_cluster`
+in `Exploitability.h` is populated by a caller not present in this repo,
+so it isn't provable from that file alone that it's the exact same id
+space as `Engine::get_turn_cluster()`), a direct test was built and run
+against the **real** `turn_hand_cluster.bin` (now accessible) for the
+exact disputed hand (`3c Td` on `8h 6h 9s`), enumerating all 1081 possible
+villain hole-card combinations and averaging `expected_showdown_sign()`
+both ways:
+
+```
+ORIGINAL polarity (hc>vc=win) hero equity: 76.38%
+FLIPPED  polarity (hc<vc=win) hero equity: 23.62%
+Reference (real Monte Carlo equity):        32.81%
+```
+
+The original code told the resolver hero was a **76% favorite** in a spot
+where hero is actually a clear underdog — essentially inverted. The
+flipped convention lands on the correct side (underdog) and within the
+expected noise band of a coarse, bucketed approximation (cluster ids pool
+many hands together; some gap from the exact 32.8% figure is expected and
+not itself a bug). This confirms the fix, independently of the
+`Exploitability.h` cross-check.
+
+### The fix
+
+`PokerAI/tree/RealtimeSearch.h`'s `TurnClusterLeafModel::expected_showdown_sign()`:
+
+```cpp
+// before (backwards):
+if (hc > vc) sum += 1.0;
+else if (hc < vc) sum -= 1.0;
+
+// after (correct: lower cluster id = stronger hand):
+if (hc < vc) sum += 1.0;
+else if (hc > vc) sum -= 1.0;
+```
+
+Searched the rest of `RealtimeSearch.h` and `dh_native_ai.cpp` for any
+other ordinal cluster-id comparisons that might share this bug: this is
+the **only** place hand-cluster ids are compared this way (`FlopResolver`,
+an offline demo/study tool not wired into live play, shares the same
+`TurnClusterLeafModel` class and is automatically fixed by the same
+change; every other resolver path uses exact `Engine::compute_winner()`/
+`sevencards_strength.bin` showdown scoring, or the real preflop blueprint,
+neither of which involve this comparison).
+
+### Scope and severity
+
+This affected **every flop decision** that reaches this leaf model (i.e.
+essentially all FLOP-mode `LiveResolver` resolves since section 17 wired
+it into live play) — not just this one hand. The resolver was
+systematically overvaluing hero's continuation equity whenever flop
+betting would close, biasing toward far too many calls (and likely too
+few folds) across the board. This is a significantly more consequential
+bug than section 21's preflop tree-navigation fix; it degrades actual
+decision quality on essentially every flop pot, not just a specific rare
+tree-navigation edge case.
+
+### Validation performed
+
+- Independent Monte Carlo ground truth (from-scratch Python hand
+  evaluator, no DecisionHoldem code reused) for the exact disputed hand.
+- Direct empirical test against the real `cluster/turn_hand_cluster.bin`
+  and `cluster/sevencards_strength.bin` (now accessible from this sandbox)
+  comparing both polarity conventions' implied equity against that ground
+  truth.
+- Cross-checked against the original authors' own (unmodified, pre-existing)
+  `tree/Exploitability.h` code, independently confirming the same "lower
+  cluster id wins" convention for river clusters.
+- Confirmed no other code path shares the same comparison pattern.
+- Rebuilt `dh_native_ai.dylib` (`g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER
+  -shared -fPIC -o dh_native_ai.dylib tools/dh_native_ai.cpp`): compiles
+  cleanly, all 4 ABI symbols intact (`nm -gU`).
+
+### What's still not directly verified
+
+The exact numeric residual gap between the flipped-polarity model estimate
+(23.62%) and true equity (32.81%) for this one hand has not been
+decomposed further (how much is inherent cluster-bucketing coarseness vs.
+some other smaller remaining approximation error) — that gap is expected
+and inherent to using a bucketed abstraction as a proxy for exact equity,
+not evidence of a further bug, but it does mean flop decisions from this
+resolver remain an approximation, not exact-equity play, same as
+documented in sections 15-17. The user should re-test live play across a
+range of flop spots (not just calls facing shoves) to build confidence
+that decision quality has meaningfully improved with this fix in place.
