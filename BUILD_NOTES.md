@@ -2352,3 +2352,79 @@ working above.
   out of scope for the reasons above — this section only replaces the
   narrowest, safest, highest-value slice (the most common preflop
   decisions) with real data, not the whole preflop game tree.
+
+## 19. GUI startup hang after the blueprint change: confirmed unrelated, root cause is the (never-actually-needed) full river-cluster swap load
+
+After section 18's blueprint change, the user reported `python3
+../__main__.py serve dummy --port 8000` appearing to hang right after
+printing `ai start load`, unsure whether it was progressing or stuck, and
+suspected the new blueprint-reading code was the cause.
+
+**It was not.** `resolve_preflop_decision()`/`BlueprintReader.h` only run
+*during a hand*, when `getdecision()` is called for a preflop decision —
+they open and read a few KB from `cluster/blueprint_strategy.dat` on
+demand. Nothing in section 18's change runs at library-load time. The
+`ai start load` → `load finish` messages bracket `Engine::load()`
+(`PokerAI/poker/Engine.h`), which is unrelated code, untouched by section
+18, and was already known (`244ff43`, "Revert `DH_SKIP_RIVER_CLUSTER`...
+load real river cluster via swap") to fully materialize
+`river_hand_cluster.bin` (16.86GB) in memory at load time, per the user's
+own earlier request to test whether that would work under swap. This was
+the build actually running — the timing (this being the first launch
+attempt after the blueprint rebuild) was coincidental, not causal.
+
+**Live diagnosis, on the same host, while the user's process was
+"hanging":** its PID was visible from this session's own shell (same
+machine). `ps` showed a process 8+ minutes in, resident set size actually
+*shrinking* over time (a classic sign of active paging/thrashing, not a
+frozen/deadlocked process), and `sysctl vm.swapusage` showed swap climbing
+in real time — `total=5120M used=4300M free=820M`, then seconds later
+`total=6144M used=5034M free=1110M` (macOS dynamically grows the swap
+file as pressure increases). This is a real, still-progressing but
+extremely slow disk-bound load (the file lives on an external drive, and
+"progress" here means paging ~17GB through a system with 16GB of unified
+memory), not a code hang — but it was heading toward exhausting available
+swap/disk headroom with no guarantee of ever completing, so it was killed
+(`kill <pid>`) rather than left running further.
+
+**The fix: stop loading `river_hand_cluster.bin` at all — it was already
+proven dead weight.** Section 17's own header comment in `dh_native_ai.cpp`
+states plainly that this library's river-street code only ever calls
+`Engine::compute_winner()` (backed by `sevencards_strength.bin`), and
+**never** `Engine::get_river_cluster()` — the 16.86GB file has no code
+path that reads it in this resolver at all. Loading it via swap was
+purely an experiment the user asked for earlier ("I want to see if it's
+possible to run with swap"); the experiment's answer is now conclusively
+**no** — not within a reasonable time, and not without risking swap/disk
+exhaustion. The file's own committed build-command comment already
+recommended `-DDH_SKIP_RIVER_CLUSTER` as the default; that recommendation
+was temporarily overridden for the swap experiment and is now restored:
+
+```shell
+cd PokerAI
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -shared -fPIC \
+    -o dh_native_ai.dylib tools/dh_native_ai.cpp
+```
+
+Rebuilt and confirmed: compiles cleanly, all 4 ABI symbols present
+(`nm -gU`), and swap usage on this host immediately began dropping back
+down after the old process was killed (`total=3072M used=1583M
+free=1489M` moments later) — consistent with the large in-flight
+allocation being released, not with any leak or ongoing pressure from
+other code.
+
+**This flag has zero effect on decision quality or on the new preflop
+blueprint feature** — they are fully independent:
+- River decisions still use exact showdown equity via
+  `Engine::compute_winner()`/`sevencards_strength.bin`, unaffected either
+  way, because that was always the only river data path used.
+- The section 18 preflop blueprint reader opens
+  `cluster/blueprint_strategy.dat` directly and independently via
+  `BlueprintReader.h`'s own small, targeted reads — it does not depend on
+  or interact with `Engine::load()` or the `DH_SKIP_RIVER_CLUSTER` flag at
+  all.
+
+**Recommendation:** always build with `-DDH_SKIP_RIVER_CLUSTER` on this
+host (16GB unified memory) going forward — it is not a reduced-fidelity
+mode for anything this codebase's resolver actually uses, only a RAM/swap
+optimization that removes a genuinely large, genuinely unused load.
