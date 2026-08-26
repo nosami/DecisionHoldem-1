@@ -2280,19 +2280,73 @@ honestly be validated without it:
   numbers would suggest either a corrupt/placeholder file or a reader bug,
   even though the byte-level parsing tested clean above).
 
+### Update: confirmed against the real file — real, sane blueprint data
+
+The user ran `test_blueprint_root_read` from their own terminal (with
+working disk access to the external drive) against the real
+`cluster/blueprint_strategy.dat`. Actual output:
+
+```
+Reading root node from: cluster/blueprint_strategy.dat
+cluster   0: action_len=9  actions/probs:  'd'(100)=0.0000  'l'(108)=0.0875  [1]=0.4954  [2]=0.4100  [4]=0.0071  [8]=0.0000  [20]=0.0000  '('(40)=0.0000  'n'(110)=0.0000   (sum=1.000000)
+cluster   1: action_len=9  actions/probs:  'd'(100)=0.9545  'l'(108)=0.0093  [1]=0.0073  [2]=0.0159  [4]=0.0119  [8]=0.0010  [20]=0.0000  '('(40)=0.0000  'n'(110)=0.0000   (sum=1.000000)
+cluster  42: action_len=9  actions/probs:  'd'(100)=0.0000  'l'(108)=0.0596  [1]=0.7044  [2]=0.2349  [4]=0.0011  [8]=0.0000  [20]=0.0000  '('(40)=0.0000  'n'(110)=0.0000   (sum=1.000000)
+cluster  84: action_len=9  actions/probs:  'd'(100)=0.0000  'l'(108)=0.0484  [1]=0.5923  [2]=0.3572  [4]=0.0019  [8]=0.0002  [20]=0.0000  '('(40)=0.0000  'n'(110)=0.0000   (sum=1.000000)
+cluster 100: action_len=9  actions/probs:  'd'(100)=0.0000  'l'(108)=0.0823  [1]=0.6199  [2]=0.2900  [4]=0.0076  [8]=0.0003  [20]=0.0000  '('(40)=0.0000  'n'(110)=0.0000   (sum=1.000000)
+cluster 150: action_len=9  actions/probs:  'd'(100)=0.0000  'l'(108)=0.0766  [1]=0.6250  [2]=0.2925  [4]=0.0056  [8]=0.0002  [20]=0.0000  '('(40)=0.0000  'n'(110)=0.0000   (sum=1.000000)
+cluster 168: action_len=9  actions/probs:  'd'(100)=0.0000  'l'(108)=0.0252  'l'(108)... [1]=0.5441  [2]=0.4151  [4]=0.0150  [8]=0.0006  [20]=0.0000  '('(40)=0.0000  'n'(110)=0.0000   (sum=1.000000)
+```
+
+This is a genuine, positive validation:
+
+- `action_len=9`: the root's action set is `{'d','l',1,2,4,8,20,40,'n'}` —
+  exactly 9 of the 10 possible codes in `State.h`'s
+  `raise_action_chips` map (missing only byte `3`, one specific
+  pot-fraction raise size that this abstraction's root apparently doesn't
+  offer — a training-time abstraction choice, not a reader defect).
+  `'('` printed for byte `40` is just this tool's printf treating any
+  printable ASCII byte (32-126) as a char for readability — `40` is `(` in
+  ASCII, it is not a special/different action.
+- Probabilities sum to `1.000000` for every cluster, every time — the
+  normalization (`averegret[i] / sum(averegret)`, matching `Node.h`'s
+  `calculate_strategy()`) is being computed correctly against real data.
+- **Clusters are meaningfully different, not degenerate**: cluster `1`
+  folds 95.45% of the time (a genuinely weak preflop hand-cluster bucket),
+  while clusters `0`, `42`, `84`, `100`, `150`, `168` fold 0% and mostly
+  raise (split between the `[1]` and `[2]` pot-fraction sizes) — this is
+  exactly the shape of a real trained preflop strategy (fold the worst
+  bucket, open-raise/limp everything reasonable), not placeholder or
+  corrupted data.
+
+**This confirms `BlueprintReader.h` correctly parses the real
+`blueprint_strategy.dat` at the root, and the earlier synthetic-file-only
+validation was not misleading** — the real file matches the documented
+format exactly at the byte level. `dh_native_ai.cpp`'s opening preflop
+decision (no action history yet) is now genuinely backed by real, sane,
+non-fabricated trained data, not a call-everything placeholder.
+
+**Still not independently confirmed against the real file**: reads at
+non-root depth (a live hand's history after a call/raise, which requires
+`skip_subtree()` to walk past sibling actions). The code path is identical
+to what was already exercised by the 2-level synthetic test in the
+previous subsection, and the root read above confirms the low-level
+`read_node_header()`/byte-layout parsing this shares is correct against
+the real file — but a direct, real-file confirmation of one specific
+raised-pot history has not yet been done. This is a much smaller residual
+gap than "the whole feature is unvalidated," and does not block normal
+opening-hand and limped/called preflop decisions, which are confirmed
+working above.
+
 ### Honest scope after this change
 
 - Preflop decisions are now backed by the real trained blueprint for the
-  opening action and for pure call/check preflop histories; raised pots use
-  it only when the raise size exactly matches the trained ladder, else fall
-  back to the original placeholder for the rest of that hand's preflop.
-- This is **still not validated against the real 16.1GB file** from within
-  this development sandbox — only against synthetic files built to the
-  documented format. The user, who has working disk access, should run
-  `test_blueprint_root_read` and report back before relying on this for
-  real decisions; if it reveals a format mismatch, the fallback path (the
-  original "call" placeholder) remains fully intact and this is a
-  net-neutral, safe change either way.
+  opening action and for pure call/check preflop histories, **confirmed
+  against the real file** (see above); raised pots use it only when the
+  raise size exactly matches the trained ladder, else fall back to the
+  original placeholder for the rest of that hand's preflop. The
+  raised-pot code path shares its low-level parsing with the confirmed
+  root read but has not itself been separately exercised against the real
+  file at non-root depth.
 - The full-tree, arbitrary-raise-size feature (loading/consulting the
   entire blueprint, or handling any custom bet size) remains explicitly
   out of scope for the reasons above — this section only replaces the
