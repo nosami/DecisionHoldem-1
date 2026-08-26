@@ -197,10 +197,26 @@ struct LookupResult {
 // reads that final node's header and returns hero's normalized average
 // strategy for `hand_cluster` (0-168).
 //
-// Only ever reads a small, bounded number of node headers (never the bulk
-// of the ~16GB file): the root read alone is a few KB; each additional
-// step of `action_path` costs at most a few more KB per sibling action it
-// has to skip past, still negligible against the file's full size.
+// CORRECTION (see BUILD_NOTES.md section 23 -- this comment previously,
+// incorrectly, claimed the cost here is always small/bounded): that is
+// only true when every sibling action skipped along the way is itself
+// terminal (fold) or a plain betting node. Per the note on skip_subtree()
+// above, a sibling that CLOSES preflop betting (most commonly 'l' -- a
+// call/limp, which is almost always the first real action in each node's
+// action list per State.h's ordering) opens straight into the entire
+// nested postflop (flop/turn/river) subtree for that betting line, which
+// can be a large fraction of the ~16GB file. Reaching any action listed
+// AFTER 'l' therefore requires fully walking past that whole subtree's
+// node headers (still no large in-RAM allocation or bulk payload reads --
+// skip_subtree() seeks over regret/averegret arrays rather than reading
+// them -- but still one int32 read + one seek per node in that subtree).
+// Measured on a local SSD copy of the real blueprint file, this costs
+// roughly 6-10 seconds per such lookup; on the file's original location
+// (an external HDD/USB drive), the same lookup was easily 100x+ slower
+// due to per-seek latency, to the point of looking hung. See
+// BUILD_NOTES.md section 23 for the measurements and the fix (copy the
+// blueprint file to local fast storage; this header's logic did not
+// change, only where the file lives).
 inline LookupResult lookup_preflop_strategy(
 	const std::string& blueprint_path,
 	const std::vector<unsigned char>& action_path,

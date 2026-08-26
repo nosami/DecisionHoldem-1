@@ -2803,3 +2803,132 @@ resolver remain an approximation, not exact-equity play, same as
 documented in sections 15-17. The user should re-test live play across a
 range of flop spots (not just calls facing shoves) to build confidence
 that decision quality has meaningfully improved with this fix in place.
+
+## 23. Preflop server "hang" after the section 21 fix: not a bug, but the correctness fix's inherent cost on a slow external drive
+
+### The symptom
+
+After the section 21 fix (correcting `BlueprintReader::skip_subtree()` to
+correctly walk through sibling chance-node subtrees instead of throwing),
+the user reported that starting a hand appeared to hang: the server
+process printed `ai start load` / `load finish` as usual, then went quiet
+for a very long time on the very first preflop decision after a raise.
+
+### Investigation
+
+Sampling the stuck process (`sample <pid> 3`) showed it was **not**
+deadlocked or infinite-looping -- it was actively executing, deeply
+recursing through `BlueprintReader::skip_subtree()` -> `skip_subtree()`
+-> ... -> `fseeko()`, i.e. exactly the code path the section 21 fix
+introduced (walking through a sibling's nested postflop subtree instead
+of throwing immediately). The process state was `U` (uninterruptible
+sleep), consistent with blocking on disk I/O, not a CPU spin or a lock.
+
+The blueprint file (`PokerAI/cluster/blueprint_strategy.dat`, ~16.1GB) is
+a **symlink to the external Seagate USB/HDD drive**
+(`/Volumes/Seagate Desktop Drive/DecisionHoldem_cluster_data/blueprint_stgy.dat`).
+`skip_subtree()`'s correctness fix is architecturally sound (see section
+21) but is not free: reaching any preflop action that comes after a
+sibling that closes betting (in this tree's action ordering, `'l'`
+call/check is almost always listed first, so *every* subsequent sibling --
+raises, all-in -- requires walking past the ENTIRE nested postflop subtree
+hanging off that limp/check line first). That is a large number of small,
+essentially-random `fseeko()` + 4-byte-`read()` pairs scattered across a
+16GB file. On a spinning/USB external drive, each such seek pays real
+mechanical/USB-protocol latency, and thousands of them compound into what
+looks indistinguishable from a hang, even though the process is making
+forward progress the whole time.
+
+A direct timing harness (`BlueprintReader::lookup_preflop_strategy()`,
+called directly, no server involved) confirmed this:
+- root-only lookup (empty action_path): ~0.001s (matches the original,
+  still-accurate claim that a root read alone is cheap).
+- single-raise-action lookup (`path=[1]`, `[2]`, `[4]`): 6.4s-9.5s each,
+  on a **local SSD copy** of the same file.
+- two-action-deep lookup (matching a real "we raised, opponent
+  re-raised" preflop line): 7.3s-8.6s, again on local SSD.
+
+The original, external-drive location made the same lookups **100x+**
+slower (extrapolated from per-seek latency measurements and the fact
+that the earlier live-play attempt had not returned after several
+minutes) -- easily long enough to look hung, especially with no
+intermediate progress output.
+
+### The fix (data placement, not code)
+
+This is a hardware/data-locality problem, not a further logic bug in
+`skip_subtree()` -- the section 21 fix's *semantics* are correct and were
+independently re-validated (section 21's synthetic fixture test still
+passes; nothing in this section changed the recursion logic itself, only
+where the file physically lives). The fix applied:
+
+1. Copied `blueprint_stgy.dat` (16,123,074,125 bytes) from the external
+   drive to local SSD storage: `/Users/jason/dh_local_data/blueprint_stgy.dat`.
+2. Verified byte-for-byte integrity with `md5` on both copies before
+   trusting the local one (`37de30d8e2372a7bba84938dd0e645af`, identical
+   on both).
+3. Repointed `PokerAI/cluster/blueprint_stgy.dat` and
+   `PokerAI/cluster/blueprint_strategy.dat` (both consumed under
+   different names by different parts of the codebase) from symlinks
+   pointing at the external drive to symlinks pointing at the local SSD
+   copy. These symlinks are already gitignored (`PokerAI/cluster/*` in
+   `.gitignore`, with only `preflopallin1326.1225.bin` excepted), so this
+   is a **local machine configuration change only** -- nothing to commit,
+   and it does not affect any other clone/checkout of this repo.
+4. Updated the misleadingly-optimistic performance comment above
+   `lookup_preflop_strategy()` in `BlueprintReader.h` (it previously
+   claimed the cost was always "a few more KB" per lookup step -- true
+   only for a lookup path that never has to pass a betting-closing
+   sibling; now documents the real, measured worst case and points here).
+
+### Why the other four cluster files were not moved
+
+`sevencards_strength.bin`, `flop_hand_cluster.bin`, `turn_hand_cluster.bin`,
+and `river_hand_cluster.bin` are loaded ONCE, fully sequentially, at
+process startup (`Engine::load()`) -- not repeatedly re-seeked into during
+live play the way the blueprint file is. Sequential reads from the
+external drive measured ~36-38MB/s, which is slow (the ~3-4 minute
+non-river startup load time observed throughout this session is
+consistent with that), but it is a one-time, predictable, linearly-scaling
+cost paid once per server process start, not a per-decision cost that
+compounds during play. Moving those to local SSD would speed up server
+startup but was not needed to fix the reported "hang," and was left as an
+optional, not-yet-applied optimization (leaving them on the external
+drive also avoids consuming ~20GB more of the local disk's ~91GB free
+space than necessary). If startup time becomes a bottleneck, the exact
+same copy+verify+re-symlink procedure applies to those files too.
+
+### Validation
+
+- `sample <pid> 3` on the stuck process confirmed active, correct forward
+  progress (not a deadlock/infinite loop) through the exact code path
+  section 21's fix added.
+- Direct timing harness against `BlueprintReader::lookup_preflop_strategy()`
+  itself (not just the standalone recursion) confirmed root lookups stay
+  near-instant, and multi-action lookups complete in single-digit seconds
+  once the file is on local SSD -- down from apparently-unbounded (100x+)
+  on the external drive.
+- `md5` checksum match between the external-drive original and the local
+  SSD copy confirms no data corruption was introduced by the copy.
+- Rebuilt `dh_native_ai.dylib` after the (comment-only, non-functional)
+  `BlueprintReader.h` edit; all 4 ABI symbols still present via `nm -gU`.
+
+### What the user should do
+
+No code change is required on your end -- this was a data-placement fix
+plus a corrected code comment. Simply **restart the server** (the running
+process must be killed and restarted for it to pick up both this and the
+section 22 fix, since a live process keeps using whatever it already
+`dlopen`'d/mmap'd/symlink-resolved at its own startup time):
+
+```
+cd /Users/jason/src/copilot-worktrees/DecisionHoldem/nosami-fuzzy-guide/pypokergui/server
+source /tmp/dh_venv/bin/activate
+python3 ../__main__.py serve dummy --port 8000
+```
+
+Expect the initial `ai start load` step to still take a few minutes (it
+sequentially loads the four other multi-GB cluster files from the
+external drive, unchanged by this fix), but preflop decisions after a
+raise should now resolve in single-digit seconds rather than appearing to
+hang indefinitely.
