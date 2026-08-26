@@ -81,6 +81,33 @@ def main():
         print("  Anomalies (empty/not-found range, see raw lines): %d" % len(anomalies))
     print()
 
+    # IMPORTANT CAVEAT about the raw "% below uniform" number above: it is
+    # NOT the same as "% of the time narrowing was wrong". Any real
+    # narrowing that concentrates belief onto a handful of favored combos
+    # necessarily pushes the majority of the OTHER combos below the
+    # uniform/mean weight (probability mass is conserved) -- so a healthy,
+    # informative model can easily show most hands "below uniform" even
+    # when it is doing a good job on average, simply because the weight
+    # distribution itself is skewed (a few high, many low), not flat.
+    # A more meaningful, distribution-shape-independent signal is the
+    # actual hand's RANK PERCENTILE (rank / n): a model with literally NO
+    # predictive information would place the true hand at a uniformly
+    # random percentile, averaging to 50% over many hands. An average
+    # percentile well BELOW 50% means narrowing is, on average, correctly
+    # pulling the true hand toward the front of the pack (informative). An
+    # average at/above 50% means it is providing no benefit or is actively
+    # anti-informative (worse than a blind guess) -- a genuine red flag
+    # worth investigating, unlike the raw "below uniform" count above.
+    if rows:
+        percentiles = [100.0 * int(r["rank"]) / int(r["n"]) for r in rows]
+        avg_pct = sum(percentiles) / len(percentiles)
+        print("Average rank-percentile of the actual hand: %.1f%% "
+              "(50%% = no better than a blind guess; well below 50%% = "
+              "narrowing is informative on average; at/above 50%% = "
+              "narrowing is providing no benefit or is actively "
+              "counterproductive)" % avg_pct)
+        print()
+
     def fmt_row(r):
         return ("  %-4s  weight=%6s%%  rank=%5s/%-5s  uniform=%6s%%  top:%s" %
                 (r["hand"], r["weight"], r["rank"], r["n"], r["uniform"], r["top"]))
