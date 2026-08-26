@@ -818,6 +818,17 @@ python3 -c "import server.poker"   # (run with cwd=pypokergui, PYTHONPATH set)
   and `blueprint.so` are Linux x86_64 binaries with no included source; they
   need a Linux x86_64 runtime (e.g. Docker), which was unavailable in this
   sandbox (`docker` is not installed here).
+- **Disabling `river_hand_cluster.bin` does not unlock a working flop
+  decision (section 9), tested directly.** It safely frees ~16.86GB for the
+  isolated flop/turn hand-clustering functions (confirmed working, ~1.6GB
+  peak RSS), but this repository's only decision/evaluation code
+  (`getcfv_whole_holdem`) performs full backward induction to the river by
+  construction — it recurses into river-street nodes as an inherent part of
+  computing any flop-level value, so it crashes (null-pointer segfault,
+  reproduced) rather than stopping cleanly at the flop. A real flop-only
+  decision would require the depth-limited/subgame-resolving search this
+  repo's `Depth_limit_Search.h` was meant to provide but is missing from the
+  released source (see the Python reference implementation instead, section 7).
 - No placeholder/fabricated data files were created or committed anywhere in
   this repository.
 
@@ -939,7 +950,105 @@ processed in that run.
 **Answer: once per process/session, at engine startup — not once per hand
 and not once per decision.**
 
-## 9. Appendix: complete binary-file inventory
+## 9. Experiment: can disabling river_hand_cluster.bin loading enable a flop decision?
+
+Tested directly, empirically, and safely (without risking the shared host).
+**Short answer: no — not through this repository's only existing decision
+entrypoint, and not for an algorithmic reason, not just a RAM reason.**
+
+### What was tested
+
+`poker/Engine.h`'s `load()` now supports an opt-in build flag,
+`DH_SKIP_RIVER_CLUSTER` (default OFF — normal/Linux behavior is completely
+unchanged unless this macro is explicitly defined at compile time), which
+skips allocating and reading `river_hand_cluster.bin` (~16.86GB) entirely.
+See the `#ifndef DH_SKIP_RIVER_CLUSTER` / `#else` block in `Engine::load()`.
+
+A small standalone test, `PokerAI/tools/test_engine_no_river.cpp`, was built
+against this flag and run under live `ps`/`vm_stat`/disk monitoring:
+
+```
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o /tmp/test_engine_no_river tools/test_engine_no_river.cpp
+cd PokerAI && /tmp/test_engine_no_river
+```
+
+Result (measured, not estimated):
+
+```
+[DH_SKIP_RIVER_CLUSTER] river_hand_cluster.bin NOT loaded (experiment mode)
+Engine() construction completed. Peak RSS so far: 1.634 GB
+get_flop_cluster(hole={0,21}, flop={30,47,8}) = 1422  (flop cluster lookup OK, river not needed)
+get_turn_cluster(hole={0,21}, turn={30,47,8,12}) = 220  (turn cluster lookup OK, river not needed)
+Final peak RSS: 1.634 GB
+```
+
+So in isolation: **yes**, `Engine()` initializes safely under ~1.6GB (down
+from the ~20.86GB all-cluster-files total) and `get_flop_cluster()` /
+`get_turn_cluster()` both work correctly without river data — the disk/swap
+state didn't move at all during this test (no risk to the shared host).
+This confirms the river cluster table is genuinely independent, in isolation,
+of flop/turn hand-strength classification.
+
+A second, deliberately-crashed micro-test then confirmed what happens if
+`get_river_cluster()` is called with river data skipped: it dereferences a
+null pointer and segfaults immediately (`Segmentation fault: 11`, exit code
+139) — by design, since `river_cluster[i].keys/values` are simply never
+allocated in that mode.
+
+### Why this doesn't get you a working flop decision anyway
+
+The one and only decision/evaluation entrypoint that exists in this
+repository, `Main.cpp`'s `else` branch → `getcfv_whole_holdem()` →
+`getnode_cfv_holdem()` (`tree/Exploitability.h`), is **not** a "compute the
+flop decision, stop there" function. It computes best-response
+exploitability via full backward induction over the *entire* remaining game
+tree: at a preflop→flop chance node it deals a flop and immediately
+recurses into the flop-stage subtree (`betting_stage == 1` branch, line
+~578 of `Exploitability.h`); reaching flop→turn it deals a turn card and
+recurses further (`betting_stage == 2`, calls `get_turn_cluster` then
+recurses); reaching turn→river it deals a river card, calls
+`get_river_cluster`, and recurses into the terminal/river subtree
+(`betting_stage == 3`, line ~679) — and only once *that* recursion returns
+does it aggregate values back up to produce a flop-level (or preflop-level)
+number. This is standard CFR backward induction: a flop value literally
+*is* the range-weighted average of everything that can happen on turn and
+river beneath it.
+
+Consequently, disabling `river_hand_cluster.bin` doesn't let
+`getcfv_whole_holdem()` produce a flop decision and stop — it lets the
+recursion proceed exactly as far as the first river-street node it reaches,
+at which point `get_river_cluster()` dereferences a null pointer and the
+whole process crashes (as reproduced above). This is an **algorithmic**
+dependency baked into how this codebase computes decisions, not merely a
+"the array happens to be loaded but never read" situation like some of the
+other cluster files might have been if the tree structure were different.
+
+Separately, `Main.cpp`'s evaluate branch also unconditionally loads the full
+`blueprint_strategy.dat` tree (~16GB+, section 8.1) before it ever reaches
+this recursion at all — a cost entirely unaffected by the river-cluster
+toggle, and already independently confirmed (section 2) to make the full
+run infeasible on this 16GiB machine on its own.
+
+### Bottom line
+
+- Skipping river loading **is safe and does work** for the narrow, provably
+  isolated task of flop/turn hand-strength classification
+  (`get_flop_cluster`/`get_turn_cluster`), and frees ~16.86GB of RAM for that
+  narrow purpose — confirmed with a real, measured, low-risk run (peak RSS
+  1.634GB, no disk/swap impact).
+- It **cannot** be used to make this repository's actual `Main.cpp`
+  decision/evaluation code produce a flop-only answer: that code performs
+  full backward induction to the river by construction, and would need to be
+  substantially rewritten (a real depth-limited/subgame-resolving search,
+  as explored separately in the Python reference implementation,
+  `tools/depth_limited_search_demo.py`, and discussed in section 7) to avoid
+  needing river data for a flop decision. This is exactly the gap that
+  `Depth_limit_Search.h` was meant to fill in the original design but is
+  absent from the released source (section 2).
+- No production behavior changed: `DH_SKIP_RIVER_CLUSTER` is off by default,
+  so ordinary builds behave identically to before this experiment.
+
+## 10. Appendix: complete binary-file inventory
 
 A consolidated list of every binary (non-source-code) file relevant to this
 repository, its purpose, and its size, gathered by direct filesystem
