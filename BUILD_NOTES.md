@@ -1321,12 +1321,22 @@ says it extends). The four C-linkage entrypoints the Python GUI actually
 calls (`getdecision`, `restart_game`, `Next_stage`, `opp_take_action`) are a
 thin wrapper around all of this real machinery.
 
-Critically, the binary's embedded DWARF debug info lists compile-unit source
-paths including **`Depth_limit_Search.h`** itself (alongside `tree/Node.h`,
-`tree/Bulid_Tree.h`, `PlaySearch.h`, `Search.h`, `tree/Exploitability.h`,
-`BlueprintMCCFR.h`) — confirming this header genuinely existed and was
-compiled by the original authors; it just was never included in the public
-release (consistent with section 2.1 and the still-open upstream issue #10).
+Critically, the binary contains embedded source-path string literals —
+`Depth_limit_Search.h`, `tree/Node.h`, `tree/Bulid_Tree.h`, `PlaySearch.h`,
+`Search.h`, `tree/Exploitability.h`, `tree/Save_load.h`,
+`tree/Visualize_Tree.h`, `BlueprintMCCFR.h`, `tree/../poker/Engine.h`,
+`tree/../poker/State.h` — confirming these headers, including
+**`Depth_limit_Search.h`**, genuinely existed and were compiled by the
+original authors; they were just never included in the public release
+(consistent with section 2.1 and the still-open upstream issue #10).
+**Correction**: on closer inspection with `objdump -h`/`objdump -s`, the
+`.debug_info`/`.debug_line` DWARF sections are real but tiny (160/197 bytes)
+and cover only glibc's `crti.S`/`crtn.S` C-runtime startup stubs — not the
+application's own source. The header path strings above are *not* from
+structured DWARF; they are plain string-table literals, almost certainly
+`__FILE__` expansions baked in by `assert()` macros (this build was not
+compiled with `NDEBUG`). They confirm the header filenames but carry no
+line-table/type/algorithm information.
 
 ### Why it cannot run natively on macOS
 
@@ -1415,3 +1425,64 @@ asking first:
   sandbox to pursue this further, given the above; that remains an
   available next step only if explicitly requested, ideally on genuine
   Linux/x86_64 hardware rather than this host.
+
+## 13. Is there enough information in the `.so` to reconstruct a Mac-native binary?
+
+Asked directly: given how inspectable this unstripped binary is, could its
+contents be decompiled/reconstructed into new source and rebuilt for
+macOS/arm64? Investigated concretely rather than guessing, by measuring
+exactly what "unstripped" gives us here.
+
+**What's actually available, quantified:**
+- `.symtab` is present (not stripped): 4,682 symbols. But 3,988 of these are
+  weak (`W`) symbols — libstdc++/STL template instantiations pulled in by
+  the headers, not custom application logic. Only **107** symbols are real
+  defined functions (`T`/`t`) belonging to this program.
+- Because these are C++ mangled names, `c++filt` recovers full function
+  *signatures* for all 107 — e.g.
+  `search_mccfr(subgame_node**, Searchstate&, int, std::mersenne_twister_engine<...>&, double, int)`,
+  `build_subtree_flop(strategy_node*, subgame_node*, Searchstate&, int, bool, bool)`,
+  `update_substrategy(subgame_node*, Searchstate&, unsigned char*, int*, Players_range*, double*, double*, double, double, int, bool)`.
+  This is meaningfully more than a stripped binary gives (real function
+  names + parameter types + the custom class/struct names they operate on:
+  `Pokerstate`, `Searchstate`, `strategy_node`, `subgame_node`,
+  `Players_range`), but it is still only **signatures**, not bodies.
+- The DWARF `.debug_info`/`.debug_line` sections are present but trivial
+  (160/197 bytes, glibc C-runtime startup stubs only — see the correction in
+  section 12). There is **no** line-table, variable-name, or type-layout
+  debug information for the actual solver code. Struct field names/offsets,
+  local variable names, and control-flow structure are all absent.
+- `objdump -d` shows ~1,197 uses of `xmm` (SSE2 double-precision) registers
+  across the binary — a large volume of numerical code, consistent with the
+  described CFR regret/strategy math, that only exists as raw x86-64
+  machine instructions.
+
+**What reconstruction would actually require:** disassembling and manually
+decompiling the machine code of all 107 functions (which include recursive
+tree-building/traversal and regret-matching/CFR update routines — not
+simple leaf functions) into real, semantically equivalent, portable C++;
+inferring the layout of `strategy_node`/`subgame_node`/`Searchstate`/
+`Pokerstate`/`Players_range` purely from access-pattern analysis in the
+disassembly (no field names exist anywhere); reproducing exact floating-point
+operation order (CFR/regret-matching results are order-sensitive); and doing
+all of this without any ground-truth reference output to check correctness
+against, since this project's own pretrained `blueprint_strategy.dat` isn't
+legitimately available either (sections 3/7). Tools like Ghidra/IDA/Hex-Rays
+can generate approximate pseudo-C for each function, but that output still
+requires substantial expert manual correction before it is real, compilable,
+behaviorally-faithful source — this is a multi-week-to-months reverse
+engineering effort for a single expert, not something with any realistic
+chance of a correct result from automated/quick effort, and a wrong
+reconstruction (subtly incorrect regret math, wrong struct layout, off-by-one
+in tree indexing) could silently produce plausible-looking but wrong poker
+decisions with no way to detect that without a trusted reference to compare
+against.
+
+**Answer: no** — not in any practical or reliable sense. The unstripped
+symbol table gives real signatures and confirms the withheld header names,
+which is valuable forensic context, but it is not remotely equivalent to
+having source, and attempting a full decompilation-based reconstruction was
+judged not to be a legitimate, achievable path here — consistent with this
+project's stated goal of not fabricating success. No decompilation was
+attempted; this section only reports what information is present and why
+it falls short.
