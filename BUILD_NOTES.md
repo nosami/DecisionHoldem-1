@@ -3254,11 +3254,11 @@ no measurable performance benefit from being on faster local storage.
 - `river_hand_cluster.bin` (16,856,854,560 bytes, ~15.7GB) — unused at
   runtime due to `DH_SKIP_RIVER_CLUSTER`; kept external since local SSD
   speed provides no benefit for a file that's never read into RAM.
-- `blueprint_stgy.dat` (16,123,074,125 bytes, ~15.0GB) — a redundant
-  duplicate of the SSD copy already at `/Users/jason/dh_local_data/blueprint_stgy.dat`
-  (the live copy actually used at runtime). Left untouched per section 25's
-  decision (treated as a backup; not deleted without explicit user
-  confirmation).
+**UPDATE (same session, minutes later)**: the user asked to delete the
+`blueprint_stgy.dat` duplicate as well, since it exists on the SSD. Verified
+byte-identical first (`shasum -a 256` on both copies:
+`0e3ed201f1f21c5b713c87aba10fe7bf3f49721b47b6b8be8e2dff9ef544ee12` on both),
+then deleted the Seagate copy. Seagate now holds only `river_hand_cluster.bin`.
 
 **Current `PokerAI/cluster/` symlink targets after this change**:
 ```
