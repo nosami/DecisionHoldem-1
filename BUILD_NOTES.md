@@ -4254,3 +4254,405 @@ especially after an all-in) still holds; only the exact figures shifted.
 Rebuilt `dh_native_ai.dylib` clean; confirmed all 4 required ABI symbols
 (`restart_game`, `Next_stage`, `opp_take_action`, `getdecision`) still
 exported via `nm -gU`.
+
+## 34. Speeding up TURN-mode decisions with a RiverClusterLeafModel built on the per-hole-hand split river files (real, measured 6-15x speedup)
+
+### The problem (already identified in section 29, previously blocked)
+
+Section 29 identified why TURN mode is much slower than FLOP mode per CFR
+iteration: FLOP mode has a cheap leaf shortcut (`TurnClusterLeafModel`) that
+estimates a flop decision's value by comparing precomputed turn-cluster ids,
+never actually dealing a card. TURN mode has no such shortcut: every single
+CFR iteration, once turn betting closes, `LiveResolver` deals a REAL river
+card via a genuine ~44-48-branch chance node (see `RealtimeSearch.h`'s
+`chance_value()`) and, for every branch, computes an EXACT showdown
+(`Engine::compute_winner()`, a real hand-strength lookup against
+`sevencards_strength.bin`) for every hero-hand x villain-hand pair. This is
+the real, measured cost driver behind TURN's much higher iteration cost
+(section 28's exploitability-based convergence measurements) and its
+narrower 12s wall-clock safety cap (`convergence_config_for_mode()`).
+
+Section 29 proposed the obvious fix -- a `RiverClusterLeafModel` mirroring
+`TurnClusterLeafModel`, using `Engine::get_river_cluster()` -- but this
+requires the ENTIRE `river_hand_cluster.bin` (~16.86GB) resident in RAM,
+which does not fit this host's 16GB, so it was shelved as "future work,
+currently impossible."
+
+### What unblocked it: the per-hole-hand split files (section 31) + a validated O(1) direct-seek lookup (this section)
+
+Section 31 already split the monolithic 16.86GB `river_hand_cluster.bin`
+into 1326 per-hole-hand files (`<handid>.bin`, one per possible hole hand,
+~12.7MB each, still resident on local SSD at
+`/Users/jason/dh_local_data/river_cluster_split/`, validated byte-exact
+against the original monolith). This reopens the possibility IF a specific
+5-card board's row within one hand's file can be found directly, without
+loading the whole 2,118,760-row array into RAM just to binary-search it.
+
+**The key mathematical fact, derived and empirically validated before
+writing any production code** (`tools/test_river_rank_seek.cpp`,
+300/300 real trials passed): `Engine.h`'s river key formula is a base-52
+positional encoding of the 5-card board sorted ascending by raw 0-51 card
+index (`key = comm[0]*52^4 + comm[1]*52^3 + comm[2]*52^2 + comm[3]*52 +
+comm[4]`). Because each digit position is bounded by the same base-52
+regardless of which 2 raw card values are excluded (the hand's own hole
+cards), sorting all C(50,5) possible boards by this key is IDENTICAL to
+standard lexicographic order of the 5-tuple over the 50-card universe that
+remains after removing the hand's 2 hole cards. This means the row (rank)
+of any specific board within a hand's sorted `keys[]` array is computable
+via a closed-form "lex-rank of a k-combination" formula -- no full-file
+load, no binary search, no scan: a single `pread()` of 2 bytes at a
+directly-computed byte offset.
+
+This was validated three ways before being used in production code: (1) a
+hand-derived n=4,k=2 example confirming the formula's enumeration order
+matches the intended convention (and specifically does NOT match the more
+commonly-documented colex/combinatorial-number-system formula, which gives
+a different, wrong order for this file's key convention); (2) 300 random
+real (hole-hand, board) trials against the REAL split files, comparing the
+direct-seek row/key/value against an INDEPENDENT full-array binary search
+mirroring `Engine.h::find_river()`'s own algorithm -- 300/300 passed, exact
+match every time; (3) confirming (by reading the ORIGINAL, unmodified
+`tree/Exploitability.h::getnode_cfv_river()`) that river-cluster values use
+the SAME "lower cluster id = stronger hand" polarity convention already
+established (and fixed, after a real bug, in section 22) for turn clusters.
+
+### `RiverClusterLeafModel` (`RealtimeSearch.h`)
+
+Mirrors `TurnClusterLeafModel`'s API and structure exactly, but for the
+TURN street instead of the FLOP street, and sourced from the per-hole-hand
+split files via sparse direct-seek reads instead of
+`Engine::get_river_cluster()`'s RAM-resident arrays:
+
+- Constructor: `(split_dir, board[4], Players_range&)`. Probes
+  availability first (attempts to open one plausible hand file) --
+  if the directory/files can't be read, the whole model marks itself
+  `available()==false` and does no further I/O, rather than throwing or
+  silently fabricating data.
+- `precompute()`: for each hand in `range.hero`/`range.villain`, opens that
+  hand's split file ONCE, does one sparse `pread()` (2 bytes, the value
+  only -- the key itself doesn't need re-reading in production since the
+  formula was already validated) per non-colliding candidate river card
+  (computing that candidate's row via the lex-rank formula), then closes
+  the file. No full-file load, ever.
+- `expected_showdown_sign(hi, vi)`: identical in form to
+  `TurnClusterLeafModel`'s -- averages the polarity-corrected sign over all
+  valid candidate river cards, using the same "lower cluster id = stronger
+  hand" convention.
+
+### Wiring into `LiveResolver`
+
+- Added an optional `river_leaf` constructor parameter (default `nullptr`,
+  fully backward compatible -- every pre-existing call site is unaffected
+  unless it explicitly opts in).
+- `cfr()` and `best_response()` (the two functions that must stay in exact
+  lockstep, since `best_response()` is used for exploitability measurement
+  against the SAME game tree `cfr()` solves) each gained one new dispatch
+  line, checked BEFORE `expand()` (i.e. before a chance node would be
+  created): `if (mode_==Mode::TURN && river_leaf_ && river_leaf_->available()
+  && s.betting_stage>=3) return terminal_river_leaf(...)`. This fires at
+  exactly the moment TURN betting closes (`betting_stage` advances from 2
+  to 3, or jumps to 4 on an all-in fast-forward -- both cases are caught by
+  `>=3`), before the river card would otherwise be dealt.
+- `terminal_river_leaf()`: a new function, structurally identical to the
+  existing `terminal_leaf()` but using `river_leaf_->expected_showdown_sign()`
+  instead of `leaf_->expected_showdown_sign()`.
+- When `river_leaf` is null (the default) or unavailable, TURN mode's
+  dispatch simply never takes the new branch -- behavior is IDENTICAL to
+  before this change (real chance node + exact showdown). This is purely
+  additive/opt-in, never a behavior change unless explicitly enabled.
+
+### Wiring into `dh_native_ai.cpp`
+
+Both TURN-mode call sites (`resolve_decision()` for hero's own decisions,
+`narrow_villain_range_postflop()` for opponent-range narrowing) now
+construct a `RiverClusterLeafModel` and pass it to their `LiveResolver`,
+but ONLY if the new `DH_RIVER_SPLIT_DIR` environment variable is set (read
+fresh via `getenv()` on every call, not cached) -- if unset, `river_leaf`
+stays a null `unique_ptr` and `river_leaf.get()` passes `nullptr`,
+reproducing the exact original behavior. This makes the whole feature
+strictly opt-in: a host without the (large, non-repo, locally-generated)
+split files present still runs identically to before, just without the
+speedup.
+
+### Real, measured results (`tools/test_turn_leaf_speedup.cpp`, new)
+
+A new validation tool drives the SAME real scenario (via actual ABI calls
+`restart_game`/`opp_take_action`/`Next_stage`/`getdecision` -- not a
+reimplementation) twice in one process: once with `DH_RIVER_SPLIT_DIR`
+unset (original behavior) and once with it set to the real split directory
+(new leaf-model behavior). Real measured wall-clock, this host:
+
+| Operation | Without leaf model | With leaf model | Speedup |
+|---|---|---|---|
+| Hero's own TURN decision (`getdecision()`) | 12651.0 ms | 1977.4 ms | **6.4x** |
+| Villain TURN raise narrowing (`opp_take_action("raise 1800")`, extended 4-action resolver) | 13354.8 ms | 870.5 ms | **15.3x** |
+
+Both runs returned plausible, valid decision strings (`"allin"` in this
+particular scenario for both -- consistent, not a coincidence of one path
+crashing/defaulting). A separate sanity check (ad hoc, not committed)
+confirmed the leaf-model path is not degenerate: on the identical TURN
+board, a strong hero hand (two high cards) got `"call"` while a weak hero
+hand (two low, unconnected cards) got `"fold"` -- a sane, non-uniform
+differentiation, consistent with how `TurnClusterLeafModel`'s original
+validation was judged for FLOP mode.
+
+Re-running the EXISTING, unmodified regression tests with
+`DH_RIVER_SPLIT_DIR` left unset confirms zero behavior change to the
+default path: `test_bet_size_narrowing.cpp` reproduces its exact prior
+TURN narrowing timing (13354.5ms, matching the "without leaf model" figure
+above almost exactly) and FLOP weight-change value (0.0157) unchanged.
+`test_run_until_converged.cpp` (which builds its own `LiveResolver`
+directly, never passing a `river_leaf`, so it is unaffected regardless of
+the environment variable) reproduces its exact prior baseline (TURN:
+900 iters / 13213.5ms / 2.406% exploitability, matching section 33's
+figures almost exactly).
+
+### Honest scope / remaining limitations
+
+- This is an estimate, not an exact computation -- exactly like FLOP's
+  existing `TurnClusterLeafModel`: it assumes the river gets checked down
+  (no river-betting subtree modeled) and estimates showdown equity via
+  ordinal cluster-id comparison rather than dealing every possible river
+  card and computing an exact seven-card hand-strength comparison. This
+  approximation already existed for TURN mode in a cruder form (a real
+  chance node + exact showdown, but with the SAME "river gets checked
+  down" assumption already documented in `dh_native_ai.cpp`'s header
+  comment) -- this change does not introduce a new approximation, it
+  replaces an expensive exact computation with a cheap approximate one
+  for a quantity that was already going to be treated identically
+  (checked down) either way.
+- Requires the per-hole-hand split files to exist on local disk (~16GiB,
+  not part of the repo, not committed -- generated once per section 31's
+  documented process) and the `DH_RIVER_SPLIT_DIR` environment variable to
+  be set. Without both, TURN mode is completely unaffected (falls back to
+  the original, slower, exact behavior) -- never silently wrong or
+  degraded, just not accelerated.
+- Per-decision cost is dominated by file opens (up to ~1035 distinct
+  villain hands + hero's own hand, one open/close each) plus a couple
+  dozen tiny `pread()`s per hand -- this was measured to already be fast
+  enough (under 2 seconds for a full villain-range TURN decision) that no
+  further optimization (e.g. caching open file descriptors across repeated
+  decisions within the same hand, or switching to `mmap()`) was pursued,
+  but is a natural next step if an even larger villain range or a slower
+  disk ever makes this a bottleneck again.
+
+### Files touched
+
+- `PokerAI/tree/RealtimeSearch.h`: added the `RiverClusterLeafModel` class
+  (with its own binomial-coefficient table, lex-rank formula, and
+  compact-index helper, adapted from the validated
+  `test_river_rank_seek.cpp` logic); added `LiveResolver`'s optional
+  `river_leaf` constructor parameter/member; added `terminal_river_leaf()`;
+  updated `cfr()`'s and `best_response()`'s TURN-mode dispatch to use it
+  when available. Added `<string>`, `<cstdint>`, `<cstdio>`, `<algorithm>`,
+  `<fcntl.h>`, `<unistd.h>` includes needed for the new class's file I/O.
+- `PokerAI/tools/dh_native_ai.cpp`: added `river_split_dir()` (reads
+  `DH_RIVER_SPLIT_DIR`); both TURN-mode `LiveResolver` construction sites
+  (`resolve_decision()`, `narrow_villain_range_postflop()`) now build and
+  pass a `RiverClusterLeafModel` when the environment variable is set;
+  updated the header's SCOPE/HONEST LIMITATIONS comment to describe the
+  new opt-in behavior.
+- `PokerAI/tools/test_river_rank_seek.cpp` (new): the direct-seek
+  correctness validation tool described above (300/300 real trials
+  passed). Kept as a permanent reference/regression test for the lex-rank
+  formula against real data.
+- `PokerAI/tools/test_turn_leaf_speedup.cpp` (new): the real, end-to-end
+  before/after timing validation tool described above. Kept as a permanent
+  regression/benchmark test.
+- `.gitignore`: added both new test binaries.
+
+Rebuilt `dh_native_ai.dylib` clean; confirmed all 4 required ABI symbols
+(`restart_game`, `Next_stage`, `opp_take_action`, `getdecision`) still
+exported via `nm -gU`.
+
+### How to enable this in a real run
+
+```
+export DH_RIVER_SPLIT_DIR=/path/to/river_cluster_split   # from section 31
+```
+
+before starting the GUI/server process that loads `dh_native_ai.dylib`.
+Unset (the default), TURN mode behaves exactly as it did before this
+section.
+
+## 35. Answering "how long does TURN now take to converge?" — it now genuinely converges (it didn't before); the old 2000-iteration safety cap became the binding constraint and was raised
+
+### The question
+
+Section 34 measured per-decision wall-clock speedup (6.4x/15.3x) but not
+what actually matters for quality: does TURN's adaptive CFR loop
+(`run_until_converged()`, section 28) now reach its 1%-of-pot exploitability
+target, or does it still hit a safety cap first — and if so, which one?
+
+Neither existing tool answered this directly: `test_turn_leaf_speedup.cpp`
+(section 34) only times `getdecision()`/`opp_take_action()`, not
+iterations/exploitability; `test_run_until_converged.cpp` (section 28)
+reports exactly those numbers but built its own `LiveResolver` WITHOUT a
+`river_leaf`, so it never exercised the new leaf model at all (confirmed:
+identical numbers with `DH_RIVER_SPLIT_DIR` set or unset).
+
+### Measurement
+
+Extended `test_run_until_converged.cpp`'s `run_mode()` with an optional
+`use_river_leaf` flag that constructs a real `RiverClusterLeafModel` from
+`DH_RIVER_SPLIT_DIR` (same env var, same on-disk split files `dh_native_ai.cpp`
+uses) and passes it into `LiveResolver`'s new `river_leaf` constructor
+argument — i.e. this exercises the exact same code path production uses, not
+a reimplementation. Also corrected this test file's local
+`convergence_config_for_mode()` TURN `batch_size` from a stale `100` to `50`,
+matching the real one in `dh_native_ai.cpp` (updated in section 33) — this
+tool is meant to mirror production's config for a meaningful comparison.
+
+Real measured result, same scenario as section 28/34 (1035-combo villain
+range, non-degenerate 4-card board):
+
+| Run | iters | final exploit | wall-clock | outcome |
+|---|---|---|---|---|
+| TURN, no leaf (old path) | 850 | 3.377% | 12,558ms | hit safety cap (never converges) |
+| TURN, with leaf, old 2000-iter cap | 2000 | 3.418% | 348ms | hit *iteration* cap, not wall-clock (still un-converged) |
+| TURN, with leaf, cap raised to 20000 | 4150 | **0.927%** | **738ms** | **converged under 1% target** |
+
+The middle row is the key finding: once the leaf model made iterations ~20x
+cheaper, the old `max_iterations = 2000` safety cap (chosen back when 2000
+iterations was already a lot of wall-clock time) became the binding
+constraint LONG before the 12-second wall-clock budget was used — TURN was
+stopping itself after 348ms even though it had 11.6 more seconds available,
+and it still hadn't reached the accuracy target. This is a materially
+different (better) outcome than before: previously TURN did not converge at
+all within its budget (section 28); now it does, and quickly.
+
+### Fix: raised TURN's `max_iterations` cap from 2000 to 20000
+
+Changed `convergence_config_for_mode(LiveResolver::Mode::TURN)` in
+`PokerAI/tools/dh_native_ai.cpp` (and mirrored the same value in
+`test_run_until_converged.cpp` for consistency) from `{ 50, 2000, 12000.0 }`
+to `{ 50, 20000, 12000.0 }` — batch size and wall-clock cap unchanged, only
+the iteration ceiling raised (matching RIVER's existing 20000 cap).
+
+**Verified this is safe / a no-op for the default (leaf model disabled)
+path**: re-ran the same scenario with `DH_RIVER_SPLIT_DIR` unset at the new
+20000 cap and got IDENTICAL numbers to the old 2000 cap (850 iters, 12558ms,
+3.377%) — the 12-second wall-clock cap still binds first at the same point,
+because without the leaf model each iteration still costs ~14ms and the
+wall-clock check happens every 50-iteration batch regardless of how high
+`max_iterations` is set. Raising the ceiling only matters (helps) when the
+leaf model is active and iterations are cheap enough to actually reach it.
+
+### Honest caveats
+
+- This is one scenario (one board, one range, one hero hand), not an
+  exhaustive sweep — other TURN boards/ranges could converge faster or
+  slower. The qualitative conclusion (leaf model unblocks real convergence
+  within the existing wall-clock budget; the iteration cap, not wall-clock,
+  was the newly-binding constraint) is solid, but exact iteration counts
+  will vary hand-to-hand, consistent with CFR's usual behavior.
+- 20000 was chosen to match RIVER's existing cap and because the measured
+  scenario needed only ~4150 — it is a generous ceiling with headroom, not a
+  tightly tuned number. If a future measurement shows some TURN scenario
+  needing more than 20000 iterations before the 12s wall-clock cap would
+  otherwise bind, the cap can be raised further; it does not change non-leaf
+  behavior either way (that path is still bounded first by the 12s wall
+  clock, as re-verified above).
+- This does not change what TURN converges TO (the same 1%-of-pot target and
+  the same tree/approximations as section 34) — only that it can actually
+  reach that target within its existing time budget now that the leaf model
+  makes iterations cheap enough to run enough of them.
+
+### Files changed
+
+- `PokerAI/tools/dh_native_ai.cpp`: raised TURN's `max_iterations` from 2000
+  to 20000 in `convergence_config_for_mode()`, with a comment explaining why.
+- `PokerAI/tools/test_run_until_converged.cpp`: added an optional
+  `use_river_leaf` parameter to `run_mode()` that constructs a real
+  `RiverClusterLeafModel` from `DH_RIVER_SPLIT_DIR` and passes it through to
+  `LiveResolver`; added a `"TURN(leaf)"` comparison run to `main()`;
+  corrected the local TURN `batch_size` from a stale `100` to `50` to match
+  production (section 33); raised the local TURN `max_iterations` to 20000
+  to match the production fix above.
+
+Rebuilt `dh_native_ai.dylib` clean (same command as section 34); confirmed
+all 4 ABI symbols still exported via `nm -gU`. Re-ran
+`test_bet_size_narrowing` (PASS, unchanged) and `test_river_rank_seek`
+(300/300, unchanged) — no regressions.
+
+## 36. Investigating a live-play surprise: TURN recommended "allin" holding Q7o (air) on a checked-through, paired 6-6-4-2 board
+
+### The report
+
+While running a live Slumbot hand via `pypokergui/play_with_slumbot.py`, after
+`b200c/kk/k` (both players put in 200 preflop, checked the flop, villain
+checked the turn), hero held Qc7h on board 6s-6d-4s-2c and `getdecision()`
+returned `"allin"` — a massive overbet-shove with a hand that has no pair, no
+flush (only two board spades), and only a weak backdoor draw. Given TURN mode
+was just heavily modified (sections 33-35: leaf model, cap raise, narrowing
+fix), this needed to be checked for a regression rather than assumed benign.
+
+### Investigation
+
+`getdecision()`/`resolve_decision()` samples an action from hero's own
+AVERAGE strategy at the root (`resolve_decision()`, `dh_native_ai.cpp`) — it
+does not always take the argmax — so a single logged `"allin"` alone doesn't
+reveal whether this was a rare sampled bluff or the dominant strategy. Built
+a throwaway diagnostic (`tools/_diag_turn_allin.cpp`, deleted after use — see
+below for exact repro) reproducing this board/pot/stack state via
+`LiveResolver` directly (same reduced fold/check/allin-only action set
+`resolve_decision()` always uses) against a full un-narrowed continuing
+range, and printed the actual average-strategy probabilities instead of one
+sample, for four hero hands on the identical board:
+
+| Hero hand | fold | check/call | allin |
+|---|---|---|---|
+| Qc7h (air) | 0.04% | 0.06-0.15% | **99.8-99.9%** |
+| As9d (ace-high air) | ~0.01% | ~0.01% | **99.97%** |
+| QdQh (overpair) | 0.2% | 4-12% | 88-95% |
+| 6c6h (quads, the nuts) | 0.5-1.1% | **98.9-99.4%** | 0.01-0.02% |
+
+Ran each hand both with and without the section-34/35 `RiverClusterLeafModel`
+active: the numbers are nearly identical either way (e.g. Qc7h: 99.81%
+allin without the leaf model vs. 99.90% with it) — **this behavior predates
+and is unrelated to this session's TURN changes**; it is not a leaf-model or
+cap-raise regression.
+
+### What this actually is
+
+The strategy is NOT degenerate or hand-blind — it's clearly polarized by
+hand strength: the true nuts (quads) slowplay by checking/calling to trap,
+medium value (an overpair) mostly shoves for value, and total air also
+shoves at a similarly extreme frequency. This is a real (if extreme)
+consequence of a limitation already called out in `dh_native_ai.cpp`'s own
+header comment: hero's own live decisions use a **reduced action set with
+only fold / check-call / all-in — no intermediate bet sizes**. With no way
+to bet a medium/value-sized amount or check back a bluff-catcher for pot
+control, CFR's equilibrium in this narrowed abstraction collapses toward
+"trap with the very best hands, shove (for value or as a bluff) with nearly
+everything else" — a far more binary, overbet-heavy style than a solver with
+a real bet-sizing ladder would produce, and likely more exploitable in
+practice (an observant opponent could infer hero's turn-shove range is
+strongly polarized and adjust calling ranges accordingly).
+
+### Conclusion / not a bug, but a known, real limitation
+
+No fix applied here — this is a pre-existing, already-documented structural
+limitation of the reduced action abstraction, not a defect introduced by
+sections 33-35. Flagging one legitimate follow-up idea for a future session:
+`narrow_villain_range_postflop()` already resolves an extra canonical 1x-pot
+raise branch beyond fold/call/allin (section 33); since TURN iterations are
+now ~20x cheaper (section 34-35), giving hero's own `resolve_decision()`
+resolver that same extra branch (previously not attempted for hero's own
+decisions, only for narrowing) may now be computationally tractable and
+would let hero mix in a real medium-sized value bet instead of only
+check/shove — this was not attempted in this session; it is a nontrivial
+design change (touches `resolve_decision()`'s action set, node fan-out, and
+needs its own regression validation) and is left as documented future work.
+
+### Repro (diagnostic file deleted after use, not part of the deliverable)
+
+Cards per `pypokergui/play_with_slumbot.py`'s `cards_dic` (rank-major, suit
+blocks of 13): hero Qc=23,7h=44; board 6s=4,6d=30,4s=2,2c=13. `Searchstate`:
+`betting_stage=2` (TURN), `total_pot=400`, both stacks `19800`,
+`last_bigbet=0` (facing a check). Built a full un-blocked continuing range
+(1035 combos) as villain's range (not the live bot's actual narrowed belief,
+which isn't recoverable after the fact from a single log line) and ran
+`LiveResolver` to the same 1%-exploitability target as `run_until_converged()`,
+then printed `LiveResolver::average_strategy(resolver.root.get(), 0, avg)`
+instead of sampling one action from it.

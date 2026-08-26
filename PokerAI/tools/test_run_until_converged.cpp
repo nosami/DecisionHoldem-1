@@ -16,6 +16,7 @@
 //###############################################################################
 #include "../tree/RealtimeSearch.h"
 #include <cstdio>
+#include <cstdlib>
 #include <chrono>
 #include <vector>
 #include <array>
@@ -31,7 +32,7 @@ struct ConvergenceConfig {
 
 static ConvergenceConfig convergence_config_for_mode(LiveResolver::Mode mode) {
 	if (mode == LiveResolver::Mode::FLOP)  return { 200, 10000, 3000.0 };
-	if (mode == LiveResolver::Mode::TURN)  return { 100, 2000, 12000.0 };
+	if (mode == LiveResolver::Mode::TURN)  return { 50, 20000, 12000.0 }; // batch halved, see BUILD_NOTES section 33
 	return { 500, 20000, 6000.0 }; // RIVER
 }
 
@@ -76,7 +77,7 @@ static void build_range(int count, unsigned char exclude1, unsigned char exclude
 	}
 }
 
-static void run_mode(const char* label, LiveResolver::Mode mode) {
+static void run_mode(const char* label, LiveResolver::Mode mode, bool use_river_leaf = false) {
 	unsigned char hero_c1 = 51, hero_c2 = 47;
 	std::vector<std::array<unsigned char, 2>> villain_range;
 	build_range(1225, hero_c1, hero_c2, villain_range);
@@ -100,6 +101,26 @@ static void run_mode(const char* label, LiveResolver::Mode mode) {
 		leaf.reset(new TurnClusterLeafModel(engine, flop_board, range));
 	}
 
+	// Optional RiverClusterLeafModel (BUILD_NOTES.md section 34): only
+	// constructed for the "TURN (leaf model)" comparison run below, reading
+	// the same DH_RIVER_SPLIT_DIR environment variable dh_native_ai.cpp
+	// uses, so this measurement reflects the exact same real, on-disk split
+	// files the production wiring reads from -- not a synthetic stand-in.
+	std::unique_ptr<RiverClusterLeafModel> river_leaf;
+	if (use_river_leaf && mode == LiveResolver::Mode::TURN) {
+		const char* dir = std::getenv("DH_RIVER_SPLIT_DIR");
+		if (dir && *dir) {
+			unsigned char turn_board[4] = { board5[0], board5[1], board5[2], board5[3] };
+			river_leaf.reset(new RiverClusterLeafModel(dir, turn_board, range));
+			if (!river_leaf->available()) {
+				std::fprintf(stderr, "%s: RiverClusterLeafModel unavailable (bad DH_RIVER_SPLIT_DIR?)\n", label);
+			}
+		} else {
+			std::fprintf(stderr, "%s: DH_RIVER_SPLIT_DIR not set -- skipping leaf-model run\n", label);
+			return;
+		}
+	}
+
 	Searchstate s;
 	s.small_blind = 50; s.big_blind = 100;
 	s.betting_stage = (mode == LiveResolver::Mode::FLOP) ? 1 : (mode == LiveResolver::Mode::TURN) ? 2 : 3;
@@ -115,7 +136,7 @@ static void run_mode(const char* label, LiveResolver::Mode mode) {
 	s.cur_round_action_num = 0;
 	s.last_raise = 0;
 
-	LiveResolver resolver(range, engine, leaf.get(), mode);
+	LiveResolver resolver(range, engine, leaf.get(), mode, /*extended_actions=*/false, river_leaf.get());
 	resolver.init_root(s, std::vector<unsigned char>(board5, board5 + n_board));
 
 	auto [iters, expl_pct, ms, run_ms, expl_ms] = run_until_converged(resolver, mode);
@@ -128,5 +149,6 @@ int main() {
 	run_mode("FLOP", LiveResolver::Mode::FLOP);
 	run_mode("RIVER", LiveResolver::Mode::RIVER);
 	run_mode("TURN", LiveResolver::Mode::TURN);
+	run_mode("TURN(leaf)", LiveResolver::Mode::TURN, /*use_river_leaf=*/true);
 	return 0;
 }

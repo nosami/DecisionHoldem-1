@@ -83,6 +83,12 @@
 #include <cmath>
 #include <memory>
 #include <iostream>
+#include <string>
+#include <cstdint>
+#include <cstdio>
+#include <algorithm>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace RealtimeSearch {
 
@@ -238,6 +244,208 @@ private:
 	std::vector<std::vector<int>> hero_clusters;    // [hand_idx][candidate_idx] -> turn cluster id, or -1
 	std::vector<std::vector<int>> villain_clusters;
 };
+
+// ---------------------------------------------------------------------------
+// RiverClusterLeafModel -- the TURN-mode analogue of TurnClusterLeafModel
+// above, giving LiveResolver's TURN mode the same kind of cheap terminal
+// shortcut FLOP mode already has, instead of dealing a real river chance
+// node (~48 branches) and resolving an exact showdown for every one every
+// single CFR iteration (see BUILD_NOTES.md section 29 for why that was the
+// measured cost driver behind TURN mode being much slower than FLOP mode).
+//
+// The blocker documented in section 29 was RAM: Engine::get_river_cluster()
+// requires the entire 16.86GB river_hand_cluster.bin resident in memory,
+// which does not fit this host's 16GB. This class does NOT use
+// Engine::get_river_cluster() or the monolithic file at all. Instead it
+// reads directly from the PER-HOLE-HAND SPLIT files built in section 31
+// (one ~12.7MB file per of the 1326 possible hole hands, `<handid>.bin` =
+// `[keys: 2,118,760 x 4-byte unsigned, ascending]` followed by
+// `[values: 2,118,760 x 2-byte unsigned short]`, index-aligned with keys --
+// exactly Engine.h's own in-RAM layout, just one hand's slice of it, on
+// disk instead of in RAM).
+//
+// The key enabling result (section 34, validated 300/300 against real
+// split files in tools/test_river_rank_seek.cpp before this class was
+// written): because Engine.h's river key is a base-52 positional encoding
+// of the 5-card board sorted ascending by raw card index, and the encoding
+// is unaffected in RELATIVE order by which 2 raw values are excluded (the
+// hand's own hole cards), sorting all C(50,5) possible boards by key is
+// IDENTICAL to standard lexicographic order of the 5-tuple over the
+// 50-card universe that remains after removing the hand's 2 hole cards.
+// This means the row (rank) of any specific board within a hand's sorted
+// keys[] array is computable via a closed-form combinatorial formula --
+// no full-file load, no binary search, no scan: one `pread()` of 2 bytes
+// per candidate river card, at a directly-computed byte offset.
+// ---------------------------------------------------------------------------
+class RiverClusterLeafModel {
+public:
+	static const long RIVER_COMMUNITY_TOTAL = 2118760;
+	static const long VALUES_OFFSET = RIVER_COMMUNITY_TOTAL * 4;
+
+	// `split_dir`: path to the directory of per-hole-hand split files
+	// (`<h1*52+h2>.bin`, h1<h2). If this directory/files can't be opened,
+	// the model marks itself unavailable (available()==false) rather than
+	// throwing or fabricating data -- callers must check available() and
+	// fall back to the existing exact chance-node+showdown resolve when
+	// false (see LiveResolver::cfr()/best_response(), which do exactly
+	// this).
+	RiverClusterLeafModel(const std::string& split_dir, const unsigned char board[4], const Players_range& range)
+		: range_(range), split_dir_(split_dir) {
+		board_[0] = board[0]; board_[1] = board[1]; board_[2] = board[2]; board_[3] = board[3];
+		build_binomial_table();
+		for (int c = 0; c < 52; c++) {
+			if (c == board_[0] || c == board_[1] || c == board_[2] || c == board_[3]) continue;
+			candidates.push_back((unsigned char)c);
+		}
+		// Probe availability with the first hand we can find on either
+		// side before committing to a full precompute pass -- avoids
+		// silently doing nothing useful (every lookup falling through to
+		// -1) when the split directory simply isn't present on this host.
+		available_ = probe_available();
+		if (!available_) {
+			std::fprintf(stderr,
+				"[RiverClusterLeafModel] split directory '%s' unavailable/unreadable -- "
+				"TURN-mode leaf shortcut disabled for this decision, falling back to exact "
+				"chance-node resolve\n", split_dir_.c_str());
+			return;
+		}
+		precompute(range_.hero, hero_clusters);
+		precompute(range_.villain, villain_clusters);
+	}
+
+	bool available() const { return available_; }
+
+	// Same polarity convention as TurnClusterLeafModel::expected_showdown_sign
+	// (lower cluster id = stronger hand), confirmed for RIVER clusters
+	// specifically via the ORIGINAL, unmodified tree/Exploitability.h's
+	// getnode_cfv_river(): `if (clusters[mycard] > clusters[j])
+	// actionicfvs1[j] = -pot*0.5;` -- i.e. a higher river-cluster id for
+	// the traversing player's hand than the opponent's is a LOSS, so
+	// lower id = stronger hand, exactly like turn clusters (see BUILD_NOTES.md
+	// section 34).
+	double expected_showdown_sign(int hi, int vi) const {
+		const auto& hh = range_.hero[hi];
+		const auto& vh = range_.villain[vi];
+		double sum = 0.0;
+		int n = 0;
+		for (size_t k = 0; k < candidates.size(); k++) {
+			unsigned char c = candidates[k];
+			if (c == hh[0] || c == hh[1] || c == vh[0] || c == vh[1]) continue;
+			int hc = hero_clusters[hi][k];
+			int vc = villain_clusters[vi][k];
+			if (hc < 0 || vc < 0) continue; // collided with own hole cards, or lookup unavailable
+			if (hc < vc) sum += 1.0;      // lower cluster id = stronger hand = hero wins
+			else if (hc > vc) sum -= 1.0;
+			n++;
+		}
+		if (n == 0) return 0.0;
+		return sum / n;
+	}
+
+private:
+	static uint64_t C_TABLE[53][6];
+	static bool binomial_built_;
+
+	static void build_binomial_table() {
+		if (binomial_built_) return;
+		for (int n = 0; n <= 52; n++)
+			for (int k = 0; k <= 5; k++) {
+				if (k == 0 || k == n) C_TABLE[n][k] = 1;
+				else if (k > n) C_TABLE[n][k] = 0;
+				else C_TABLE[n][k] = 0;
+			}
+		for (int n = 1; n <= 52; n++)
+			for (int k = 1; k <= 5 && k < n; k++)
+				C_TABLE[n][k] = C_TABLE[n - 1][k - 1] + C_TABLE[n - 1][k];
+		binomial_built_ = true;
+	}
+
+	static uint64_t binom(int n, int k) {
+		if (k < 0 || n < 0 || k > n) return 0;
+		return C_TABLE[n][k];
+	}
+
+	// Standard lex-rank ("successor counting") of a k-combination, over a
+	// contiguous universe {0,...,n-1} -- see tools/test_river_rank_seek.cpp
+	// for the hand-derived/validated derivation of this exact formula
+	// (deliberately NOT the more commonly-documented colex/combinatorial-
+	// number-system formula, which gives the wrong order for this file's
+	// key convention).
+	static uint64_t lex_rank_of_combination(const int* c, int k, int n) {
+		uint64_t rank = 0;
+		int prev = -1;
+		for (int i = 0; i < k; i++) {
+			for (int v = prev + 1; v < c[i]; v++)
+				rank += binom(n - 1 - v, k - 1 - i);
+			prev = c[i];
+		}
+		return rank;
+	}
+
+	static int compact_index(int raw, int h1, int h2) {
+		int shift = 0;
+		if (raw > h1) shift++;
+		if (raw > h2) shift++;
+		return raw - shift;
+	}
+
+	// Tests whether the split directory is actually usable by opening one
+	// plausible hand file (any two of this leaf's own candidate cards
+	// make a valid "hand id" for this purpose -- we don't need it to be a
+	// hand actually present in range_, just a file that should exist).
+	bool probe_available() const {
+		if (candidates.size() < 2) return false;
+		int h1 = candidates[0], h2 = candidates[1];
+		if (h1 > h2) std::swap(h1, h2);
+		std::string path = split_dir_ + "/" + std::to_string(h1 * 52 + h2) + ".bin";
+		int fd = open(path.c_str(), O_RDONLY);
+		if (fd < 0) return false;
+		close(fd);
+		return true;
+	}
+
+	// Looks up river cluster ids for every (hand, candidate river card)
+	// pair via a direct sparse pread() per candidate -- one file open/close
+	// per unique hand, a few dozen tiny reads each, never a full-file load.
+	void precompute(const std::vector<std::array<unsigned char, 2>>& hands, std::vector<std::vector<int>>& out) {
+		out.assign(hands.size(), std::vector<int>(candidates.size(), -1));
+		for (size_t hi = 0; hi < hands.size(); hi++) {
+			unsigned char h[2] = { hands[hi][0], hands[hi][1] };
+			if (h[0] == board_[0] || h[0] == board_[1] || h[0] == board_[2] || h[0] == board_[3] ||
+				h[1] == board_[0] || h[1] == board_[1] || h[1] == board_[2] || h[1] == board_[3]) continue;
+			int h1 = h[0], h2 = h[1];
+			if (h1 > h2) std::swap(h1, h2);
+			std::string path = split_dir_ + "/" + std::to_string(h1 * 52 + h2) + ".bin";
+			int fd = open(path.c_str(), O_RDONLY);
+			if (fd < 0) continue; // leave -1s; expected_showdown_sign() skips them
+			for (size_t k = 0; k < candidates.size(); k++) {
+				unsigned char c = candidates[k];
+				if (c == h[0] || c == h[1]) continue;
+				unsigned char comm[5] = { board_[0], board_[1], board_[2], board_[3], c };
+				std::sort(comm, comm + 5);
+				int compacted[5];
+				for (int i = 0; i < 5; i++) compacted[i] = compact_index(comm[i], h1, h2);
+				uint64_t R = lex_rank_of_combination(compacted, 5, 50);
+				if (R >= (uint64_t)RIVER_COMMUNITY_TOTAL) continue;
+				uint16_t val = 0;
+				ssize_t got = pread(fd, &val, 2, VALUES_OFFSET + (long)R * 2);
+				if (got == 2) out[hi][k] = (int)val;
+			}
+			close(fd);
+		}
+	}
+
+	const Players_range& range_;
+	std::string split_dir_;
+	unsigned char board_[4];
+	std::vector<unsigned char> candidates;
+	std::vector<std::vector<int>> hero_clusters;
+	std::vector<std::vector<int>> villain_clusters;
+	bool available_ = false;
+};
+
+uint64_t RiverClusterLeafModel::C_TABLE[53][6] = {};
+bool RiverClusterLeafModel::binomial_built_ = false;
 
 // ---------------------------------------------------------------------------
 // Range-vs-range vanilla vector-form CFR over a single flop betting round,
@@ -774,9 +982,18 @@ public:
 	// without changing what hero itself is able to do. See BUILD_NOTES.md
 	// for the full writeup (why one bucket, why not the full ladder, and
 	// the measured cost of the 4th action).
+	// `river_leaf`, when non-null AND river_leaf->available(), gives TURN
+	// mode (see BUILD_NOTES.md section 34) the same kind of cheap terminal
+	// shortcut FLOP mode already has via `leaf`: once TURN betting closes,
+	// instead of dealing a real river chance node and resolving an exact
+	// showdown for every one of its ~48 branches, this estimates the leaf
+	// value directly from precomputed river-cluster ids read from the
+	// per-hole-hand split files. When null (or unavailable), TURN mode
+	// behaves exactly as before this feature was added -- a real chance
+	// node + exact showdown -- so this is purely additive/opt-in.
 	LiveResolver(const Players_range& range, Engine* eng, const TurnClusterLeafModel* leaf, Mode mode,
-		bool extended_actions = false)
-		: range_(range), engine_(eng), leaf_(leaf), mode_(mode), extended_actions_(extended_actions) {
+		bool extended_actions = false, const RiverClusterLeafModel* river_leaf = nullptr)
+		: range_(range), engine_(eng), leaf_(leaf), river_leaf_(river_leaf), mode_(mode), extended_actions_(extended_actions) {
 		N = (int)range_.hero.size();
 		M = (int)range_.villain.size();
 	}
@@ -846,6 +1063,8 @@ public:
 		Searchstate& s = node->state;
 		if (s.betting_stage == 5) return terminal_fold(node, reach, traverser);
 		if (mode_ == Mode::FLOP && s.betting_stage >= 2) return terminal_leaf(node, reach, traverser);
+		if (mode_ == Mode::TURN && river_leaf_ && river_leaf_->available() && s.betting_stage >= 3)
+			return terminal_river_leaf(node, reach, traverser);
 		if (mode_ == Mode::TURN && (int)node->board.size() >= 5) return terminal_showdown(node, reach, traverser);
 
 		expand(node);
@@ -928,6 +1147,8 @@ public:
 		Searchstate& s = node->state;
 		if (s.betting_stage == 5) return terminal_fold(node, reach, traverser);
 		if (mode_ == Mode::FLOP && s.betting_stage >= 2) return terminal_leaf(node, reach, traverser);
+		if (mode_ == Mode::TURN && river_leaf_ && river_leaf_->available() && s.betting_stage >= 3)
+			return terminal_river_leaf(node, reach, traverser);
 		if (mode_ == Mode::TURN && (int)node->board.size() >= 5) return terminal_showdown(node, reach, traverser);
 
 		expand(node);
@@ -1195,6 +1416,37 @@ private:
 		return util;
 	}
 
+	// TURN-mode analogue of terminal_leaf() above, using river_leaf_
+	// (a RiverClusterLeafModel) instead of leaf_ (a TurnClusterLeafModel).
+	// Fires once TURN betting closes (see cfr()/best_response()'s dispatch),
+	// replacing what would otherwise be a real river chance-node expansion
+	// (~48 branches) plus an exact showdown at every one of them, every
+	// CFR iteration. Only used when river_leaf_ is non-null and
+	// river_leaf_->available() -- see LiveResolver's constructor comment.
+	std::vector<double> terminal_river_leaf(Node* node, std::vector<double> reach[2], int traverser) {
+		Searchstate& s = node->state;
+		double pot = s.table.total_pot;
+		int out_n = (traverser == 0) ? N : M;
+		int other_n = (traverser == 0) ? M : N;
+		std::vector<double> util(out_n, 0.0);
+		for (int th = 0; th < out_n; th++) {
+			double v = 0.0;
+			for (int oh = 0; oh < other_n; oh++) {
+				double r = reach[1 - traverser][oh];
+				if (r == 0.0) continue;
+				const auto& hero_hand = (traverser == 0) ? range_.hero[th] : range_.hero[oh];
+				const auto& villain_hand = (traverser == 0) ? range_.villain[oh] : range_.villain[th];
+				if (!hands_compatible(hero_hand, villain_hand)) continue;
+				double sign = (traverser == 0)
+					? river_leaf_->expected_showdown_sign(th, oh)
+					: -river_leaf_->expected_showdown_sign(oh, th);
+				v += r * sign * (pot / 2.0);
+			}
+			util[th] = v;
+		}
+		return util;
+	}
+
 	std::vector<double> terminal_showdown(Node* node, std::vector<double> reach[2], int traverser) {
 		Searchstate& s = node->state;
 		double pot = s.table.total_pot;
@@ -1232,6 +1484,7 @@ private:
 	const Players_range& range_;
 	Engine* engine_;
 	const TurnClusterLeafModel* leaf_;
+	const RiverClusterLeafModel* river_leaf_;
 	Mode mode_;
 	bool extended_actions_;
 	int N, M;

@@ -72,6 +72,17 @@
 //       more cards to deal. See BUILD_NOTES.md for the design writeup and
 //       measured performance cost of tracking a full (rather than a small,
 //       fixed-size sampled) range.
+//     - TURN mode's per-CFR-iteration cost (dealing a real river card via a
+//       chance node, then an exact showdown, for every one of ~44-48
+//       branches, every iteration) can optionally be replaced with a cheap
+//       RiverClusterLeafModel lookup (BUILD_NOTES.md section 34) -- set the
+//       DH_RIVER_SPLIT_DIR environment variable to the path of the
+//       per-hole-hand split river-cluster files (see BUILD_NOTES.md section
+//       31/34 for how those are built) to enable it. This is purely
+//       opt-in/additive: unset (the default), or if the directory/files
+//       can't be read, TURN mode transparently falls back to the original
+//       exact chance-node + showdown behavior -- never worse or wrong,
+//       only slower without it.
 //     - This is meant to make the existing GUI (pypokergui) ACTUALLY
 //       PLAYABLE against a genuine, working, from-scratch search algorithm
 //       on macOS -- it is explicitly NOT a reconstruction of the original
@@ -200,6 +211,23 @@ struct PreflopCacheLoader {
 	}
 };
 PreflopCacheLoader g_preflop_cache_loader;
+
+// Optional, purely-additive fast path for TURN-mode decisions (BUILD_NOTES.md
+// section 34): if the DH_RIVER_SPLIT_DIR environment variable is set to the
+// path of the per-hole-hand split river-cluster files (one ~12.7MB
+// "<handid>.bin" file per of the 1326 possible hole hands -- see section 31),
+// TURN-mode LiveResolver runs use a RiverClusterLeafModel to estimate the
+// river leaf value directly from precomputed cluster ids (a few dozen tiny
+// disk reads per hand, done once per resolve, outside the CFR loop) instead
+// of dealing a real river card and computing an exact showdown on every
+// single CFR iteration. If unset, or if the directory/files can't actually
+// be read, TURN mode transparently falls back to its original, exact
+// chance-node + showdown behavior -- this can never make a TURN decision
+// WORSE or WRONG, only slower when the split files aren't available.
+std::string river_split_dir() {
+	const char* env = std::getenv("DH_RIVER_SPLIT_DIR");
+	return env ? std::string(env) : std::string();
+}
 
 int committed_this_street(int slot) {
 	return g.stack_at_street_start[slot] - g.stack[slot];
@@ -463,7 +491,20 @@ ConvergenceConfig convergence_config_for_mode(LiveResolver::Mode mode) {
 	// ~2.7-2.8s/~23%, vs. the pre-existing ~1.2s/~10% overshoot at 3 actions
 	// -- see BUILD_NOTES.md). This does not change what TURN converges TO,
 	// only how precisely the safety cap is honored.
-	if (mode == LiveResolver::Mode::TURN)  return { 50, 2000, 12000.0 };
+	//
+	// max_iterations raised 2000 -> 20000 (BUILD_NOTES.md section 35): with
+	// DH_RIVER_SPLIT_DIR set (RiverClusterLeafModel active, section 34), a
+	// TURN iteration got ~20x cheaper, and the OLD 2000-iteration cap was
+	// measured to be the binding constraint -- TURN hit it at only ~738ms of
+	// wall-clock (far under the 12s max_ms) while still sitting at 3.4%
+	// exploitability, never actually reaching the 1% target. Measured
+	// directly against the real split files: raising the cap to 20000 lets
+	// the same scenario run 4150 iterations / ~738ms and genuinely converge
+	// under 1% (0.93%). Confirmed this raise is a no-op when the leaf model
+	// is NOT active (DH_RIVER_SPLIT_DIR unset): the 12000ms wall-clock cap
+	// still binds first at the same ~850 iterations/12.5s as before, byte-
+	// for-byte identical to the old 2000-cap behavior in that case.
+	if (mode == LiveResolver::Mode::TURN)  return { 50, 20000, 12000.0 };
 	return { 500, 20000, 6000.0 }; // RIVER
 }
 
@@ -542,6 +583,14 @@ void narrow_villain_range_postflop(int opp_slot, unsigned char observed_byte) {
 			unsigned char flop_board[3] = { g.board[0], g.board[1], g.board[2] };
 			leaf.reset(new TurnClusterLeafModel(engine, flop_board, range));
 		}
+		std::unique_ptr<RiverClusterLeafModel> river_leaf;
+		if (mode == LiveResolver::Mode::TURN) {
+			std::string dir = river_split_dir();
+			if (!dir.empty()) {
+				unsigned char turn_board[4] = { g.board[0], g.board[1], g.board[2], g.board[3] };
+				river_leaf.reset(new RiverClusterLeafModel(dir, turn_board, range));
+			}
+		}
 		// extended_actions=true: this resolver instance is used ONLY to
 		// compute a narrowing update, never to pick hero's own action (see
 		// resolve_decision(), which always uses the default/false, 3-action
@@ -551,7 +600,7 @@ void narrow_villain_range_postflop(int opp_slot, unsigned char observed_byte) {
 		// silently skipped. See RealtimeSearch.h's LiveResolver constructor
 		// comment and BUILD_NOTES.md for the full design writeup and
 		// measured cost of the extra action.
-		LiveResolver resolver(range, engine, leaf.get(), mode, /*extended_actions=*/true);
+		LiveResolver resolver(range, engine, leaf.get(), mode, /*extended_actions=*/true, river_leaf.get());
 		resolver.init_root(s, g.board);
 		std::vector<double> tracked_weights;
 		tracked_weights.reserve(g.villain_range.size());
@@ -615,7 +664,16 @@ std::string resolve_decision() {
 		leaf.reset(new TurnClusterLeafModel(engine, flop_board, range));
 	}
 
-	LiveResolver resolver(range, engine, leaf.get(), mode);
+	std::unique_ptr<RiverClusterLeafModel> river_leaf;
+	if (mode == LiveResolver::Mode::TURN) {
+		std::string dir = river_split_dir();
+		if (!dir.empty()) {
+			unsigned char turn_board[4] = { g.board[0], g.board[1], g.board[2], g.board[3] };
+			river_leaf.reset(new RiverClusterLeafModel(dir, turn_board, range));
+		}
+	}
+
+	LiveResolver resolver(range, engine, leaf.get(), mode, /*extended_actions=*/false, river_leaf.get());
 	resolver.init_root(s, g.board);
 	if (opp_slot == 0) run_until_converged(resolver, mode, &tracked_weights, nullptr);
 	else run_until_converged(resolver, mode, nullptr, &tracked_weights);
