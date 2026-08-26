@@ -1486,3 +1486,54 @@ judged not to be a legitimate, achievable path here — consistent with this
 project's stated goal of not fabricating success. No decompilation was
 attempted; this section only reports what information is present and why
 it falls short.
+
+## 14. Correction/refinement: do the `.so`'s custom struct/function names exist in the public source?
+
+A fair follow-up question exposed an inaccurate implication in section 13 —
+that the binary's data structures and logic were entirely unknown outside
+the `.so`. Checked exhaustively rather than assuming: grepped the public
+repo source for every one of the 107 real (`T`/`t`) defined functions in
+`AlascasiaHoldem.so`, and for the custom struct/class names it uses.
+
+**Result: most of it is already present as real, compilable public source,
+with exactly matching signatures.**
+
+- `Pokerstate` and `Searchstate` are fully defined in `poker/State.h`
+  (lines 31 and 313). `strategy_node`/`subgame_node` are fully defined in
+  `tree/Node.h`.
+- Of 73 non-STL real functions checked, **52 exist verbatim** (identical
+  C++ signatures, confirmed by comparing the demangled `.so` symbol against
+  the actual function declaration — e.g. `build_subtree_flop(strategy_node*,
+  subgame_node*, Searchstate&, int, bool, bool)` and `getnode_cfv_holdem
+  (strategy_node**, Pokerstate&, double*, double*, unsigned char*, int, int,
+  int)` match byte-for-byte) in `tree/Bulid_Tree.h`, `tree/Exploitability.h`,
+  `tree/Save_load.h`, `tree/Visualize_Tree.h`, `BlueprintMCCFR.h`,
+  `Multi_Blureprint.h`, and `Main.cpp` — i.e. all of the offline
+  blueprint-training, tree-building, exploitability-computation, save/load,
+  and visualization machinery this repo already has really is what the `.so`
+  was built from.
+- **Only 21 functions are genuinely absent from the public source**, and they
+  cluster exactly where expected — the live game-interface layer
+  (`getdecision`, `restart_game`, `Next_stage`, `opp_take_action`,
+  `startgame`, `initgamestart`, `getexternal_cards`), the real-time search
+  algorithm itself (`search_cfr`, `search_mccfr`, `search_mccfrp`, `rollout`,
+  `expect_game_val`, `randomized_pseudo_harmonic`), and its substrategy/range
+  update machinery (`update_substrategy`, `update_substrategy_preflop`,
+  `update_subgame_strategy`, `multi_update_substrategy`, `update_range`),
+  plus two minor variants (`load2`, `bulid_bluestrategy2`, `findlistmax`).
+- **`Players_range` appears in neither `AlascasiaHoldem.so`'s nor
+  `blueprint.so`'s companion source anywhere in this repo** — it exists only
+  inside the compiled binaries, confirming it's a data structure private to
+  the missing `Search.h`/`PlaySearch.h`/`Depth_limit_Search.h` trio.
+
+**Practical implication**: this sharpens, but does not reverse, section 13's
+conclusion. The reconstruction gap is precisely these ~21 functions (the
+actual depth-limited real-time search/resolving algorithm and its live-play
+glue) plus one struct — not "the whole compiled library." Everything else
+needed to *build* the parts of this repo that already compile (offline
+blueprint MCCFR training, tree save/load, exploitability measurement,
+visualization) is already present as real source, matching what produced
+these `.so` files. Only that narrow, specific 21-function/1-struct surface
+would still require disassembly-based reverse engineering with no source and
+no ground-truth output to validate against — the same caveats as section 13,
+just now scoped to the actual missing piece rather than the whole binary.
