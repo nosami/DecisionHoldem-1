@@ -991,9 +991,46 @@ public:
 	// per-hole-hand split files. When null (or unavailable), TURN mode
 	// behaves exactly as before this feature was added -- a real chance
 	// node + exact showdown -- so this is purely additive/opt-in.
+	//
+	// `full_ladder`, when true, keeps EVERY legal action State.h's
+	// legal_actions() returns at the OPENING decision of a betting round
+	// (cur_round_action_num==0, i.e. nobody has acted yet this street) --
+	// the same native pot-fraction raise sizes (0.5/1/2/4/8/10/20 pot,
+	// subject to the same per-round/per-raise caps used everywhere else
+	// in this codebase, including the trained blueprint) the reduced
+	// fold/call/allin-only set above was collapsing away, instead of
+	// inventing new sizes. Nodes reached AFTER that opening action (i.e.
+	// facing a bet/raise) still fall back to the reduced set, plus the
+	// same single extra "1x pot" size extended_actions_ already offers
+	// (the native abstraction itself never offers more than that one
+	// extra size once facing a bet anyway). This restriction is
+	// deliberate and measured, not a simplification for its own sake:
+	// keeping the FULL ladder at every depth (including deep in a
+	// reraise war) was benchmarked at 6-75x slower per iteration and
+	// pushed convergence out to 17-60+ seconds -- unusable for a live
+	// decision -- because the opening node's up to 6-way branching
+	// factor compounds through every subtree beneath it. Restricting
+	// full granularity to just the opening action keeps convergence
+	// times in the same ballpark as the reduced action set while still
+	// letting hero pick a real, differentiated bet size instead of only
+	// fold/check/allin (see BUILD_NOTES.md section 37 for the numbers).
+	// This is only safe to combine with modes that never expand a
+	// further chance node inside THIS resolver's own tree (FLOP --
+	// always terminates at `leaf` the instant flop betting closes; TURN
+	// -- terminates at `river_leaf` the instant turn betting closes, but
+	// ONLY when river_leaf is actually active; RIVER -- the last street,
+	// nothing further to deal). TURN mode WITHOUT an active river_leaf
+	// still deals a real, expensive river chance node per iteration, and
+	// full_ladder combined with that case reproduces the original "did
+	// not finish 5 iterations in several minutes" combinatorial blowup
+	// this file's `expand()` used to warn about -- so callers must gate
+	// full_ladder on river_leaf availability themselves for TURN mode
+	// (dh_native_ai.cpp does this).
 	LiveResolver(const Players_range& range, Engine* eng, const TurnClusterLeafModel* leaf, Mode mode,
-		bool extended_actions = false, const RiverClusterLeafModel* river_leaf = nullptr)
-		: range_(range), engine_(eng), leaf_(leaf), river_leaf_(river_leaf), mode_(mode), extended_actions_(extended_actions) {
+		bool extended_actions = false, const RiverClusterLeafModel* river_leaf = nullptr,
+		bool full_ladder = false)
+		: range_(range), engine_(eng), leaf_(leaf), river_leaf_(river_leaf), mode_(mode),
+		  extended_actions_(extended_actions), full_ladder_(full_ladder) {
 		N = (int)range_.hero.size();
 		M = (int)range_.villain.size();
 	}
@@ -1340,16 +1377,51 @@ private:
 		if (node->state.betting_stage >= 4) return;
 		unsigned char buf[16];
 		int n = node->state.legal_actions(buf);
-		std::vector<unsigned char> reduced;
-		// Byte 2 ("1x pot" raise, per State.h's take_action()) is included
-		// only when extended_actions_ is set -- see the constructor
-		// comment. legal_actions() already emits bytes in the real
-		// fold/call/raise-sizes-ascending/allin order, so this preserves
-		// that relative order without any extra sorting.
-		for (int i = 0; i < n; i++)
-			if (buf[i] == 'd' || buf[i] == 'l' || buf[i] == 'n' ||
-				(extended_actions_ && buf[i] == 2)) reduced.push_back(buf[i]);
-		node->actions = reduced;
+		if (full_ladder_ && node->state.cur_round_action_num == 0) {
+			// Keep EVERY legal action -- the same native pot-fraction raise
+			// ladder (0.5/1/2/4/8/10/20 pot, per State.h's legal_actions())
+			// the trained blueprint and every other part of this codebase
+			// already uses, not a new invented size (BUILD_NOTES.md section
+			// 37). Only safe for modes that don't expand a further chance
+			// node inside this tree -- see the constructor comment; callers
+			// are responsible for that gating.
+			//
+			// Restricted to cur_round_action_num==0 (the FIRST action of
+			// the betting round, i.e. nobody has acted yet this street):
+			// measured (BUILD_NOTES.md section 37) that keeping the full
+			// ladder at EVERY node, including facing-a-raise nodes deeper
+			// in a reraise war, made FLOP/RIVER/TURN(leaf) 6-75x slower
+			// per iteration and pushed convergence out to 17-60+ seconds
+			// -- unusable for a live per-decision response. Since
+			// State.h's own legal_actions() already collapses raise
+			// choices down to at most one extra pot-size once facing a
+			// reraise (cur_round_action_num in [2,4)) and none at all
+			// beyond that (>=4), the real combinatorial cost was almost
+			// entirely the opening node's up-to-6-way branching factor
+			// compounding through the reduced-but-still-real subtrees
+			// beneath each of those branches. Offering full granularity
+			// only at the single opening decision (falling back to the
+			// existing fold/call/allin -- or extended_actions_'s +1x-pot
+			// -- set for every node after that) keeps the dominant new
+			// information (which OPENING size hero used) while avoiding
+			// that compounding cost.
+			node->actions.assign(buf, buf + n);
+		} else {
+			std::vector<unsigned char> reduced;
+			// Byte 2 ("1x pot" raise, per State.h's take_action()) is included
+			// when extended_actions_ is set, OR when full_ladder_ is set and
+			// we're past the opening node (facing-a-raise/reraise): the
+			// native abstraction itself only ever offers at most this one
+			// extra size once facing a bet (State.h's cur_round_action_num
+			// in [2,4) gate), so keeping it here is a single extra branch,
+			// not a combinatorial blowup -- unlike keeping the full 6-way
+			// opening ladder at every depth, which was measured to be
+			// 6-75x slower per iteration (BUILD_NOTES.md section 37).
+			for (int i = 0; i < n; i++)
+				if (buf[i] == 'd' || buf[i] == 'l' || buf[i] == 'n' ||
+					((extended_actions_ || full_ladder_) && buf[i] == 2)) reduced.push_back(buf[i]);
+			node->actions = reduced;
+		}
 		int p = node->state.player_i_index;
 		int own_n = (p == 0) ? N : M;
 		node->regret.assign(own_n, std::vector<double>(node->actions.size(), 0.0));
@@ -1487,6 +1559,7 @@ private:
 	const RiverClusterLeafModel* river_leaf_;
 	Mode mode_;
 	bool extended_actions_;
+	bool full_ladder_;
 	int N, M;
 };
 

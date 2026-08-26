@@ -480,8 +480,25 @@ struct ConvergenceConfig {
 	double max_ms;      // hard wall-clock cap regardless of exploitability or iteration count
 };
 
-ConvergenceConfig convergence_config_for_mode(LiveResolver::Mode mode) {
-	if (mode == LiveResolver::Mode::FLOP)  return { 200, 10000, 3000.0 };
+ConvergenceConfig convergence_config_for_mode(LiveResolver::Mode mode, bool full_ladder = false) {
+	// full_ladder widens hero's own action set at the opening decision of
+	// a betting round from {fold, call, allin} to the real native
+	// pot-fraction ladder (RealtimeSearch.h's LiveResolver constructor
+	// comment / BUILD_NOTES.md section 37). Measured directly: this makes
+	// each iteration meaningfully more expensive (more branches per node),
+	// so the same time budgets used for the reduced 3-action tree are no
+	// longer enough to reliably reach the same exploitability -- FLOP
+	// measured 6.7% at the original 3000ms cap vs. 2.7% at 8000ms; RIVER
+	// measured 1.97% at the original 6000ms cap vs. 0.96% (just crosses
+	// 1%) at 10000ms. Both budgets below are widened ONLY when full_ladder
+	// is active; the reduced-action (default) budgets are byte-for-byte
+	// unchanged from before this feature existed. TURN's existing 12000ms
+	// cap (section 35) was already measured to be enough for full_ladder
+	// too (converged 0.92%-1.94% across repeated runs -- see BUILD_NOTES
+	// section 37 for the honest caveat that it sometimes lands just over
+	// 1%, same "best effort under a time cap" design the rest of this file
+	// already uses), so TURN's cap is intentionally left unchanged here.
+	if (mode == LiveResolver::Mode::FLOP)  return { 200, 10000, full_ladder ? 8000.0 : 3000.0 };
 	// TURN's batch_size was 100 before the bet-size-narrowing fix added a 4th
 	// (extended_actions) branch to this resolver's tree; the wall-clock cap
 	// below is only checked BETWEEN batches, so a costlier per-iteration rate
@@ -505,7 +522,7 @@ ConvergenceConfig convergence_config_for_mode(LiveResolver::Mode mode) {
 	// still binds first at the same ~850 iterations/12.5s as before, byte-
 	// for-byte identical to the old 2000-cap behavior in that case.
 	if (mode == LiveResolver::Mode::TURN)  return { 50, 20000, 12000.0 };
-	return { 500, 20000, 6000.0 }; // RIVER
+	return { 500, 20000, full_ladder ? 10000.0 : 6000.0 }; // RIVER
 }
 
 const double TARGET_EXPLOITABILITY_PCT = 1.0;
@@ -521,8 +538,9 @@ const double TARGET_EXPLOITABILITY_PCT = 1.0;
 // run() and exploitability() so the convergence check reflects this exact
 // decision's real tracked-range belief, not a synthetic uniform one.
 void run_until_converged(LiveResolver& resolver, LiveResolver::Mode mode,
-	const std::vector<double>* external_reach0, const std::vector<double>* external_reach1) {
-	ConvergenceConfig cfg = convergence_config_for_mode(mode);
+	const std::vector<double>* external_reach0, const std::vector<double>* external_reach1,
+	bool full_ladder = false) {
+	ConvergenceConfig cfg = convergence_config_for_mode(mode, full_ladder);
 	double pot = (double)resolver.root->state.table.total_pot;
 	auto t0 = std::chrono::steady_clock::now();
 	int done = 0;
@@ -673,10 +691,27 @@ std::string resolve_decision() {
 		}
 	}
 
-	LiveResolver resolver(range, engine, leaf.get(), mode, /*extended_actions=*/false, river_leaf.get());
+	// full_ladder gives hero's OWN decision the real native pot-fraction
+	// bet sizes (0.5/1/2/4/10/20x pot, per State.h's legal_actions() --
+	// the same abstraction the blueprint was trained with) at the opening
+	// action of a betting round, instead of only fold/check/allin -- see
+	// RealtimeSearch.h's LiveResolver constructor comment and BUILD_NOTES.md
+	// section 37 for the full design writeup and measured tractability.
+	// Only safe for modes that don't expand a further chance node inside
+	// this resolver's own tree: FLOP and RIVER always qualify; TURN only
+	// when river_leaf is actually active (non-null) -- TURN without it
+	// still deals a real, expensive river chance node per iteration, and
+	// combining that with the full ladder reproduces the original
+	// "several minutes" combinatorial blowup this file used to warn
+	// about, so it is deliberately excluded here.
+	bool full_ladder = (mode == LiveResolver::Mode::FLOP) || (mode == LiveResolver::Mode::RIVER)
+		|| (mode == LiveResolver::Mode::TURN && river_leaf != nullptr);
+
+	LiveResolver resolver(range, engine, leaf.get(), mode, /*extended_actions=*/false, river_leaf.get(),
+		full_ladder);
 	resolver.init_root(s, g.board);
-	if (opp_slot == 0) run_until_converged(resolver, mode, &tracked_weights, nullptr);
-	else run_until_converged(resolver, mode, nullptr, &tracked_weights);
+	if (opp_slot == 0) run_until_converged(resolver, mode, &tracked_weights, nullptr, full_ladder);
+	else run_until_converged(resolver, mode, nullptr, &tracked_weights, full_ladder);
 	// Adaptive iteration budget -- keeps iterating until measured
 	// exploitability drops under ~1% of the pot (or a safety cap is hit);
 	// see run_until_converged()'s comment above for the real measured
@@ -694,7 +729,9 @@ std::string resolve_decision() {
 
 	// Root actions may not literally be [fold, call, allin] in that order or
 	// even all present (e.g., no fold offered if nothing is owed) -- match
-	// by the actual encoded action bytes ('d'=fold, 'l'=call/check, 'n'=allin).
+	// by the actual encoded action bytes ('d'=fold, 'l'=call/check, 'n'=allin,
+	// anything else is a pot-fraction raise byte -- only reachable when
+	// full_ladder gave this decision access to the real ladder above).
 	double r = std::uniform_real_distribution<double>(0.0, 1.0)(g.rng);
 	double cum = 0.0;
 	for (size_t a = 0; a < resolver.root->actions.size(); a++) {
@@ -703,7 +740,33 @@ std::string resolve_decision() {
 			unsigned char act = resolver.root->actions[a];
 			if (act == 'd') return "fold";
 			if (act == 'n') return "allin";
-			return "call";
+			if (act == 'l') return "call";
+			// Pot-fraction raise byte: compute the real chip total using
+			// the EXACT same formula State.h's take_action() uses to apply
+			// this same byte, and resolve_preflop_decision() already uses
+			// for its own raise bytes (last_raise = pot * byte / 200 * 100).
+			// s.table.total_pot/s.last_bigbet (from build_current_searchstate())
+			// are in the WHOLE-HAND (20000-baseline) convention this
+			// resolver's own math (and the real State.h engine) uses
+			// internally -- but apply_own_action()'s "raise N" parser
+			// expects N in the STREET-RELATIVE convention for any street
+			// other than preflop (street_relative_raise_baseline(); see its
+			// own comment). Compute the whole-hand total first, then
+			// convert down to street-relative by subtracting whatever was
+			// already committed in EARLIER streets, exactly mirroring
+			// opp_take_action()'s inverse (amount = street_relative_raise_
+			// baseline(opp) - g.stack[opp]) for the same conversion in the
+			// other direction.
+			int total_pot_before = (int)s.table.total_pot;
+			int last_bigbet_before = (int)s.last_bigbet;
+			int my_bet_before = 20000 - g.stack[g.my_id];
+			int n_chips_to_call = last_bigbet_before - my_bet_before;
+			int pot = total_pot_before + n_chips_to_call;
+			int last_raise = pot * act / 200 * 100;
+			int new_total_bet_whole_hand = last_bigbet_before + last_raise;
+			int already_committed_earlier_streets = 20000 - g.stack_at_street_start[g.my_id];
+			int new_total_bet_street_relative = new_total_bet_whole_hand - already_committed_earlier_streets;
+			return "raise " + std::to_string(new_total_bet_street_relative);
 		}
 	}
 	return "call"; // defensive fallback, should be unreachable

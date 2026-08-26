@@ -36,6 +36,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
+#include <algorithm>
 #include <functional>
 
 static double time_ms(const std::function<void()>& fn) {
@@ -102,7 +104,17 @@ int main(int argc, char** argv) {
 			decision_before.c_str());
 		ok = false;
 	}
-	if (decision_after != "fold" && decision_after != "call" && decision_after != "allin") {
+	// WITH the leaf model active, full_ladder is now also enabled for TURN
+	// (see RealtimeSearch.h's LiveResolver constructor comment and
+	// BUILD_NOTES.md section 37), so hero's own decision can legitimately
+	// be a real "raise <chips>" string now, not just fold/call/allin --
+	// accept any well-formed "raise <positive integer>" in addition to the
+	// original three.
+	bool is_valid_raise = decision_after.rfind("raise ", 0) == 0 &&
+		decision_after.size() > 6 &&
+		std::all_of(decision_after.begin() + 6, decision_after.end(), ::isdigit) &&
+		std::stoi(decision_after.substr(6)) > 0;
+	if (decision_after != "fold" && decision_after != "call" && decision_after != "allin" && !is_valid_raise) {
 		std::printf("FAIL: getdecision() with leaf model returned an implausible action \"%s\"\n",
 			decision_after.c_str());
 		ok = false;

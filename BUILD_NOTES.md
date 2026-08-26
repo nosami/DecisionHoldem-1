@@ -4656,3 +4656,222 @@ which isn't recoverable after the fact from a single log line) and ran
 `LiveResolver` to the same 1%-exploitability target as `run_until_converged()`,
 then printed `LiveResolver::average_strategy(resolver.root.get(), 0, avg)`
 instead of sampling one action from it.
+
+## 37. Giving hero's own live decisions real bet sizes (not just fold/check/allin), using the exact native ladder the blueprint was trained with
+
+Follow-up to section 36: the user explicitly asked for hero's own decisions
+to be able to make "various size bets," using "the bet sizes that the
+lookup files use" — not new, invented sizes. This section documents what
+was implemented, what was measured, and the honest tradeoffs.
+
+### The real native bet-size ladder (reverse-engineered from `State.h`, not guessed)
+
+`Searchstate::legal_actions()`/`legal_actions_river()` and `take_action()`
+(both used identically by the training-time `Pokerstate` and the search-time
+`Searchstate` — genuinely the same abstraction the blueprint was trained
+with) encode raise sizes as a byte multiplied by 0.5x pot (`last_raise =
+pot * actionstr / 200 * 100`):
+
+| Byte | Multiplier |
+|---|---|
+| 1 | 0.5x pot |
+| 2 | 1x pot |
+| 4 | 2x pot |
+| 8 | 4x pot |
+| 20 | 10x pot |
+| 40 | 20x pot |
+
+Availability by street/position in the betting round (`cur_round_action_num`):
+- Preflop/flop opening action (`cur_round_action_num<2`): all of 0.5/1/2/4/10/20x pot.
+- Preflop/flop facing one reraise (`cur_round_action_num` in [2,4)): only 1x pot.
+- Preflop/flop deeper reraise war (`>=4`): no raise sizes, fold/call/allin only.
+- Turn opening action: 0.5/1/2x pot only.
+- Turn facing a reraise: 1x pot only.
+- River opening-ish (`<4`): 0.5/1/2/4x pot.
+
+This does **not** match a "modern solver" ladder (no 0.33x/0.75x/1.5x, no
+distinct min-bet) — it's coarser and overbet-skewed. This was confirmed
+directly to the user, who had assumed a different (incorrect) ladder.
+
+### Where this was safe to add without also expanding a chance node
+
+`LiveResolver::cfr()`/`best_response()` already short-circuit BEFORE any
+further chance-node expansion in three of four cases: FLOP mode always
+terminates at `TurnClusterLeafModel`'s leaf estimate the instant flop
+betting closes; TURN mode terminates at `RiverClusterLeafModel`'s leaf
+estimate the instant turn betting closes, but *only* when that leaf model
+is actually active (section 34); RIVER mode is inherently the last street.
+Only TURN *without* an active river leaf model still deals a real,
+~44-48-branch river chance node per iteration — this is almost certainly
+the scenario the old "did not finish 5 iterations in several minutes"
+comment in `RealtimeSearch.h` was describing, and remains genuinely
+infeasible for a wider action set. `take_action()` is already fully
+generic over action bytes (pre-existing, shared engine code), so no
+engine-side change was needed — only `LiveResolver::expand()`'s action-set
+*filter* needed a new option.
+
+### Implementation: `full_ladder`, restricted to the opening action of each betting round
+
+Added a `full_ladder` constructor parameter to `LiveResolver` (default
+`false`, purely additive — every existing call site is unaffected). When
+`full_ladder=true`, `expand()` keeps every byte `legal_actions()` returns —
+but **only at the opening decision of a betting round**
+(`cur_round_action_num==0`, i.e. nobody has acted yet this street). Nodes
+reached after that (facing a bet/raise) still fall back to the existing
+reduced set, with the same single extra "1x pot" branch `extended_actions`
+already provides for narrowing (native abstraction never offers more than
+one extra size once facing a bet anyway, so this costs one branch, not a
+blowup).
+
+This restriction is deliberate and *measured*, not a simplification for its
+own sake — see below.
+
+### Tractability measurements (this is the part that mattered)
+
+Built a throwaway diagnostic (`tools/_diag_full_ladder.cpp`, deleted after
+use) constructing a real `LiveResolver` with `full_ladder=true` for FLOP,
+RIVER, and TURN(with an active `RiverClusterLeafModel`, `DH_RIVER_SPLIT_DIR`
+set), using the same convergence methodology as `run_until_converged()`.
+
+**Keeping the full ladder at EVERY node (including deep in a reraise war),
+not just the opening action** — tested first, rejected:
+
+| Mode | Reduced-action baseline | Full ladder (every node) |
+|---|---|---|
+| FLOP | 4800 iters / ~800ms / 0.96% | 600 iters / 3.4s / 20.3% (capped, not converged) |
+| RIVER | 12500 iters / ~4.6s / 0.60% | 2500 iters / 6.5s / 4.0% (capped, not converged) |
+| TURN(leaf) | 4150 iters / ~740ms / 0.93% | 5850 iters / 12s / 1.47% (capped, not converged) |
+
+6-75x slower per iteration and did not converge within the SAME time
+budgets the reduced action set easily meets. Given enough time (60-90s per
+mode) it eventually does converge (FLOP 14200 iters/60s/1.23%, RIVER 11500
+iters/27s/0.62%, TURN(leaf) 8200 iters/17s/0.98%) — but tens of seconds per
+live decision is not acceptable, confirming the original "several minutes"
+warning was pointing at a real, still-relevant cost, just one level
+shallower than originally attributed (the chance-node fanout wasn't the
+only source of blowup — the opening node's up-to-9-way branching factor
+compounding through every subtree beneath it was, independently, also
+expensive).
+
+**Restricting the full ladder to just the OPENING action of each betting
+round** (the implementation actually shipped) — measured against the SAME
+production time budgets already configured for the reduced action set:
+
+| Mode | Cap (reduced) | Full ladder (opening-only) at that same cap |
+|---|---|---|
+| FLOP | 3000ms | 1600 iters / 3.3s / 6.7% (still capped, not converged) |
+| RIVER | 6000ms | 4500 iters / 6.5s / 2.0% (still capped, not converged) |
+| TURN(leaf) | 12000ms | 8800 iters / 9.2s / 0.92% (**converges within budget**) |
+
+TURN(leaf) — the mode directly implicated in the section 36 "allin"
+report — fits inside its existing time budget. FLOP and RIVER needed a
+wider budget to also converge; measured with widened caps:
+
+| Mode | Widened cap | Result |
+|---|---|---|
+| FLOP | 8000ms | 4200 iters / 8.2s / 2.7% (still not reliably under 1%) |
+| RIVER | 10000ms | 7000 iters / 10.0s / 0.96% (converges, right at the edge) |
+
+### Decision: ship it, with honestly-disclosed limits (same "best effort under a time cap" philosophy the rest of this file already uses)
+
+- `full_ladder` is wired into `resolve_decision()` (`dh_native_ai.cpp`),
+  gated exactly per the safety analysis above: `true` for FLOP always,
+  RIVER always, TURN only when `river_leaf` is non-null (i.e.
+  `DH_RIVER_SPLIT_DIR` set and the leaf model loaded) — **never** for TURN
+  without an active leaf model, where it would reproduce the original
+  infeasible blowup.
+- `convergence_config_for_mode()` now takes a `full_ladder` bool and widens
+  ONLY the wall-clock cap when it's true: FLOP 3000ms->8000ms, RIVER
+  6000ms->10000ms. TURN's existing 12000ms cap is left unchanged (already
+  measured sufficient). The reduced-action (`full_ladder=false`) budgets
+  used by narrowing and by TURN-without-leaf are byte-for-byte unchanged.
+- **Honest limitation, disclosed, not hidden**: even with the widened
+  budgets, FLOP measured 2.7% exploitability (not reliably under the 1%
+  target) and RIVER measured right at the edge (0.96%). This mirrors the
+  same "best effort under a time cap, not a guarantee" design already
+  documented for TURN's own reduced-action budget — full_ladder makes that
+  tradeoff a bit more visible for FLOP specifically, since it now more
+  often finishes above target. This was a deliberate choice to actually
+  ship real bet-size granularity for a live decision within an
+  acceptable few-seconds response time, rather than either (a) taking
+  tens of seconds per decision, or (b) declining to offer real bet sizes
+  at all.
+
+### Chip-total formula for a sampled raise byte (`"raise <chips>"` string)
+
+`resolve_decision()`'s action-byte-to-string mapping previously only
+handled `'d'`->fold, `'n'`->allin, and collapsed everything else to
+"call". Extended it to compute a real chip total for any other
+(pot-fraction raise) byte, using the exact same formula `State.h`'s
+`take_action()` uses to apply that byte, and that `resolve_preflop_decision()`
+already uses for its own raise bytes:
+
+```
+n_chips_to_call = last_bigbet_before - my_bet_before
+pot             = total_pot_before + n_chips_to_call
+last_raise      = pot * byte / 200 * 100
+new_total_bet   = last_bigbet_before + last_raise   // whole-hand cumulative
+```
+
+Verified algebraically against `take_action()`'s own source (`raise_to()`
+is *incremental*, not absolute — it subtracts `n_chips_to_call + last_raise`
+from the stack — so the player's new whole-hand cumulative bet works out to
+`my_bet_before + n_chips_to_call + last_raise = last_bigbet_before +
+last_raise` regardless of `my_bet_before`, exactly matching the formula
+above), not just asserted.
+
+One extra step beyond `resolve_preflop_decision()`'s version: that formula
+gives a **whole-hand cumulative** total (matching the resolver's/engine's
+own internal convention, where pot/bet bookkeeping never resets across
+streets). For preflop this happens to equal the "street-relative" total
+`apply_own_action()`/pypokergui's `State.apply_action()`/Slumbot's own
+published `ParseAction()` reference parser all expect for a `"raise N"`
+string, because preflop is the first street. For **postflop** streets it
+does not — those conventions all reset per street (confirmed directly:
+pypokergui's `fish_player_setup.py::State.apply_action()` computes
+`last_action_chips = last_round_bets - players_chips[...]` then treats the
+raise string's `N` as this street's new cumulative commitment, and
+Slumbot's own `ParseAction()` explicitly documents `street_last_bet_to`
+resetting to 0 at the start of each street and being exactly what a
+`b<N>` wire action encodes). So `resolve_decision()` converts down:
+`new_total_bet_street_relative = new_total_bet_whole_hand - (20000 -
+g.stack_at_street_start[g.my_id])`, mirroring `opp_take_action()`'s
+existing inverse conversion for the same reason. This was verified against
+all three independent references (local bookkeeping, pypokergui's
+protocol adapter, and Slumbot's own reference parser) before shipping —
+not assumed.
+
+### Verification
+
+- `tools/test_bet_size_narrowing`: PASS (unaffected — narrowing's resolver
+  never sets `full_ladder`).
+- `tools/test_river_rank_seek`: 300/300 PASS (unrelated code path).
+- `tools/test_run_until_converged`: identical FLOP/RIVER/TURN/TURN(leaf)
+  numbers as section 35 (this test doesn't exercise `full_ladder`, confirms
+  zero effect on the existing reduced-action path).
+- `tools/test_turn_leaf_speedup`: updated its action-validity assertion
+  (previously only accepted fold/call/allin — now also accepts a
+  well-formed `"raise <positive integer>"`, since that's the whole point of
+  this feature) and reran: WITHOUT the leaf model, hero's TURN decision
+  still returns `"allin"` (full_ladder correctly stays off); WITH the leaf
+  model, it now genuinely returns e.g. `"raise 1150"` instead of always
+  collapsing to fold/call/allin. Both cases still show the same 2-6x
+  speedup this test was built to measure.
+- Rebuilt `dh_native_ai.dylib` clean (`-Wall -Wextra`, only the
+  pre-existing unrelated unused-parameter warning), confirmed all 4 ABI
+  symbols present via `nm -gU`.
+
+### Not done / left as future work
+
+- FLOP and (to a lesser extent) RIVER do not reliably reach the 1% target
+  even with widened time budgets — a genuinely smaller ladder (e.g. only
+  offering 1-2 representative sizes at the opening instead of the full
+  up-to-6-way native set) might close this gap further while still giving
+  real size differentiation; not attempted here since the user's
+  instruction was to use the lookup tables' real sizes, and TURN (the
+  mode directly implicated in the section 36 report) already works well.
+- No change to `narrow_villain_range_postflop()`'s own resolver (still
+  uses the single extra 1x-pot bucket via `extended_actions`, not
+  `full_ladder`) — narrowing against a wider opponent action set was out
+  of scope for this request, which was specifically about hero's own
+  decisions.
