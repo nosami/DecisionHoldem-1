@@ -325,6 +325,83 @@ void dh_log_narrowing(const char* label, unsigned char observed_byte,
 	std::fprintf(stderr, "\n");
 }
 
+// Compares villain's REAL revealed hole cards (available at hand-end --
+// Slumbot's API includes "bot_hole_cards" in the terminal response of
+// EVERY hand, not just showdowns, per BUILD_NOTES.md) against the belief
+// this run's own g.villain_range had settled on for them by that point in
+// the hand. Reports the actual combo's rank and normalized weight among
+// every combo this file was still tracking as possible, and flags it a
+// "RANGE MISS" whenever that weight is below what a uniform guess over the
+// remaining tracked combos would have assigned (i.e. our narrowing made
+// this specific combo LESS likely than "no information at all" would have
+// -- the concrete signature of "opponent wasn't holding a hand we thought
+// was in his range"). Always prints (not gated behind DH_VERBOSE_STRATEGY):
+// this is a single line per hand, directly answers "did narrowing mislead
+// us this hand", and is useless if silently skipped on ordinary runs. Must
+// be called (from the Python driver) after the real bot_hole_cards are
+// known but BEFORE the next hand's restart_game() resets villain_range.
+void dh_log_actual_hand(unsigned char c1, unsigned char c2) {
+	if (g.villain_range.empty()) {
+		std::fprintf(stderr,
+			"[DH_RANGE_MODEL] actual villain hand=%s%s -- no tracked range "
+			"available (villain_range empty); cannot compare\n",
+			dh_card_str(c1).c_str(), dh_card_str(c2).c_str());
+		return;
+	}
+	std::vector<size_t> idx(g.villain_range.size());
+	for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
+	std::sort(idx.begin(), idx.end(),
+		[&](size_t a, size_t b) { return g.villain_range[a].weight > g.villain_range[b].weight; });
+
+	int rank = -1;
+	double actual_weight = 0.0;
+	for (size_t k = 0; k < idx.size(); k++) {
+		const WeightedHand& h = g.villain_range[idx[k]];
+		if ((h.c1 == c1 && h.c2 == c2) || (h.c1 == c2 && h.c2 == c1)) {
+			rank = (int)k + 1;
+			actual_weight = h.weight;
+			break;
+		}
+	}
+
+	size_t n = g.villain_range.size();
+	double uniform_weight = 1.0 / (double)n;
+	size_t top_k = std::min<size_t>(5, n);
+	std::string top_str;
+	for (size_t k = 0; k < top_k; k++) {
+		const WeightedHand& h = g.villain_range[idx[k]];
+		char buf[32];
+		std::snprintf(buf, sizeof(buf), " %s%s=%.2f%%",
+			dh_card_str(h.c1).c_str(), dh_card_str(h.c2).c_str(), h.weight * 100.0);
+		top_str += buf;
+	}
+
+	if (rank < 0) {
+		// Should be impossible for a real, legal deal (villain_range covers
+		// every non-blocked combo unless something upstream degenerately
+		// collapsed to empty and was reset -- see
+		// prune_villain_range_for_board()'s own "villain range was empty"
+		// fallback warning). Reported as its own case rather than silently
+		// treating it as rank N+1/weight 0, so a real tracking bug would be
+		// obvious rather than just look like an extreme miss.
+		std::fprintf(stderr,
+			"[DH_RANGE_MODEL] actual villain hand=%s%s NOT FOUND among %zu "
+			"tracked combos -- RANGE MISS (unexpected: check for an earlier "
+			"'villain range was empty' warning this hand). Top expected:%s\n",
+			dh_card_str(c1).c_str(), dh_card_str(c2).c_str(), n, top_str.c_str());
+		return;
+	}
+
+	bool is_miss = actual_weight < uniform_weight;
+	std::fprintf(stderr,
+		"[DH_RANGE_MODEL] actual villain hand=%s%s weight=%.4f%% rank=%d/%zu "
+		"(uniform=%.4f%%) -- %s. Top expected:%s\n",
+		dh_card_str(c1).c_str(), dh_card_str(c2).c_str(), actual_weight * 100.0, rank, n,
+		uniform_weight * 100.0,
+		is_miss ? "RANGE MISS (weighted BELOW a uniform random guess)" : "within expected range",
+		top_str.c_str());
+}
+
 int committed_this_street(int slot) {
 	return g.stack_at_street_start[slot] - g.stack[slot];
 }
@@ -1125,6 +1202,18 @@ void getdecision(char* out_buf) {
 	}
 	apply_own_action(action);
 	std::strncpy(out_buf, action.c_str(), 19);
+}
+
+// Optional, purely-additive 5th ABI function: report villain's true
+// revealed hole cards (card ids in this file's suit*13+rank convention,
+// same as restart_game()'s c1id/c2id) at hand-end, for comparison against
+// this run's own tracked villain_range belief. See dh_log_actual_hand()
+// above for exactly what gets printed and why. Never affects any decision,
+// narrowing update, or returned action -- read-only diagnostic logging
+// only. Existing callers that don't call this (e.g. any other driver still
+// using just the original 4 functions) are completely unaffected.
+void report_actual_hand(int c1id, int c2id) {
+	dh_log_actual_hand((unsigned char)c1id, (unsigned char)c2id);
 }
 
 } // extern "C"

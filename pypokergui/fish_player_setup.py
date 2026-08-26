@@ -128,3 +128,17 @@ class FishPlayer():  # Do not forget to make parent class as "BasePokerPlayer"
         # print('round_state:', round_state)
         pass
 
+    def report_actual_hand(self, c1id, c2id):
+        '''Optional diagnostic: report villain's real revealed hole cards
+        (available at hand-end -- Slumbot includes "bot_hole_cards" in the
+        terminal response of every hand, win/lose/fold) so the native
+        library can compare them against its own tracked villain_range
+        belief and print a [DH_RANGE_MODEL] "RANGE MISS" line to stderr
+        whenever the actual hand was weighted below a uniform random guess.
+        Must be called before the NEXT hand's receive_round_start_message()
+        (which resets villain_range via restart_game()). Older dylibs built
+        before this diagnostic was added won't export report_actual_hand;
+        callers should guard with hasattr(self.playsearch, ...) if mixing
+        library versions.'''
+        self.playsearch.report_actual_hand(c1id, c2id)
+

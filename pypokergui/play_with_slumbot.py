@@ -383,6 +383,21 @@ def PlayHand(token):
                     state.apply_action(incr)
             if state.is_terminal() == False:
                 raise Exception('error terminal game',state.betting_stage)
+            # Slumbot reveals the opponent's real hole cards in the
+            # terminal response of EVERY hand (win, lose, showdown, or
+            # fold) via "bot_hole_cards" -- report them to the native
+            # library so it can compare its own final villain_range belief
+            # against the actual holding and flag a [DH_RANGE_MODEL]
+            # "RANGE MISS" whenever narrowing had rated the real hand below
+            # a uniform random guess. Must happen before the next hand's
+            # receive_round_start_message() resets villain_range, so this
+            # is done here, before returning. No-op (silently skipped) if
+            # bot_hole_cards is absent or this dylib predates the
+            # diagnostic (older builds won't export report_actual_hand).
+            bot_hole_cards = r.get('bot_hole_cards')
+            if bot_hole_cards and hasattr(bot.playsearch, 'report_actual_hand'):
+                actual = [cards_dic[bot_hole_cards[0]], cards_dic[bot_hole_cards[1]]]
+                bot.report_actual_hand(actual[0], actual[1])
             print('Hand winnings: %i' % winnings)
             return (token, winnings)
 

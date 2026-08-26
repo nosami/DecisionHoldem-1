@@ -5184,3 +5184,135 @@ test dylibs (`/tmp/dh_native_ai_test.dylib`, backup at
 `/tmp/dh_native_ai.dylib.bak`) and several one-off Python/ctypes analysis
 scripts (`/tmp/find_big_losses.py`, `/tmp/compare_fix.py`, etc.) were used
 for this investigation and are not part of the repo.
+
+## 41. Adding a "did narrowing mislead us" diagnostic: comparing villain's real revealed hole cards against our tracked range belief at hand-end (`report_actual_hand`)
+
+The user asked whether we could find hands where villain wasn't actually
+holding a hand our narrowing model thought was in his range -- i.e. a
+direct, hand-by-hand audit of `villain_range`'s accuracy, not just its
+narrowing behavior (which `[DH_RANGE_MODEL]`/`DH_VERBOSE_STRATEGY`, §39,
+already logs). No existing log line answers this: the narrowing summaries
+show the model's own internal belief evolving, but never compare it
+against ground truth, because ground truth (villain's real hole cards)
+wasn't being captured at all.
+
+### What's actually available
+
+Slumbot's `/api/act` terminal response includes `bot_hole_cards` on **every**
+hand -- win, lose, showdown, or a plain fold -- confirmed directly in
+`/tmp/run.log` (e.g. hand 1: `..., 'bot_hole_cards': ['Qd', '2d'],
+'winnings': -200, ...}` on a hand that ended in a fold, not a showdown).
+`play_with_slumbot.py` already receives this in `r` but never read or used
+it before this section.
+
+### What was added
+
+1. **`PokerAI/tools/dh_native_ai.cpp`**: a new `dh_log_actual_hand(c1, c2)`
+   helper and a 5th exported ABI function, `report_actual_hand(int c1id,
+   int c2id)`, alongside the existing 4 (`restart_game`/`Next_stage`/
+   `opp_take_action`/`getdecision`). Given villain's real hole-card ids
+   (same suit*13+rank convention as `restart_game`'s own `c1id`/`c2id`),
+   it looks the exact combo up in `g.villain_range` (still populated at
+   this point -- called before the next hand's `restart_game()` resets
+   it), and prints one line:
+   ```
+   [DH_RANGE_MODEL] actual villain hand=<cards> weight=<w>% rank=<r>/<n>
+     (uniform=<1/n>%) -- <verdict>. Top expected: <top-5 combos>
+   ```
+   `<verdict>` is `within expected range` normally, or **`RANGE MISS
+   (weighted BELOW a uniform random guess)`** whenever the real combo's
+   tracked weight is below what pure ignorance (`1/n` over the `n` combos
+   still considered possible) would have assigned -- i.e. narrowing didn't
+   just fail to help, it actively pointed away from the truth. A separate
+   "NOT FOUND among N tracked combos" case is reported distinctly (not as
+   an ordinary miss) in the — should be impossible for a legal deal —
+   event that the true combo was somehow pruned out entirely, so a real
+   tracking bug would be obvious rather than look like an extreme miss.
+   Unlike `DH_VERBOSE_STRATEGY`'s other diagnostics, this line is **always**
+   printed (not gated behind an env var): it's one line per hand, and is
+   the entire point of the feature -- gating it behind an opt-in flag the
+   user has to remember to set would defeat the purpose.
+   This function is purely additive/read-only: it never changes
+   `villain_range`, any decision, or any narrowing update. Existing
+   callers using only the original 4 ABI functions are unaffected.
+
+2. **`pypokergui/fish_player_setup.py`**: `FishPlayer.report_actual_hand(c1id,
+   c2id)` -- a thin wrapper calling the new native export, documented as
+   needing to run before the next hand's `receive_round_start_message()`.
+
+3. **`pypokergui/play_with_slumbot.py`**: at the existing hand-terminal branch
+   (right before `print('Hand winnings: %i' % winnings)`), reads
+   `r.get('bot_hole_cards')`, converts it through the same `cards_dic` used
+   for hero's own hole cards, and calls `bot.report_actual_hand(...)` --
+   guarded with `hasattr(bot.playsearch, 'report_actual_hand')` so an older
+   dylib built before this change is silently skipped rather than crashing.
+
+4. **`pypokergui/analyze_range_misses.py`** (new): parses any
+   `play_with_slumbot.py` log for these lines and prints a summary --
+   count/percentage of RANGE MISS vs. within-range hands, every miss sorted
+   by how far below uniform it was, and any anomalies. Usage:
+   ```
+   python3 pypokergui/analyze_range_misses.py /tmp/run.log
+   python3 pypokergui/analyze_range_misses.py /tmp/run.log --only-misses
+   ```
+
+### Verification
+
+- Rebuilt `dh_native_ai.dylib` in place (old version backed up to
+  `/tmp/dh_native_ai.dylib.before_rangecheck.bak`); confirmed via `nm -gU`
+  that all 5 ABI symbols (the original 4 plus `report_actual_hand`) are
+  exported.
+- Ran the existing regression tests (`test_realtime_search_flop`,
+  `test_run_until_converged`) -- both still pass with the same sane
+  convergence numbers as before this change (no regressions from the
+  purely-additive function).
+- Isolated `ctypes` test: after a real preflop raise that the trained
+  blueprint could exactly match (so real Bayesian narrowing happens), a
+  reported `AcKc` ranked 8th of 1225 combos (0.14% weight, clearly
+  plausible after a raise), while a reported `7c2d` ranked dead last
+  (1225th of 1225, 0.0046% weight) and was correctly flagged `RANGE MISS`.
+- Live smoke test: `python3 pypokergui/play_with_slumbot.py --max-hands 3`
+  against the real Slumbot API produced exactly one `[DH_RANGE_MODEL]
+  actual villain hand=...` line per hand (3 for 3 hands), with real
+  hand-appropriate rankings; one of the three (`6c5c`, rank 761/1081) was
+  correctly flagged as a genuine RANGE MISS.
+  `pypokergui/analyze_range_misses.py /tmp/smoke_test.log` correctly
+  summarized this as 1/3 (33.3%) RANGE MISS.
+
+### Known caveat: stderr/stdout interleaving in combined log files
+
+As with the pre-existing `[DH_STRATEGY]`/`[DH_RANGE_MODEL]` narrowing
+lines (§39), this new line is written via C's unbuffered `stderr`, while
+`play_with_slumbot.py`'s own `print()` calls go to Python's block-buffered
+`stdout`. When both streams are merged into one file (`2>&1 | tee
+run.log`), the native line for a given hand can appear earlier in the file
+than that hand's own Python-printed transcript lines, even though it was
+logically emitted after them. This is a pre-existing, cosmetic ordering
+quirk of this codebase (already noted when investigating "lost logging"
+earlier this session) -- it does not affect correctness, and
+`analyze_range_misses.py` doesn't depend on ordering (it only pattern-
+matches the `[DH_RANGE_MODEL] actual villain hand=...` lines directly).
+
+### What this does NOT do
+
+This is a diagnostic-only addition -- it does not change any decision,
+narrowing update, or bet size, and it does not attempt to explain WHY a
+miss happened (bad luck vs. a genuine narrowing defect vs. villain
+deviating from a GTO-like distribution). That analysis is the natural next
+step once enough live-session data has accumulated with this logging in
+place; §38/§40's investigations already show most catastrophic losses this
+project has found so far were legitimate high-variance CFR outputs rather
+than narrowing failures, but this is the first tool that can directly test
+that hypothesis case-by-case against villain's true holdings instead of
+only observing narrowing's own internal behavior.
+
+### Files touched
+
+- `PokerAI/tools/dh_native_ai.cpp`: added `dh_log_actual_hand()` and the
+  new `report_actual_hand()` ABI export.
+- Rebuilt `PokerAI/dh_native_ai.dylib` (old version backed up to
+  `/tmp/dh_native_ai.dylib.before_rangecheck.bak`).
+- `pypokergui/fish_player_setup.py`: added `FishPlayer.report_actual_hand()`.
+- `pypokergui/play_with_slumbot.py`: calls it at hand-end with the real
+  `bot_hole_cards`.
+- `pypokergui/analyze_range_misses.py` (new): log-analysis companion script.
