@@ -741,11 +741,21 @@ private:
 //                  set.
 //
 // Like every resolver in this file, this performs UNSAFE (fixed-range)
-// subgame resolving: the opponent's range is a caller-supplied sample, not
-// derived from a real range-tracking blueprint (which is unavailable -- see
-// BUILD_NOTES.md). hero's range is typically just the single real hand held
-// by whichever side is "me" in the live game (see dh_native_ai.cpp), which
-// keeps N small and the resolve fast regardless of mode.
+// subgame resolving in the classical sense (no true opponent-modeling
+// search over hero's own strategy is performed -- only a range-vs-range
+// vanilla CFR resolve against whatever range the caller supplies). That
+// caller-supplied range is no longer necessarily a flat/uniform sample,
+// though: dh_native_ai.cpp tracks a persistent, full (non-fixed-size)
+// opponent-range belief across the hand (LiveGame::villain_range),
+// seeded from the real trained preflop blueprint and narrowed after each
+// observed opponent action via this same resolver's own strat_sum/
+// average_strategy() output (see run()'s external_reach parameters,
+// below, and dh_native_ai.cpp's narrow_villain_range_postflop()) -- this
+// header only provides the mechanism (an externally-seedable initial
+// reach), not the belief-tracking policy itself, which lives entirely in
+// the caller. hero's range is typically just the single real hand held by
+// whichever side is "me" in the live game, which keeps N small and the
+// resolve fast regardless of mode.
 // ---------------------------------------------------------------------------
 class LiveResolver {
 public:
@@ -777,8 +787,22 @@ public:
 		root->board = board0;
 	}
 
-	void run(int iterations) {
+	// `external_reach0`/`external_reach1`, when supplied and correctly
+	// sized, seed the hero/villain side's initial per-hand reach weights
+	// (e.g. a caller-tracked opponent-range belief) instead of the default
+	// flat 1.0-per-hand assumption. This does not change the resolver's
+	// mechanics at all -- reach weights already flow through cfr() exactly
+	// like this for every iteration -- it only changes what they start as.
+	// See dh_native_ai.cpp's LiveGame::villain_range for the caller that
+	// uses this to narrow a persistent, full (non-fixed-size) opponent
+	// range belief street-by-street, rather than treating every hand in
+	// the supplied range as equally likely.
+	void run(int iterations,
+		const std::vector<double>* external_reach0 = nullptr,
+		const std::vector<double>* external_reach1 = nullptr) {
 		std::vector<double> reach0(N, 1.0), reach1(M, 1.0);
+		if (external_reach0 && (int)external_reach0->size() == N) reach0 = *external_reach0;
+		if (external_reach1 && (int)external_reach1->size() == M) reach1 = *external_reach1;
 		for (int h = 0; h < N; h++)
 			if (collides_with_board(range_.hero[h], root->board)) reach0[h] = 0.0;
 		for (int h = 0; h < M; h++)

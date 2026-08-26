@@ -217,14 +217,22 @@ struct LookupResult {
 // BUILD_NOTES.md section 23 for the measurements and the fix (copy the
 // blueprint file to local fast storage; this header's logic did not
 // change, only where the file lives).
-inline LookupResult lookup_preflop_strategy(
-	const std::string& blueprint_path,
-	const std::vector<unsigned char>& action_path,
-	int hand_cluster)
+// Shared tree-walk: navigates from the blueprint's root down through
+// `action_path`, exactly as lookup_preflop_strategy() always has, and
+// returns the target node's raw header (all 169 clusters' averegret rows,
+// already fully read off disk as a side effect of read_node_header() --
+// see the file-level format comment above). Factored out so a lookup that
+// needs ALL clusters' strategies (lookup_preflop_strategy_all_clusters(),
+// below -- used to narrow a tracked opponent-range belief, one cluster per
+// possible opponent hand, rather than just hero's own single held cluster)
+// can share the exact same navigation code and pay the exact same one-walk
+// disk cost as a single-cluster lookup: NodeHeader::averegret already holds
+// every cluster's row for the target node regardless of which (if any) one
+// cluster the original single-cluster lookup happened to extract.
+inline NodeHeader walk_to_node(
+	std::ifstream& fin,
+	const std::vector<unsigned char>& action_path)
 {
-	std::ifstream fin(blueprint_path, std::ios::in | std::ios::binary);
-	if (!fin) throw std::runtime_error("BlueprintReader: cannot open " + blueprint_path);
-
 	const int CLUSTERS = 169;
 	NodeHeader h;
 	for (size_t step = 0; ; step++) {
@@ -244,6 +252,19 @@ inline LookupResult lookup_preflop_strategy(
 		// fin is now positioned at the start of action `idx`'s subtree --
 		// the next loop iteration reads ITS header.
 	}
+	return h;
+}
+
+inline LookupResult lookup_preflop_strategy(
+	const std::string& blueprint_path,
+	const std::vector<unsigned char>& action_path,
+	int hand_cluster)
+{
+	std::ifstream fin(blueprint_path, std::ios::in | std::ios::binary);
+	if (!fin) throw std::runtime_error("BlueprintReader: cannot open " + blueprint_path);
+
+	const int CLUSTERS = 169;
+	NodeHeader h = walk_to_node(fin, action_path);
 
 	if (hand_cluster < 0 || hand_cluster >= CLUSTERS)
 		throw std::runtime_error("BlueprintReader: hand_cluster out of range [0,169)");
@@ -261,6 +282,63 @@ inline LookupResult lookup_preflop_strategy(
 			"for every cluster it reads, as a basic sanity check on real data)");
 	for (int i = 0; i < h.action_len; i++)
 		r.probs[i] = (h.averegret[hand_cluster][i] > 0) ? (h.averegret[hand_cluster][i] / sum) : 0.0;
+	return r;
+}
+
+// The result of an "all clusters at once" lookup: same target-node action
+// bytes, but `probs[cluster][action_idx]` for EVERY one of the 169 preflop
+// hand clusters, not just one. Used to narrow a tracked, full opponent-range
+// belief (dh_native_ai.cpp's LiveGame::villain_range) against an OBSERVED
+// opponent action: each candidate opponent hole-card combo maps to one of
+// these 169 clusters (Engine::get_preflop_cluster()), and its prior weight
+// gets multiplied by that cluster's probability of taking the actually-
+// observed action -- a direct Bayesian update using the same trained
+// strategy hero's own decisions already use.
+struct AllClustersResult {
+	std::vector<unsigned char> actionstr;
+	std::vector<std::vector<double>> probs; // [cluster][action_idx], each cluster's row normalized to sum to 1
+};
+
+// Same target node, same single disk walk, as lookup_preflop_strategy() --
+// NodeHeader::averegret already contains every cluster's row (see
+// read_node_header() above), so extracting all 169 normalized rows instead
+// of just one costs the identical amount of disk I/O as a single-cluster
+// lookup. This is what makes real-time, per-action opponent-range
+// narrowing computationally tractable at all: naively calling
+// lookup_preflop_strategy() once per candidate cluster would re-walk the
+// (potentially large, per BUILD_NOTES.md section 23) tree from scratch up
+// to 169 times for a single opponent action.
+inline AllClustersResult lookup_preflop_strategy_all_clusters(
+	const std::string& blueprint_path,
+	const std::vector<unsigned char>& action_path)
+{
+	std::ifstream fin(blueprint_path, std::ios::in | std::ios::binary);
+	if (!fin) throw std::runtime_error("BlueprintReader: cannot open " + blueprint_path);
+
+	const int CLUSTERS = 169;
+	NodeHeader h = walk_to_node(fin, action_path);
+
+	AllClustersResult r;
+	r.actionstr = h.actionstr;
+	r.probs.assign(CLUSTERS, std::vector<double>(h.action_len, 0.0));
+	for (int c = 0; c < CLUSTERS; c++) {
+		double sum = 0.0;
+		for (int i = 0; i < h.action_len; i++)
+			if (h.averegret[c][i] > 0) sum += h.averegret[c][i];
+		if (sum > 0.0) {
+			for (int i = 0; i < h.action_len; i++)
+				r.probs[c][i] = (h.averegret[c][i] > 0) ? (h.averegret[c][i] / sum) : 0.0;
+		}
+		else {
+			// Same "refuse to trust a non-positive strategy sum" stance as
+			// lookup_preflop_strategy(), but per-cluster here rather than
+			// whole-call-failing: an untrained/degenerate cluster at this
+			// node shouldn't invalidate the other 168 clusters' real data,
+			// so it falls back to a uniform row (the honest "no information"
+			// prior) for that one cluster only.
+			for (int i = 0; i < h.action_len; i++) r.probs[c][i] = 1.0 / h.action_len;
+		}
+	}
 	return r;
 }
 

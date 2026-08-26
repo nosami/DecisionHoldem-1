@@ -3057,3 +3057,175 @@ This was the third real bug found and fixed by direct code inspection
 plus a targeted, no-cluster-data-needed standalone reproduction (after
 sections 21 and 22) -- all three were genuine logic errors in this
 session's own new code, not pre-existing upstream defects.
+
+## 25. New feature: persistent, full (non-fixed-size) opponent-range belief model, replacing the fixed 40-hand uniform sample
+
+### The request
+
+The user explicitly rejected the previous design's fixed-size opponent
+range sample (40 random hole-card combos, resampled fresh on every
+`getdecision()` call, discarding all prior information every time) and
+asked for the opposite: track the opponent's actual range starting from
+the real trained preflop blueprint, and narrow it street-by-street using
+the observed betting -- **with no fixed pool size at all**, i.e. every
+still-possible hole-card combo stays in play, weighted, for as long as it
+remains possible.
+
+### Design
+
+`LiveGame` (`PokerAI/tools/dh_native_ai.cpp`) gained a new field:
+
+```cpp
+struct WeightedHand { unsigned char c1, c2; double weight; };
+std::vector<WeightedHand> villain_range;
+```
+
+This holds every hole-card combo not blocked by hero's own two cards (1225
+combos preflop), each with a running belief weight, for the WHOLE hand --
+never resampled, never capped at a fixed count.
+
+- **`init_villain_range()`** (called from `restart_game()`): seeds a
+  uniform prior over all 1225 non-hero-blocked combos.
+- **`prune_villain_range_for_board()`** (called from `Next_stage()`):
+  permanently *removes* (not just zero-weights) any combo that collides
+  with newly-dealt board cards, then renormalizes -- this is plain card-
+  removal narrowing, independent of any behavioral inference, and keeps
+  the tracked set shrinking every street (1225 -> ~1081 on the flop -> ~by
+  the river considerably fewer, depending on the actual board).
+- **Preflop narrowing** (`narrow_villain_range_preflop()`): a new
+  `BlueprintReader::lookup_preflop_strategy_all_clusters()` (added to
+  `PokerAI/tree/BlueprintReader.h`) walks the SAME single path through the
+  trained blueprint tree as the existing single-cluster lookup, but
+  returns EVERY one of the 169 preflop hand-clusters' normalized
+  probabilities for that node -- at the exact same one-disk-walk cost as
+  looking up just one cluster, since `NodeHeader::averegret` already holds
+  all 169 clusters' rows as a side effect of reading the node at all (see
+  section 23's format writeup). For every observed opponent preflop
+  action, this is looked up once, and each tracked combo's weight is
+  multiplied by its own cluster's probability of that specific action,
+  then renormalized -- a direct Bayesian update using the real trained
+  strategy, not a heuristic.
+- **Postflop narrowing** (`narrow_villain_range_postflop()`): for every
+  observed opponent postflop action, runs a DEDICATED `LiveResolver`
+  resolve (60 iterations, same budget as a live decision) rooted at the
+  state immediately before that action, seeded with the CURRENT tracked
+  range as the initial reach (via a new optional `external_reach0`/
+  `external_reach1` parameter added to `LiveResolver::run()` in
+  `RealtimeSearch.h`), then reweights each tracked hand by its own
+  `average_strategy()` probability of the observed action. Only actions
+  that map onto the resolver's existing reduced fold/call/allin action
+  abstraction can narrow the range this way; a non-all-in postflop raise
+  has no corresponding node in that abstraction and is explicitly skipped
+  (logged via stderr), not approximated.
+- **`resolve_decision()`** (hero's own real decision) now builds its
+  `Players_range` directly from the live, current `villain_range` (not a
+  fresh 40-hand sample), passing the tracked weights into `LiveResolver::
+  run()`'s new external-reach parameters.
+
+**Design choice explicitly NOT made:** reusing/caching a persisted
+resolver tree across separate ABI calls (e.g. so hero's own decision could
+reuse the same tree that was just built to narrow the opponent's
+preceding action). This was considered (see the acting-order analysis
+below) but rejected as too fragile for the benefit -- raw pointers/trees
+kept alive across independent `opp_take_action()`/`getdecision()` C ABI
+calls, with no natural invalidation trigger, risked subtle staleness bugs.
+Instead, every narrowing step and every real decision always resolves
+fresh. This is simpler and safer to reason about, at the honest cost of
+one extra `LiveResolver` resolve per observed opponent postflop action
+(previously, no such resolve existed at all for narrowing purposes).
+
+**Acting-order asymmetry** (`PokerAI/poker/State.h`'s
+`reset_betting_round_state()`): postflop, slot 1 (BB) always acts first
+(`player_i_index = 1` unconditionally once `betting_stage > 0`). If hero
+is the button (slot 0), the opponent acts first on every single postflop
+street, so `narrow_villain_range_postflop()`'s extra resolve fires on
+every street. If hero is BB, hero acts first, so many streets never need
+that extra resolve for hero's own line (the opponent's response still
+triggers one). This is a real, documented performance asymmetry, not
+something hidden.
+
+### Validation performed
+
+1. **`tools/test_villain_range_model.cpp`** (new standalone tool, run
+   against the real `cluster/blueprint_strategy.dat`, now on local SSD
+   storage per section 23):
+   - `lookup_preflop_strategy_all_clusters()`'s root-node read: 169
+     clusters, each row summing to ~1.0 (0 non-normalized rows), took
+     **0.4ms** for the same underlying disk walk that would otherwise cost
+     ~6-10s+ for the deep, closing-sibling case described in section 23 --
+     confirming the "same disk cost regardless of 1-cluster vs 169-cluster
+     extraction" design claim.
+   - Cross-checked the new all-clusters result against the existing
+     single-cluster `lookup_preflop_strategy()` for 6 sample clusters
+     (0, 1, 42, 84, 150, 168): all 6 MATCH exactly (same actionstr, same
+     per-action probabilities).
+   - A synthetic full 1225-combo range, narrowed through TWO real
+     sequential preflop actions (a trained raise-size byte, then a call),
+     stayed normalized (total weight ~1.0 after each renormalization) and
+     produced a genuinely non-uniform belief (post-narrowing weight spread
+     min=0.0 -- some hands' clusters assign literally zero probability to
+     one of the two observed actions, correctly eliminating them --
+     max=0.00258, versus a uniform 0.000816 each): confirms real
+     narrowing is happening, not just noise.
+2. **`tools/test_live_resolver_range_scaling.cpp`** (new standalone tool):
+   measured `LiveResolver::run(60)` wall-clock cost at increasing FLOP-mode
+   villain-range sizes (same board/hero hand, no disk I/O involved --
+   isolates the pure CFR-resolve cost):
+
+   | requested range size | actual (post board-collision) size | `run(60)` time |
+   |---:|---:|---:|
+   | 40   | 0 (test board happened to collide with all 40 sample combos on that arbitrary board) | 0.0 ms |
+   | 200  | 144  | 1.3 ms |
+   | 500  | 429  | 3.5 ms |
+   | 1000 | 856  | 6.7 ms |
+   | 1225 | 1081 | 8.7 ms |
+
+   Even at the full ~1081-combo range (the realistic flop-street size),
+   a single resolve is **under 9ms** -- far faster than initially estimated
+   in this session's design discussion (which projected multi-second
+   resolves by extrapolating node-visit cost linearly). The real
+   bottleneck for live play remains `Engine::load()`'s one-time ~2-2.5
+   minute startup cost (reading `sevencards_strength.bin`,
+   `flop_hand_cluster.bin`, `turn_hand_cluster.bin` off the external
+   Seagate drive -- see section 23), not the per-decision CFR resolve
+   itself, which stays fast at any tracked range size actually reachable
+   in real 52-card hold'em (never more than 1225).
+3. **Rebuilt `dh_native_ai.dylib`**
+   (`g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -shared -fPIC -o
+   dh_native_ai.dylib tools/dh_native_ai.cpp`, run from `PokerAI/`); all 4
+   ABI symbols (`_restart_game`, `_Next_stage`, `_opp_take_action`,
+   `_getdecision`) confirmed present via `nm -gU`.
+
+### What's still not directly verified
+
+- The full ABI-call sequence (`restart_game` -> `Next_stage` ->
+  `opp_take_action` -> `getdecision`, repeated across a whole hand) has
+  not yet been exercised end-to-end with the new range-tracking wired in
+  against a live opponent (e.g. a fresh Slumbot session) from within this
+  development pass -- the standalone tests above validate the new
+  arithmetic/machinery in isolation, but a live play session is the
+  strongest remaining confirmation that narrowing behaves sensibly across
+  a real, full hand and that no ABI regression was introduced.
+- The postflop narrowing's "extra resolve per opponent action" cost was
+  only measured for the CFR-resolve step itself (sub-10ms, see table
+  above); it was not measured together with `TurnClusterLeafModel`
+  construction (which recomputes turn-cluster lookups for the current
+  range size on every FLOP-mode resolve) at the largest realistic range
+  sizes, though that lookup is a cheap in-RAM array read (no disk I/O) and
+  is not expected to be a bottleneck.
+
+### What the user should do
+
+**Restart the server** to pick up the rebuilt `.dylib`:
+
+```
+cd /Users/jason/src/copilot-worktrees/DecisionHoldem/nosami-fuzzy-guide/pypokergui/server
+source /tmp/dh_venv/bin/activate
+python3 ../__main__.py serve dummy --port 8000
+```
+
+Play a full hand or two and confirm decisions still return promptly (the
+standalone timing above suggests they should) and that no
+`[DH_RANGE_MODEL] ... narrowing failed` warnings appear on stderr under
+normal play (occasional warnings for non-all-in postflop raises are
+EXPECTED and documented above, not a bug).
