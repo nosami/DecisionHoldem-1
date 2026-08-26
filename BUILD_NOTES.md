@@ -3665,3 +3665,58 @@ server process loaded the OLD `dh_native_ai.dylib` at its own startup and
 has not been restarted as part of this work (per the established rule not
 to restart it without being asked). None of this section's fixes take
 effect until the user manually restarts that server process.
+
+## 29. Future work: a `RiverClusterLeafModel` could fix TURN's cost problem, but this host's RAM makes it currently impossible
+
+**The idea, confirmed correct.** Section 28 explained why TURN mode is
+~30-90x more expensive per CFR iteration than FLOP/RIVER: FLOP stops
+solving the instant flop betting closes and reads a value off
+`TurnClusterLeafModel` (comparing precomputed `get_turn_cluster()` ids,
+averaged over untaken turn cards) instead of dealing/enumerating a real
+card. TURN has no equivalent shortcut for its own next street — it must
+deal a real river card via a genuine chance node (~48 branches) and value
+every branch at an exact showdown.
+
+`poker/Engine.h`'s `get_river_cluster()` — part of the ORIGINAL,
+pre-existing codebase, not something added this project — is structurally
+identical to `get_turn_cluster()`: a hand-strength bucket lookup, one
+street later. It's already used elsewhere in the original code for
+exactly this kind of comparison (`tree/Exploitability.h`'s offline
+`getnode_cfv_river()`, `tree/Bulid_Tree.h`'s tree building,
+`poker/State.h`'s showdown logic). A `RiverClusterLeafModel` mirroring
+`TurnClusterLeafModel` — letting TURN mode stop the instant turn betting
+closes and estimate continuation value from river-cluster-id comparisons
+averaged over untaken river cards, instead of an exact chance-node
+expansion — would give TURN the same kind of cheap-leaf shortcut FLOP
+already has, directly attacking its per-iteration cost problem (the
+actual bottleneck; section 28 measured `exploitability()`'s own overhead
+as negligible, 0.3-1.6% of total time, so this cost lives entirely in the
+CFR tree walk itself).
+
+**Why it wasn't built, and can't be on this host.** `get_river_cluster()`
+requires `river_hand_cluster.bin` fully loaded into RAM first —
+`Engine.h` allocates `river_cluster[2652]`, each holding
+`river_community_total = 2,118,760` entries of an `unsigned` key (4
+bytes) + `unsigned short` value (2 bytes):
+`2652 * 2118760 * 6 bytes ≈ 16.86GB`. This machine has **16GB total
+physical RAM** (confirmed via `sysctl hw.memsize`; ~1.4GB free at
+measurement time) — the structure alone exceeds total system RAM, not
+just what's free. This is the actual, concrete reason
+`DH_SKIP_RIVER_CLUSTER` is threaded through every tool in this project
+and why `dh_native_ai.cpp`/`RealtimeSearch.h` never call
+`get_river_cluster()`: it is not a matter of cost or convenience on this
+host, it is a hard capacity wall.
+
+**If revisited on a higher-RAM host (~20GB+ free strongly recommended,
+given the OS/other processes also need headroom beyond the raw 16.86GB
+structure):** the implementation would closely mirror
+`TurnClusterLeafModel` (`RealtimeSearch.h`) — precompute each range hand's
+`get_river_cluster()` id against every possible untaken river card once,
+then compare ids at the leaf exactly as `expected_showdown_sign()` already
+does (same polarity convention: LOWER cluster id = stronger hand, per the
+section 22 bugfix). The one-time `river_hand_cluster.bin` load (paid once
+at process startup, not per-decision) would need to be benchmarked
+separately, but per-decision TURN cost should then drop close to FLOP's,
+since it stops at the same kind of table lookup instead of a full
+chance-node expansion. Not implemented here — purely a design note for
+future work on suitable hardware.
