@@ -61,6 +61,11 @@ inline uint64_t checked_mul(uint64_t a, uint64_t b, const char* what) {
 
 class File {
 public:
+	struct Identity {
+		dev_t device;
+		ino_t inode;
+	};
+
 	explicit File(const std::string& path, int flags = O_RDONLY) : fd_(::open(path.c_str(), flags, 0644)), path_(path) {
 		if (fd_ < 0) throw std::runtime_error("IndexedBlueprint: cannot open " + path + ": " + std::strerror(errno));
 	}
@@ -91,6 +96,13 @@ public:
 
 	int fd() const { return fd_; }
 
+	Identity identity() const {
+		struct stat st;
+		if (::fstat(fd_, &st) != 0)
+			throw std::runtime_error("IndexedBlueprint: fstat failed for " + path_ + ": " + std::strerror(errno));
+		return {st.st_dev, st.st_ino};
+	}
+
 private:
 	int fd_;
 	std::string path_;
@@ -105,6 +117,14 @@ inline uint64_t fnv_update(uint64_t h, const void* data, size_t len) {
 	return h;
 }
 
+// This deliberately hashes five stable 4 KiB samples rather than all 16.1 GB,
+// so opening the reader remains a millisecond-scale operation. It is a strong
+// accidental wrong/stale-file check when combined with exact size and indexed
+// topology validation, not a cryptographic integrity proof: same-size policy
+// corruption outside these samples is not detected until it causes a checked
+// node header/action/value failure. The runtime assumes trusted local artifact
+// storage; deployments needing adversarial-tamper detection must verify a
+// separately distributed whole-file digest before starting the process.
 inline uint64_t source_fingerprint(const File& file, uint64_t source_size) {
 	uint64_t h = 1469598103934665603ULL;
 	unsigned char encoded[8];
@@ -155,6 +175,7 @@ public:
 	explicit Builder(const std::string& source_path) : source_(source_path), source_size_(source_.size()) {}
 
 	Stats build(const std::string& index_path) {
+		refuse_source_output(index_path);
 		entries_.clear();
 		actions_.clear();
 		children_.clear();
@@ -237,6 +258,7 @@ private:
 	}
 
 	void write_atomic(const std::string& path) {
+		refuse_source_output(path);
 		std::vector<unsigned char> body;
 		body.reserve(entries_.size() * ENTRY_SIZE + actions_.size() + children_.size() * 4);
 		for (const Entry& e : entries_) {
@@ -277,6 +299,9 @@ private:
 			if (::fsync(fd) != 0) throw std::runtime_error("IndexedBlueprint: fsync failed: " + std::string(std::strerror(errno)));
 			if (::close(fd) != 0) { fd = -1; throw std::runtime_error("IndexedBlueprint: close failed"); }
 			fd = -1;
+			// Re-check immediately before replacement in case the destination
+			// appeared or changed while the index body was being written.
+			refuse_source_output(path);
 			if (::rename(temp.c_str(), path.c_str()) != 0)
 				throw std::runtime_error("IndexedBlueprint: rename failed: " + std::string(std::strerror(errno)));
 		} catch (...) {
@@ -284,6 +309,20 @@ private:
 			::unlink(temp.c_str());
 			throw;
 		}
+	}
+
+	void refuse_source_output(const std::string& path) const {
+		struct stat destination;
+		if (::stat(path.c_str(), &destination) != 0) {
+			if (errno == ENOENT) return;
+			throw std::runtime_error("IndexedBlueprint: cannot inspect index output " +
+				path + ": " + std::strerror(errno));
+		}
+		File::Identity source_identity = source_.identity();
+		if (destination.st_dev == source_identity.device &&
+			destination.st_ino == source_identity.inode)
+			throw std::runtime_error(
+				"IndexedBlueprint: refusing index output that resolves to the blueprint source");
 	}
 
 	static void write_all(int fd, const void* src, size_t len) {

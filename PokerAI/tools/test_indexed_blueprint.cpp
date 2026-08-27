@@ -62,6 +62,20 @@ int main() {
 	assert(built.terminals == 2);
 	assert(built.max_depth == 3);
 
+	const uint64_t source_size_before_guards = IndexedBlueprint::File(source).size();
+	assert(throws([&] { builder.build(source); }));
+	assert(IndexedBlueprint::File(source).size() == source_size_before_guards);
+	const std::string hardlink_output = temp_path(".hardlink");
+	assert(::link(source.c_str(), hardlink_output.c_str()) == 0);
+	assert(throws([&] { builder.build(hardlink_output); }));
+	assert(IndexedBlueprint::File(source).size() == source_size_before_guards);
+	std::remove(hardlink_output.c_str());
+	const std::string symlink_output = temp_path(".symlink");
+	assert(::symlink(source.c_str(), symlink_output.c_str()) == 0);
+	assert(throws([&] { builder.build(symlink_output); }));
+	assert(IndexedBlueprint::File(source).size() == source_size_before_guards);
+	std::remove(symlink_output.c_str());
+
 	IndexedBlueprint::Reader reader(source, index, 64 * 1024);
 	assert(reader.root() == 0);
 	assert(reader.actions(0) == std::vector<unsigned char>({'l', 2}));

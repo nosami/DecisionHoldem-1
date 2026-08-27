@@ -6400,7 +6400,22 @@ sidecar containing decision-node source offsets, action bytes, and
 chance-collapsed child links. The sidecar is portable little-endian,
 versioned, checksummed, tied to the source by exact size plus a stable
 five-region sampled hash, bounds-checked, and written by atomic
-temp-file rename.
+temp-file rename. The builder refuses an output path that resolves to
+the blueprint source's device/inode, checked both before scanning and
+immediately before rename; this includes the same pathname, symlinks,
+and hardlinks and prevents accidentally replacing the 16.1 GB source.
+
+The sampled source fingerprint is intentionally not a cryptographic
+whole-file integrity check. It reads 20 KiB so normal runtime startup
+does not hash 16.1 GB: exact size, sampled content, sidecar checksum,
+and indexed topology catch ordinary wrong/stale-file mistakes, while
+node headers/actions and numeric values are checked when accessed.
+Same-size policy-byte corruption outside the sampled regions may remain
+undetected. This is acceptable for the intended trusted, local,
+read-only artifact; environments concerned about malicious or latent
+storage corruption should verify a separately published whole-file
+digest before launching. The implementation does not claim per-node
+policy-payload integrity.
 
 Build an index from `PokerAI/`:
 
