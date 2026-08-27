@@ -103,6 +103,7 @@
 #include "../tree/PreflopCache.h"
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <random>
 #include <algorithm>
@@ -484,6 +485,26 @@ int match_raise_action_byte(int total_pot_before, int last_bigbet_before, int my
 	return -1;
 }
 
+// Postflop opponent raises are essentially continuous-sized in real play
+// (Slumbot, unlike the trained preflop blueprint's discrete abstraction,
+// does not restrict itself to this engine's own raise-byte sizes), so
+// there is no EXACT match to look for the way match_raise_action_byte()
+// does for preflop. Instead pick whichever of narrow_villain_range_
+// postflop()'s two available buckets (byte 1 = 0.5x pot, byte 2 = 1x pot --
+// BUILD_NOTES.md section 51) the observed raise's real chip size is
+// numerically closer to, using the exact same pot-fraction formula
+// State.h's take_action() uses for both bytes. This directly replaces the
+// old "every non-all-in raise maps to byte 2" behavior, which was measured
+// (section 51) to mismatch the majority (~85%) of Slumbot's real postflop
+// raises, most of which fall well under 1x pot (median ~0.67x pot).
+unsigned char match_postflop_raise_bucket(int pot, int bet_increment) {
+	int half_pot_size = pot * 1 / 200 * 100;   // byte 1: 0.5x pot
+	int full_pot_size = pot * 2 / 200 * 100;   // byte 2: 1.0x pot
+	int diff_half = std::abs(bet_increment - half_pot_size);
+	int diff_full = std::abs(bet_increment - full_pot_size);
+	return (diff_half <= diff_full) ? (unsigned char)1 : (unsigned char)2;
+}
+
 // ---------------------------------------------------------------------------
 // Persistent, full opponent-range belief tracking (LiveGame::villain_range).
 //
@@ -807,13 +828,16 @@ void run_until_converged(LiveResolver& resolver, LiveResolver::Mode mode,
 // re-resolves fresh, at real cost -- documented, not hidden).
 //
 // `observed_byte` must be one of the LiveResolver reduced action set ('d'
-// fold, 'l' call/check, 'n' allin) -- an opponent's non-all-in postflop
-// raise has no corresponding node in this reduced abstraction, so it can't
-// be used to narrow the range; callers pass any other byte (e.g. '?') to
-// make that skip explicit and logged rather than silently ignored.
+// fold, 'l' call/check, 'n' allin, 1 = 0.5x-pot raise bucket, 2 = 1x-pot
+// raise bucket -- see BUILD_NOTES.md section 51 for why two size buckets
+// now exist here instead of one) -- an opponent's non-all-in postflop
+// raise otherwise has no corresponding node in this reduced abstraction, so
+// it can't be used to narrow the range; callers pass any other byte (e.g.
+// '?') to make that skip explicit and logged rather than silently ignored.
 void narrow_villain_range_postflop(int opp_slot, unsigned char observed_byte) {
 	if (g.villain_range.empty()) return;
-	if (observed_byte != 'd' && observed_byte != 'l' && observed_byte != 2 && observed_byte != 'n') {
+	if (observed_byte != 'd' && observed_byte != 'l' && observed_byte != 1 &&
+		observed_byte != 2 && observed_byte != 'n') {
 		std::fprintf(stderr,
 			"[DH_RANGE_MODEL] postflop villain-range narrowing skipped: action byte %d "
 			"has no node in this resolver's action abstraction -- range left unchanged "
@@ -883,8 +907,25 @@ void narrow_villain_range_postflop(int opp_slot, unsigned char observed_byte) {
 		// *conditioned on* has changed.
 		run_until_converged(resolver, mode, nullptr, nullptr);
 		int idx = -1;
+		unsigned char resolved_byte = observed_byte;
 		for (size_t i = 0; i < resolver.root->actions.size(); i++)
 			if (resolver.root->actions[i] == observed_byte) { idx = (int)i; break; }
+		if (idx < 0 && observed_byte == 1) {
+			// Byte 1 (0.5x-pot bucket) has a stricter min-raise legality
+			// gate than byte 2 (State.h's legal_actions(): byte 1 requires
+			// the preceding bet to itself have been <=0.5x pot; byte 2's
+			// gate is looser, <=1x pot) -- so it's possible for the
+			// bet-size-matcher (opp_take_action()) to pick bucket 1 as the
+			// nearer size match while this exact node only actually offers
+			// bucket 2 (e.g., hero's own preceding bet was itself already
+			// large). Fall back to bucket 2 rather than discarding this
+			// narrowing update entirely -- still strictly better than the
+			// pre-section-51 behavior (which only ever had bucket 2
+			// available at all), and avoids silently no-op'ing an update
+			// whenever the stricter bucket's legality gate isn't met.
+			for (size_t i = 0; i < resolver.root->actions.size(); i++)
+				if (resolver.root->actions[i] == 2) { idx = (int)i; resolved_byte = 2; break; }
+		}
 		if (idx < 0)
 			throw std::runtime_error("observed action not found among this node's resolved actions");
 
@@ -900,7 +941,7 @@ void narrow_villain_range_postflop(int opp_slot, unsigned char observed_byte) {
 		for (auto& h : g.villain_range) h.weight /= sum;
 		// tracked_weights (captured above, before this update) doubles as
 		// the "before" snapshot dh_log_narrowing needs -- no extra copy.
-		dh_log_narrowing("postflop", observed_byte, tracked_weights);
+		dh_log_narrowing("postflop", resolved_byte, tracked_weights);
 	}
 	catch (const std::exception& e) {
 		std::fprintf(stderr,
@@ -1234,21 +1275,32 @@ void opp_take_action(char* actionstr_c) {
 			else g.preflop_path_confident = false; // can no longer trust the tracked path this hand
 		}
 		else if (!preflop) {
-			// Postflop: an all-in-sized raise maps to byte 'n'; any other
-			// (non-all-in) raise now maps to byte 2, a canonical 1x-pot
-			// raise bucket that narrow_villain_range_postflop() resolves
-			// with an EXTENDED action set for exactly this purpose (see
-			// its own comment and RealtimeSearch.h's LiveResolver
-			// constructor). This does not distinguish a min-raise from a
-			// 5x overbet -- both collapse onto the same single bucket,
-			// since that's the only non-all-in raise node this reduced
-			// abstraction has room for -- but it means a real, sized
-			// opponent raise now actually narrows the tracked range,
-			// instead of being silently skipped as before. See
-			// BUILD_NOTES.md for the full design writeup, including why a
-			// single bucket (not the full native ladder) was chosen.
+			// Postflop: an all-in-sized raise maps to byte 'n'. Any other
+			// (non-all-in) raise maps to whichever of the two available
+			// size buckets (byte 1 = 0.5x pot, byte 2 = 1x pot) its real
+			// chip size is numerically closer to -- narrow_villain_range_
+			// postflop() resolves with an EXTENDED action set that includes
+			// both (see its own comment and RealtimeSearch.h's LiveResolver
+			// constructor). Two buckets still can't distinguish e.g. a
+			// min-raise from a 5x overbet with full precision, but this
+			// directly replaces the old "every non-all-in raise collapses
+			// onto a single 1x-pot bucket" behavior, which BUILD_NOTES.md
+			// section 51 measured to mismatch ~85% of Slumbot's real
+			// postflop raises (median ~0.67x pot; the old single bucket
+			// systematically over-read every observed raise as a full-pot,
+			// more-polarized bet than most of them actually were). See
+			// BUILD_NOTES.md for the full design writeup, including why
+			// two buckets (not the full native ladder) was chosen.
 			bool would_be_allin = (street_relative_raise_baseline(opp) - amount) == 0;
-			narrow_villain_range_postflop(opp, would_be_allin ? (unsigned char)'n' : (unsigned char)2);
+			unsigned char byte = (unsigned char)'n';
+			if (!would_be_allin) {
+				int total_pot_before = (20000 - g.stack[0]) + (20000 - g.stack[1]);
+				int n_chips_to_call = prev_facing - committed_this_street(opp);
+				int pot = total_pot_before + n_chips_to_call;
+				int bet_increment = amount - prev_facing;
+				byte = match_postflop_raise_bucket(pot, bet_increment);
+			}
+			narrow_villain_range_postflop(opp, byte);
 		}
 		g.stack[opp] = street_relative_raise_baseline(opp) - amount;
 		g.last_raise_size = std::max(0, amount - prev_facing);

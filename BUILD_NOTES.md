@@ -6684,3 +6684,177 @@ but this has not been quantified.
   replay/probe tool (this section); not yet committed.
 - No production code (`dh_native_ai.cpp`, `RealtimeSearch.h`) changed
   this section -- investigation only.
+
+## 51. Fixed a real systemic bias: postflop villain raises of ANY size were narrowed as if always exactly pot-sized (user: "I have never beaten Slumbot over 500 hands")
+
+### Motivation
+
+The user's report -- "I have never beaten slumbot over 500 hands" -- is a
+much stronger, more persistent signal than any single session's z-test
+(z ≈ -2.6 to -2.9 across ~1335 hands, previously the headline aggregate
+stat). Every internally-focused hypothesis investigated so far (preflop-
+confidence fallback frequency, position, resolver convergence depth,
+blueprint provenance, check-raise/slowplay modeling in section 50) has
+been individually ruled out via direct evidence. This section pivots to a
+different class of bug: not "is the resolver's math correct" (repeatedly
+confirmed yes), but "does the code that FEEDS the resolver observed
+opponent actions faithfully represent what actually happened" -- a bug
+here would be invisible in any single hand's internal diagnostics (the
+resolver always converges "correctly" given whatever input byte it's
+told), yet would systematically distort belief on every single hand.
+
+### The bug
+
+`opp_take_action()`'s postflop raise-handling branch mapped **every**
+non-all-in villain raise -- a min-raise or a 5x-pot overbet, whatever the
+real chip amount -- to the exact same single byte (`2`, "canonical
+1x-pot raise") before calling `narrow_villain_range_postflop()`. This
+was a known, explicitly-commented simplification from when postflop
+narrowing was first added (the comment literally said "this does not
+distinguish a min-raise from a 5x overbet"), but its real-world magnitude
+had never been measured.
+
+**Empirical measurement** (`/tmp/analyze_bet_sizes2.py`, a script that
+copies `pypokergui/play_with_slumbot.py`'s own `ParseAction()` bookkeeping
+verbatim to correctly reconstruct pot-before/bet-increment for every
+raise event across all historical logs, separating hero's own raises from
+villain's via `client_pos`/`last_bettor`):
+
+| | n | mean | median | min | max |
+|---|---|---|---|---|---|
+| Villain (Slumbot) non-all-in raises | 6926 | 0.663x pot | 0.667x pot | 0.125x | **1.000x pot (never overbets)** |
+| Hero's own non-all-in raises | 3193 | 1.011x pot | 0.667x pot | -- | up to >3x (full ladder available) |
+
+Villain raise-size distribution: <0.4x pot 0.2%, 0.4-0.6x 31.4%,
+0.6-0.9x 53.6%, 0.9-1.15x 14.8%, above 1.15x **0%**. So **85% of every
+real Slumbot raise is below 0.9x pot**, yet 100% of them were being fed
+to the narrowing resolver as if they were exactly pot-sized -- biasing
+hero's belief (and therefore hero's own subsequent decisions, since
+`resolve_decision()` consumes the same narrowed `g.villain_range`) toward
+reading every villain raise as more polarized/stronger than a typical
+0.5-0.9x-pot raise actually implies.
+
+Two other candidate explanations were investigated and ruled out along
+the way:
+- `resolve_decision()`'s pot-fraction-to-chips conversion formula was
+  checked byte-for-byte against `State.h::take_action()` and confirmed
+  exactly correct.
+- A suspected discrepancy around raise-byte `3` (a "0.25x pot" special
+  case in `State.h::take_action()`) turned out to be dead code --
+  `State.h::legal_actions()` never actually produces byte 3; the real
+  byte set in play is exactly `{1, 2, 4, 8, 20, 40}` -> `{0.5x, 1x, 2x,
+  4x, 10x, 20x}` pot.
+- `match_raise_action_byte()` (the PREFLOP bucket-matcher) was confirmed
+  to already require an EXACT match (no silent rounding there) -- this
+  bug was postflop-only.
+
+### The fix
+
+Rather than the much more expensive "full 6-way ladder at every node"
+(previously measured at 6-75x slower per iteration, pushing convergence
+to 17-60+ seconds -- unusable live), added just ONE more already-native
+action byte to the reduced action set `narrow_villain_range_postflop()`'s
+dedicated resolver uses: byte 1 (0.5x pot), alongside the pre-existing
+byte 2 (1x pot). `State.h::legal_actions()` already legitimately offers
+byte 1 at facing-a-bet nodes (gated by `n_raises<2` for the street), so
+this is a real native action, not an invented size -- consistent with the
+codebase's existing "mirror `State.h` exactly" design philosophy.
+
+1. **`PokerAI/tree/RealtimeSearch.h`** (`LiveResolver::expand()`'s
+   reduced-action filter): now includes byte 1 in addition to byte 2 when
+   `extended_actions_` is set (used only by the dedicated villain-range-
+   narrowing resolver -- hero's own `resolve_decision()` always passes
+   `extended_actions=false` and is completely unaffected).
+2. **`PokerAI/tools/dh_native_ai.cpp`**:
+   - `narrow_villain_range_postflop()`'s validity check widened to accept
+     `observed_byte==1`.
+   - New helper `match_postflop_raise_bucket(pot, bet_increment)`: since
+     Slumbot's real raises are continuously-sized (not restricted to this
+     engine's own discrete abstraction the way the trained preflop
+     blueprint is), there's no exact match to look for the way preflop's
+     `match_raise_action_byte()` does -- instead picks whichever of the
+     two buckets (0.5x vs 1x pot, using the identical pot-fraction
+     formula `State.h::take_action()` uses) the observed raise's real
+     chip size is numerically closer to.
+   - `opp_take_action()`'s postflop raise branch now computes
+     `total_pot_before`, `n_chips_to_call` (via the already-existing
+     `prev_facing`/`committed_this_street()`), the resulting `pot`, and
+     `bet_increment = amount - prev_facing`, then calls
+     `match_postflop_raise_bucket()` instead of hardcoding byte 2.
+   - **Legality-gate fallback**: byte 1's native legality gate
+     (`last_raise <= 0.5x pot`) is stricter than byte 2's (`last_raise <=
+     1x pot`) -- e.g. if hero's own preceding bet was itself large, only
+     byte 2 remains legal even though the bucket-matcher might pick byte
+     1 as the nearer size match. Added a fallback inside
+     `narrow_villain_range_postflop()`: if byte 1 isn't found among the
+     resolved node's actions, retry with byte 2 rather than silently
+     discarding the whole narrowing update (which would have been a
+     regression vs. the old always-byte-2 behavior in exactly this edge
+     case). The narrowing-summary log now reports whichever byte was
+     actually used (`resolved_byte`, not the originally-requested one).
+
+### Build and validation
+
+```shell
+cd PokerAI
+g++ -std=c++17 -O2 -Wall -Wextra \
+    -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include \
+    -shared -fPIC -o dh_native_ai.dylib tools/dh_native_ai.cpp \
+    -L/opt/homebrew/opt/libomp/lib -lomp
+```
+
+Zero errors, one pre-existing unrelated warning (`State.h`'s unused
+`_engine` parameter). `nm -gU dh_native_ai.dylib` confirms all four ABI
+symbols still exported. Also added a tiny standalone arithmetic check of
+`match_postflop_raise_bucket()` itself (7 hand-picked pot/increment
+pairs spanning both buckets and the exact midpoint) -- all passed;
+not committed (pure arithmetic, no engine state, not worth a permanent
+tools/ file).
+
+Full regression suite re-run (all built with
+`-DDH_SKIP_RIVER_CLUSTER` for speed, as usual for these tools):
+
+| Tool | Result |
+|---|---|
+| `test_bet_size_narrowing` | PASS -- FLOP non-all-in raise narrowing now measurably updates weights (max Δ 0.0148), wall 3337.9ms; TURN wall 12493.0ms. Both marginally over the FLOP/TURN soft time caps (3000/12000ms) -- expected, since caps are checked between iterations, not preemptively, and the 5th action branch makes each iteration somewhat more expensive. Not a hang or regression -- just a slightly larger overshoot than the pre-fix 4-action config. |
+| `test_villain_weight_distribution` | PASS -- no crashes; all-in narrowing still concentrates hard (58.97x/101.07x uniform), calls narrow gently, distributions all sane. |
+| `test_resolver_exploitability` | PASS -- unaffected (this test doesn't use `extended_actions`, so its curves are identical to pre-fix). |
+| `test_jj_slowplay_cooler` | PASS, re-run end to end -- confirms the new 2-bucket action set is live at check-facing nodes (`root actions available: call raise(0.50x pot) raise(1.00x pot) allin`), no crash/NaN, same qualitative JJ-check-frequency finding as section 50. |
+| `test_qq_trips_range_miss` | PASS -- unchanged behavior (this hand's action sequence is all checks/calls, no raises, so doesn't exercise the new bucket-matching path, but confirms no regression to the check/call narrowing code shared with the raise path). |
+| `test_run_until_converged` | PASS -- FLOP/RIVER/TURN all still converge under their exploitability targets. |
+
+### Honest limitations
+
+- Two buckets (0.5x, 1x pot) still cannot perfectly represent a
+  continuous real distribution -- a 0.3x-pot min-raise and a 0.85x-pot
+  raise both round to "closest of two," same as before but with finer
+  granularity. A full native ladder would be more accurate still but was
+  already measured (section 46-ish work) to be far too slow for live
+  play within the wall-clock budget.
+- The min-raise legality-gate fallback (byte 1 requested but only byte 2
+  legal at that specific node) has not been observed in practice this
+  session -- it's a defensive correctness guard for a real edge case in
+  the game rules, not something empirically triggered/measured yet.
+- This fix has NOT yet been validated with a fresh live Slumbot match --
+  the previous fresh-prior narrowing change (section 49) was validated
+  against 3 specific flagged hands plus a 338-hand live sample; this
+  bet-size-bucket fix is a different, additive change and its real-world
+  win-rate impact is still unmeasured. Given the user's core complaint is
+  about a *persistent, every-session* losing pattern (not a handful of
+  flagged hands), a large-sample live match (several hundred+ hands) is
+  the recommended next validation step, ideally compared against the
+  pre-fix branch on a similar sample size to separate this change's
+  effect from ordinary variance.
+
+### Files changed
+
+- `PokerAI/tree/RealtimeSearch.h` -- `LiveResolver::expand()`'s reduced
+  action filter now includes byte 1 alongside byte 2 when
+  `extended_actions_` is set.
+- `PokerAI/tools/dh_native_ai.cpp` -- new `match_postflop_raise_bucket()`
+  helper; `opp_take_action()`'s postflop raise branch now calls it
+  instead of hardcoding byte 2; `narrow_villain_range_postflop()`'s
+  validity check widened to accept byte 1, with a byte-2 legality
+  fallback and corrected narrowing-summary logging (`resolved_byte`).
+- `PokerAI/dh_native_ai.dylib` -- rebuilt (not committed; gitignored
+  build artifact, regenerate with the command above).

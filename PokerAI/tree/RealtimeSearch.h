@@ -1568,13 +1568,35 @@ private:
 			// when extended_actions_ is set, OR when full_ladder_ is set and
 			// we're past the opening node (facing-a-raise/reraise): the
 			// native abstraction itself only ever offers at most this one
-			// extra size once facing a bet (State.h's cur_round_action_num
-			// in [2,4) gate), so keeping it here is a single extra branch,
-			// not a combinatorial blowup -- unlike keeping the full 6-way
-			// opening ladder at every depth, which was measured to be
-			// 6-75x slower per iteration (BUILD_NOTES.md section 37).
+			// extra pot-fraction-raise size once facing a bet via the
+			// cur_round_action_num-gated branch (State.h's
+			// cur_round_action_num in [2,4) gate), so keeping it here is a
+			// single extra branch, not a combinatorial blowup -- unlike
+			// keeping the full 6-way opening ladder at every depth, which
+			// was measured to be 6-75x slower per iteration (BUILD_NOTES.md
+			// section 37).
+			//
+			// Byte 1 ("0.5x pot" raise) is ADDITIONALLY included when
+			// extended_actions_ is set (BUILD_NOTES.md section 51): this is
+			// also a real, already-existing native action -- State.h's
+			// legal_actions() offers it any time n_raises<2 for the whole
+			// street, independent of cur_round_action_num, so it is not an
+			// invented size either. This widens narrow_villain_range_
+			// postflop()'s single "canonical 1x pot" narrowing bucket to two
+			// buckets (0.5x and 1x pot) after measuring that Slumbot's real
+			// postflop raises are heavily concentrated BELOW 1x pot (median
+			// ~0.67x pot, 85% under 0.9x pot, see BUILD_NOTES.md section 51)
+			// -- collapsing all of those onto a single "as if pot-sized"
+			// bucket was a measurable range-narrowing distortion on every
+			// hand with a villain postflop raise. Deliberately NOT added to
+			// full_ladder_'s post-opening-node branch: full_ladder_ is only
+			// used by resolve_decision() (hero's own live decision), which
+			// intentionally keeps the ORIGINAL reduced set there (this
+			// change is scoped to narrow_villain_range_postflop()'s belief
+			// update only, exactly like extended_actions_ already was).
 			for (int i = 0; i < n; i++)
 				if (buf[i] == 'd' || buf[i] == 'l' || buf[i] == 'n' ||
+					(extended_actions_ && buf[i] == 1) ||
 					((extended_actions_ || full_ladder_) && buf[i] == 2)) reduced.push_back(buf[i]);
 			node->actions = reduced;
 		}
