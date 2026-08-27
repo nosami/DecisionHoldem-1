@@ -6246,3 +6246,128 @@ model's expected value, is what's "unlucky" here), not a bug.
 - `dh_native_ai.dylib` — rebuilt with the diagnostic change (gitignored
   build artifact, not committed; rebuild with the §43 command to
   reproduce).
+
+## 48. Prototyping two alternatives to the multiplicative range-narrowing chain (research only -- no production code changed)
+
+Follow-up to §47's `Qh7s` finding. Researched how other poker engines
+handle opponent-belief tracking across streets, then built two
+standalone, non-invasive prototypes (new `tools/test_narrow_*.cpp`
+files only -- `dh_native_ai.cpp` and `RealtimeSearch.h` are byte-for-byte
+unchanged) to empirically test both ideas against the already-documented
+`Qh7s` trip-queens hand, plus the `Ac9c`/`Ad3d` hand as a sanity check
+that neither idea disturbs an already-correct result.
+
+### Literature
+
+- **DeepStack** (Moravcik et al., *Science* 2017; arXiv:1701.01724,
+  fetched and read directly) does **not** narrow an opponent-range
+  probability vector across streets at all. Direct quotes: "After each
+  action... (iii) Opponent action: no change to our range or the
+  opponent values are required," and "continual re-solving never keeps
+  track of the opponent's range, instead only keeping track of their
+  counterfactual values." It carries forward a per-opponent-hand
+  **counterfactual value** (an upper-bound EV, not a probability),
+  replaced -- never multiplied -- by the freshest re-solve's own output,
+  with Theorem 1 proving this keeps exploitability bounded regardless
+  of how the opponent actually plays.
+- **Brown & Sandholm, "Safe and Nested Subgame Solving for
+  Imperfect-Information Games"** (arXiv:1705.02955): every re-solved
+  subgame attaches a "gadget" node letting the opponent take the payoff
+  they'd have gotten under the original blueprint strategy instead --
+  bounding how much a locally-approximate re-solve can hurt you. No
+  equivalent exists in `narrow_villain_range_postflop()` today.
+- **DecisionHoldem's own paper** (arXiv:2201.11580, fetched directly)
+  is a short paper whose only stated contribution beyond Brown's
+  "Modicum" depth-limited solving is using "diverse opponents with
+  different ranges" for **off-tree leaf valuation inside one resolve**
+  -- a different problem than carrying a range across several already-
+  completed real streets. The cross-street narrowing chain in
+  `dh_native_ai.cpp` is this codebase's own addition, not something the
+  paper specifies -- free to change without contradicting it.
+
+### Prototype A -- `tools/test_narrow_epsilon_floor.cpp`
+
+Local copies of both narrowing functions (`narrow_villain_range_
+preflop_epsilon`/`_postflop_epsilon`), floored: `w *= max(p, eps)`
+instead of `w *= p`. Tested `eps=1e-3` and `eps=1e-2`.
+
+| Step | Production | eps=1e-3 | eps=1e-2 |
+|---|---|---|---|
+| final `Qh7s` weight | 0.000097% | 0.000364% | 0.001481% |
+| final `Qh7s` rank | 820/990 | 810/990 | **867/990** |
+
+**Only a modest, and non-monotonic, improvement.** Raw weight goes up
+with a bigger floor (expected), but *rank* barely moves at 1e-3 and
+actually gets *worse* at 1e-2 -- because the floor helps every other
+weak/ambiguous combo too, not just `Qh7s` specifically, and a floor on
+each of ~5 per-street factors still compounds multiplicatively across
+streets (`eps^5` for a combo that's floored every single street). This
+matches the concern raised when the option was first proposed: a floor
+bounds *per-street* damage but does not stop the *product across many
+streets* from still going very small.
+
+Sanity check (`Ac9c`/`Ad3d`, already-correct hand): final rank
+27/990 (eps=1e-3) or 109/990 (eps=1e-2), vs. production's 95/990 --
+still comfortably "not a miss" under either floor, no meaningful harm.
+
+### Prototype B -- `tools/test_narrow_cfvalue_replace.cpp`
+
+A full DeepStack-style counterfactual-value port isn't a fit for this
+codebase's architecture (no cf-value vector exists between streets at
+all, only a probability-weighted range) and is out of scope for a
+same-day prototype. Instead this tests the single most load-bearing,
+testable piece of the idea: production's `narrow_villain_range_
+postflop()` feeds the *previous street's already-narrowed* weights into
+the new street's resolver as `external_reach` (`run_until_converged(...,
+&tracked_weights, ...)`) -- meaning each street's computed action
+probabilities are conditioned on a belief that earlier streets'
+approximate resolves already distorted, so estimation error can compound
+on itself, not just genuine signal. This prototype instead always
+passes `nullptr`/`nullptr` (`LiveResolver::run()`'s own documented flat,
+undistorted default), decoupling each street's likelihood computation
+from the accumulated narrowing, while still multiplying the resulting
+per-street factors together for the tracked belief (reach probability
+along a path is still fundamentally a product).
+
+| Step | Production | Fresh-prior prototype |
+|---|---|---|
+| final `Qh7s` weight | 0.000097% | 0.000932% (~10x) |
+| final `Qh7s` rank | 820/990 | **626/990** |
+
+**A materially bigger improvement** than the epsilon floor -- moving
+`Qh7s` from the bottom ~17% up to roughly the bottom ~37% of the
+tracked range, without an explicit floor. This is evidence that at
+least part of the extreme crush comes from compounding *approximation
+error* (each street reasoning about an opponent range already distorted
+by earlier streets), not purely irreducible signal -- consistent with
+why the real safe/nested subgame-solving literature avoids exactly this
+kind of chaining.
+
+**Important caveat found in the `Ac9c` sanity check**: under this
+prototype, `Ad3d`'s final rank was still good (27/990, similar to
+production's 95/990) but its *absolute weight* dropped well below the
+uniform baseline (0.008% vs. production's 0.179%, vs. uniform 0.101%)
+-- meaning the *existing* "is_miss = weight < uniform" diagnostic
+definition would now flag this previously-correctly-modeled hand as a
+miss too, even though its relative rank is still sound. This looks like
+a side effect of the range distribution becoming more sharply peaked
+when each street's resolve isn't tempered by the previously-narrowed
+belief (a few combos capture more of the relative mass, so everything
+else's *absolute* share drops even when its *relative order* doesn't
+get worse). **This means "weight below uniform" would need
+re-calibrating as the miss criterion if this approach were ever pursued
+for real** -- rank-based or percentile-based framing looks more robust
+than an absolute-weight threshold under this scheme.
+
+### Conclusion (research only, nothing merged)
+
+Both prototypes are additive, standalone files; **no production
+narrowing code was touched**. The fresh-prior/decoupled-resolve idea
+(Prototype B) shows a substantially larger, more theoretically-grounded
+improvement on the flagged `Qh7s` hand than a simple epsilon floor
+(Prototype A), but surfaces its own new wrinkle (the miss-detection
+threshold itself would need rethinking) and, being a bigger conceptual
+change to how each street's resolve is seeded, would need the same
+exploitability-curve-style validation as §45/§46 before ever being
+considered for production -- not undertaken here. Left for the user to
+decide whether/how to proceed.
