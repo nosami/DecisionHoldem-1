@@ -515,7 +515,14 @@ def main():
             play_times += 1
             color = '\033[32m' if total_winnings > 0 else '\033[31m'  # green if profitable, red otherwise
             reset = '\033[0m'
-            print('play times: %d, total Winnings: %s%i%s' % (play_times, color, total_winnings, reset))
+            # BB/hand: big blind is 100 chips (20000-chip stacks, 50/100
+            # blinds -- see State.h/dh_native_ai.cpp's hardcoded 20000
+            # starting stack and blind sizes). This matches the BB/hand
+            # figures already used throughout BUILD_NOTES.md (e.g.
+            # total_winnings / play_times / 100).
+            bb_per_hand = (total_winnings / play_times) / 100.0
+            print('play times: %d, total Winnings: %s%i%s (%s%.2f BB/hand%s)' %
+                  (play_times, color, total_winnings, reset, color, bb_per_hand, reset))
         except ValueError as e:
             print(e)
             time.sleep(1)
