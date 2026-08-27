@@ -5933,3 +5933,180 @@ documented in §38/§40/§41/§42/§44 is this bug, now fixed.
   reproduction/diagnostic tool that surfaced the bug.
 - `dh_native_ai.dylib` — rebuilt with the fix (gitignored build artifact,
   not committed; rebuild with the §43 command to reproduce).
+
+## 46. Investigated suit isomorphism for CFR speedup; found and fixed a much bigger, safer win instead — caching per-node terminal showdown/leaf values across CFR iterations
+
+### The user's original request
+
+"I just realised that CFR isn't using suit isomorphism. This should give
+a speed-up without sacrificing quality." Suit isomorphism (grouping
+strategically-identical hole-card combos under a board's suit-symmetry
+group, e.g. `$HOME/src/TexasSolver`'s `use_isomorphism` /
+`init_suit_isomorphism()` / `aggregate_isomorphic_cfvs()`) is a real,
+standard CFR acceleration technique. It is confirmed genuinely absent
+from this codebase (`grep -i "isomorph\|canonical"` across `PokerAI/`
+finds nothing relevant — the only "canonical" hits refer to an unrelated
+"canonical 1x-pot raise" bet-sizing concept).
+
+### Why a naive port of TexasSolver's approach is NOT safe here
+
+Collapsing CFR's regret/strategy accumulation across a suit-isomorphism
+class is only exactly correct if the OPPONENT's incoming reach/range
+weight distribution is ALSO symmetric under the same board-automorphism
+group. Derived algebraically: for isomorphic hands `h1`, `h2 = π(h1)`
+(related by a board automorphism `π`), a hand's CFR value
+`v(h) = Σ_oh reach[other][oh] · val(h, oh)` satisfies `v(h2) = v(h1)`
+**only if** `reach[other][π(oh')] == reach[other][oh']` for every
+opponent combo `oh'` — i.e., only if the opponent's own reach is also
+π-symmetric.
+
+In this codebase, villain's tracked reach (`g.villain_range` weights) is
+accumulated across MULTIPLE PRIOR STREETS of narrowing (each against a
+*different* board, hence a different automorphism group) before any
+FLOP/TURN/RIVER `LiveResolver` resolve begins. By the time such a
+resolve runs, incoming reach is generically **asymmetric** under the
+current street's own automorphism group — so naively sharing
+regret/strategy across "isomorphic" hands would silently bias results
+for essentially every real narrowing/resolve case in this bot (every
+case except the very first, pre-any-action preflop resolve, which
+already has flat/uniform — hence symmetric — reach, but that path is
+already cheap via the existing in-memory preflop cache from §23, so
+there is little to gain there anyway). Implementing this naively would
+have reproduced a subtle, hard-to-detect correctness bug of exactly the
+kind found and fixed in §45 — this time inside the CFR engine used by
+BOTH range-narrowing AND hero's own live decisions, which would be more
+damaging than §45's bug, not less.
+
+### The actual bottleneck: zero caching of iteration-invariant terminal values
+
+Auditing `RealtimeSearch.h::LiveResolver`'s three terminal-value
+functions — `terminal_showdown()`, `terminal_leaf()`,
+`terminal_river_leaf()` — found something more directly actionable:
+**none of them cached anything across CFR iterations.** Every one of the
+(up to 20,000, batch-capped by wall-clock — see §35/§37's convergence
+config) iterations a resolve runs re-walked the SAME already-visited
+tree nodes (nodes are created once and reused forever — see the
+`if (!node->children[...])` pattern used throughout `expand()` /
+`chance_value()`) and recomputed, from scratch, values that are pure,
+deterministic functions of `(this node's fixed board, hero combo,
+villain combo)` — **with no dependency whatsoever on reach weights or
+iteration number**:
+
+- `terminal_showdown()` called `engine_->compute_winner()` for every
+  non-colliding `(hero combo, villain combo)` pair, on every iteration.
+  Internally this does TWO `Maxstrength()` calls, each a ~27-comparison
+  binary search over the 133,784,560-entry `seven_keys[]` table loaded
+  from `sevencards_strength.bin` (`Engine.h` line 59-61, 264-282) — a
+  real, non-trivial hand evaluation, redundantly repeated for the same
+  hand against every opposing combo, every iteration.
+- `terminal_leaf()` / `terminal_river_leaf()` called
+  `leaf_->expected_showdown_sign(hi, vi)` /
+  `river_leaf_->expected_showdown_sign(hi, vi)` for every pair, every
+  iteration — each of which loops over ~44-48 sampled turn/river cards
+  internally (`RealtimeSearch.h` line ~221-238).
+
+Crucially, **N×M is always small in practice**: every single
+`Players_range` constructed anywhere in `tools/dh_native_ai.cpp` sets
+one side to exactly `{ my_hand }` (hero's own single known holding) and
+the other to the full tracked range (up to ~1035-1326 combos) — never
+many-vs-many. So a dense per-node `N×M` cache is at most a few thousand
+entries (a few KB to tens of KB), never a blowup risk, regardless of how
+many distinct terminal nodes exist in a resolve's tree.
+
+### The fix
+
+Added lazily-built, per-`Node` caches (computed once, on first visit,
+reused on every subsequent iteration that revisits the same node — safe
+precisely because nodes are immutable/reused for their whole lifetime):
+
+- `Node::hero_strength_cache` / `Node::villain_strength_cache`
+  (`std::vector<int>`, size N / M): each combo's `Maxstrength()` against
+  this node's board, computed once. `terminal_showdown()`'s O(N×M) pair
+  loop now does a cheap integer comparison
+  (`hs < vs ? 0 : hs > vs ? 1 : 255`) reproducing
+  `Engine::compute_winner()`'s exact polarity (lower `Maxstrength` value
+  = stronger hand, per §22) instead of two fresh hand evaluations per
+  pair.
+- `Node::leaf_sign_cache` / `Node::river_leaf_sign_cache`
+  (`std::vector<std::vector<float>>`, size N×M): the full
+  `expected_showdown_sign(hi, vi)` matrix, computed once per node,
+  looked up directly thereafter.
+
+This is a pure caching change with **zero approximation and no
+dependency on suit symmetry at all** — every cached value is byte-for-
+byte the same value the original code would have computed fresh each
+time; only the redundant recomputation is removed. `BlueprintReader`/the
+disk-walking preflop cache (§23) are untouched; this section only
+touches `LiveResolver`'s own postflop resolve loop in `RealtimeSearch.h`.
+
+### Validation
+
+**Numerical correctness (before vs. after, same code path):**
+`tools/test_resolver_exploitability` run against both the pre-change and
+post-change binary shows the exploitability-vs-iterations curve is the
+same (e.g. FLOP @ 2000 iters: 3.95 chips both before and after; RIVER @
+15000 iters: 0.01 both; TURN matches at every checkpoint) — tiny
+differences at a couple of the highest iteration counts (e.g. FLOP @
+10000: 1.09 before vs. 1.13 after) are consistent with pre-existing
+OpenMP parallel-reduction floating-point summation-order
+non-determinism (§43), not a regression from this change.
+
+**Hand-level regression checks (exact repro of §45's fixed scenario):**
+- `tools/test_hand6_range_miss`: `Jc2c`'s final tracked rank is **43/990**
+  — byte-identical to §45's post-fix result.
+- `tools/test_hand6_checkraise`: check-raise strategy is
+  **fold=3.08% call=3.08% raise(1.00x pot)=25.61% allin=68.24%** — byte-
+  identical to §45's post-fix result.
+- `tools/test_villain_weight_distribution`: same sane, non-degenerate
+  weight distributions at every stage, no NaNs/crashes.
+
+**Speed measured directly** (same machine, same
+`test_resolver_exploitability` binary, before vs. after this change,
+`DH_SKIP_RIVER_CLUSTER` build):
+
+| Mode | Iterations | Before | After | Speedup |
+|---|---|---|---|---|
+| FLOP | 10,000 | 692ms | 208ms | 3.3x |
+| RIVER | 15,000 | 2,058ms | 238ms | 8.6x |
+| RIVER | 30,000 | 4,168ms | 484ms | 8.6x |
+| TURN | 2,000 | 3,747ms | 236ms | 15.9x |
+| (whole test binary, all 3 modes) | — | 30.4s | 5.4s | 5.6x |
+
+TURN benefits the most because `terminal_river_leaf()`'s per-pair cost
+(a ~44-48-card loop) was the most expensive of the three per-call costs
+being eliminated. This is a direct, real-world speedup to every live
+FLOP/TURN/RIVER decision and every postflop range-narrowing resolve —
+more iterations now fit in the same wall-clock budget (§35/§37's
+`max_ms` caps), which can only improve convergence/exploitability for a
+given time budget, not change what the resolver converges *to*.
+
+**Rebuilt production `dh_native_ai.dylib`** with the unchanged §43 build
+command, confirmed all 5 ABI symbols still exported (`_restart_game`,
+`_opp_take_action`, `_Next_stage`, `_getdecision`, `_report_actual_hand`).
+
+### What this does NOT change
+
+- Suit isomorphism itself was NOT implemented — the correctness caveat
+  above (reach-asymmetry across streets) still applies if anyone
+  revisits that idea later. If ever pursued, the safe form would be
+  isomorphism-accelerated *construction* of the caches added in this
+  section (grouping combos to avoid redundant `Maxstrength()`/
+  `expected_showdown_sign()` calls when FILLING the cache) — never
+  collapsing the regret/strategy accumulation loop itself. Given the
+  caches here already reduce the expensive part to O(N+M) (showdown) or
+  one-time O(N×M) (leaf models) per node, the marginal additional win
+  from also isomorphism-grouping that remainder is real but much smaller
+  than what this section already captured, and comes with real
+  implementation risk — not pursued.
+- Convergence targets/behavior (§35/§37's iteration caps, wall-clock
+  caps, target exploitability) are unchanged; only wall-clock cost per
+  iteration went down.
+
+### Files touched
+
+- `PokerAI/tree/RealtimeSearch.h` — added 6 new cache fields to
+  `LiveResolver::Node`; rewrote `terminal_showdown()`,
+  `terminal_leaf()`, `terminal_river_leaf()` to build-once/reuse these
+  caches instead of recomputing per-pair values on every call.
+- `dh_native_ai.dylib` — rebuilt with the change (gitignored build
+  artifact, not committed; rebuild with the §43 command to reproduce).

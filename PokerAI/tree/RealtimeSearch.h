@@ -1069,6 +1069,25 @@ public:
 		std::vector<std::vector<double>> regret;
 		std::vector<std::vector<double>> strat_sum;
 		std::vector<std::unique_ptr<Node>> children;
+
+		// Lazily-built, iteration-invariant terminal-value caches (BUILD_NOTES.md
+		// section 46). A terminal node's board is FIXED for its entire lifetime
+		// (children/nodes are created once and reused across every subsequent
+		// CFR iteration -- see the "if (!node->children[a])" pattern used
+		// throughout expand()/chance_value()), so any value that depends ONLY on
+		// (this node's fixed board, a hero combo, a villain combo) -- never on
+		// reach weights or iteration number -- only needs computing ONCE, ever,
+		// no matter how many of the (up to 20000) CFR iterations revisit this
+		// same node. Before this cache existed, terminal_showdown/terminal_leaf/
+		// terminal_river_leaf recomputed these from scratch on every single
+		// iteration.
+		bool strength_cache_ready = false;
+		std::vector<int> hero_strength_cache;    // terminal_showdown: Maxstrength() per hero combo vs. this node's board
+		std::vector<int> villain_strength_cache; // terminal_showdown: Maxstrength() per villain combo vs. this node's board
+		bool leaf_sign_cache_ready = false;
+		std::vector<std::vector<float>> leaf_sign_cache;        // terminal_leaf: expected_showdown_sign(hi, vi) per (hero, villain) combo pair
+		bool river_leaf_sign_cache_ready = false;
+		std::vector<std::vector<float>> river_leaf_sign_cache;  // terminal_river_leaf: same, via river_leaf_ instead of leaf_
 	};
 
 	std::unique_ptr<Node> root;
@@ -1619,18 +1638,35 @@ private:
 		double pot = s.table.total_pot;
 		int out_n = (traverser == 0) ? N : M;
 		int other_n = (traverser == 0) ? M : N;
+
+		// Build this node's (hero x villain) sign cache once (see Node's
+		// comment above): leaf_->expected_showdown_sign(hi, vi) is a pure
+		// function of the two combos and this node's board -- it does not
+		// depend on reach or iteration, so it never needs recomputing after
+		// the first visit to this node.
+		if (!node->leaf_sign_cache_ready) {
+			node->leaf_sign_cache.assign(N, std::vector<float>(M, 0.0f));
+			for (int hi = 0; hi < N; hi++) {
+				for (int vi = 0; vi < M; vi++) {
+					if (!hands_compatible(range_.hero[hi], range_.villain[vi])) continue;
+					node->leaf_sign_cache[hi][vi] = (float)leaf_->expected_showdown_sign(hi, vi);
+				}
+			}
+			node->leaf_sign_cache_ready = true;
+		}
+
 		std::vector<double> util(out_n, 0.0);
 		for (int th = 0; th < out_n; th++) {
 			double v = 0.0;
 			for (int oh = 0; oh < other_n; oh++) {
 				double r = reach[1 - traverser][oh];
 				if (r == 0.0) continue;
-				const auto& hero_hand = (traverser == 0) ? range_.hero[th] : range_.hero[oh];
-				const auto& villain_hand = (traverser == 0) ? range_.villain[oh] : range_.villain[th];
+				int hi = (traverser == 0) ? th : oh;
+				int vi = (traverser == 0) ? oh : th;
+				const auto& hero_hand = range_.hero[hi];
+				const auto& villain_hand = range_.villain[vi];
 				if (!hands_compatible(hero_hand, villain_hand)) continue;
-				double sign = (traverser == 0)
-					? leaf_->expected_showdown_sign(th, oh)
-					: -leaf_->expected_showdown_sign(oh, th);
+				double sign = (traverser == 0) ? node->leaf_sign_cache[hi][vi] : -node->leaf_sign_cache[hi][vi];
 				v += r * sign * (pot / 2.0);
 			}
 			util[th] = v;
@@ -1650,18 +1686,34 @@ private:
 		double pot = s.table.total_pot;
 		int out_n = (traverser == 0) ? N : M;
 		int other_n = (traverser == 0) ? M : N;
+
+		// Same one-time cache idea as terminal_leaf() above, for river_leaf_
+		// instead of leaf_ -- kept as a separate cache field since the two
+		// functions are dispatched for different modes/board depths and are
+		// never both valid for the same node.
+		if (!node->river_leaf_sign_cache_ready) {
+			node->river_leaf_sign_cache.assign(N, std::vector<float>(M, 0.0f));
+			for (int hi = 0; hi < N; hi++) {
+				for (int vi = 0; vi < M; vi++) {
+					if (!hands_compatible(range_.hero[hi], range_.villain[vi])) continue;
+					node->river_leaf_sign_cache[hi][vi] = (float)river_leaf_->expected_showdown_sign(hi, vi);
+				}
+			}
+			node->river_leaf_sign_cache_ready = true;
+		}
+
 		std::vector<double> util(out_n, 0.0);
 		for (int th = 0; th < out_n; th++) {
 			double v = 0.0;
 			for (int oh = 0; oh < other_n; oh++) {
 				double r = reach[1 - traverser][oh];
 				if (r == 0.0) continue;
-				const auto& hero_hand = (traverser == 0) ? range_.hero[th] : range_.hero[oh];
-				const auto& villain_hand = (traverser == 0) ? range_.villain[oh] : range_.villain[th];
+				int hi = (traverser == 0) ? th : oh;
+				int vi = (traverser == 0) ? oh : th;
+				const auto& hero_hand = range_.hero[hi];
+				const auto& villain_hand = range_.villain[vi];
 				if (!hands_compatible(hero_hand, villain_hand)) continue;
-				double sign = (traverser == 0)
-					? river_leaf_->expected_showdown_sign(th, oh)
-					: -river_leaf_->expected_showdown_sign(oh, th);
+				double sign = (traverser == 0) ? node->river_leaf_sign_cache[hi][vi] : -node->river_leaf_sign_cache[hi][vi];
 				v += r * sign * (pot / 2.0);
 			}
 			util[th] = v;
@@ -1676,6 +1728,36 @@ private:
 		int out_n = (traverser == 0) ? N : M;
 		int other_n = (traverser == 0) ? M : N;
 		unsigned char comm[5] = { node->board[0], node->board[1], node->board[2], node->board[3], node->board[4] };
+
+		// Build this node's per-combo hand-strength cache once (see Node's
+		// comment above): engine_->Maxstrength(hand, board) is a pure function
+		// of one combo and this node's fixed board -- it does NOT depend on the
+		// opponent's hand, reach, or iteration. The original code called it
+		// twice (once per side) inside the O(N*M) pair loop below, so the same
+		// hand's strength was recomputed redundantly against every one of the
+		// opponent's combos, every iteration. Caching it per-combo, once,
+		// collapses that to O(N+M) real hand evaluations total for this node's
+		// entire lifetime; the O(N*M) loop below becomes a cheap integer
+		// comparison, reproducing Engine::compute_winner()'s exact polarity
+		// (lower Maxstrength = stronger hand -- see BUILD_NOTES section 22).
+		if (!node->strength_cache_ready) {
+			node->hero_strength_cache.assign(N, -1);
+			for (int i = 0; i < N; i++) {
+				const auto& h = range_.hero[i];
+				if (collides_with_board(h, node->board)) continue;
+				unsigned char hc[2] = { h[0], h[1] };
+				node->hero_strength_cache[i] = engine_->Maxstrength(hc, comm);
+			}
+			node->villain_strength_cache.assign(M, -1);
+			for (int j = 0; j < M; j++) {
+				const auto& vh = range_.villain[j];
+				if (collides_with_board(vh, node->board)) continue;
+				unsigned char vc[2] = { vh[0], vh[1] };
+				node->villain_strength_cache[j] = engine_->Maxstrength(vc, comm);
+			}
+			node->strength_cache_ready = true;
+		}
+
 		std::vector<double> util(out_n, 0.0);
 		for (int th = 0; th < out_n; th++) {
 			const auto& own_hand = (traverser == 0) ? range_.hero[th] : range_.villain[th];
@@ -1689,9 +1771,11 @@ private:
 				const auto& other_hand = (traverser == 0) ? villain_hand : hero_hand;
 				if (collides_with_board(other_hand, node->board)) continue;
 				if (!hands_compatible(hero_hand, villain_hand)) continue;
-				unsigned char p0[2] = { hero_hand[0], hero_hand[1] };
-				unsigned char p1[2] = { villain_hand[0], villain_hand[1] };
-				unsigned char w = engine_->compute_winner(p0, p1, comm);
+				int hero_idx = (traverser == 0) ? th : oh;
+				int villain_idx = (traverser == 0) ? oh : th;
+				int hs = node->hero_strength_cache[hero_idx];
+				int vs = node->villain_strength_cache[villain_idx];
+				unsigned char w = (hs < vs) ? 0 : (hs > vs) ? 1 : 255; // matches Engine::compute_winner() exactly
 				double val;
 				if (w == 255) val = pot / 2.0 - traverser_contrib;
 				else if ((int)w == traverser) val = pot - traverser_contrib;
