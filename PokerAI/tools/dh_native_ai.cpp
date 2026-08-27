@@ -331,15 +331,14 @@ void dh_log_narrowing(const char* label, unsigned char observed_byte,
 // this run's own g.villain_range had settled on for them by that point in
 // the hand. Reports the actual combo's rank and normalized weight among
 // every combo this file was still tracking as possible, and flags it a
-// "RANGE MISS" whenever that weight is below what a uniform guess over the
-// remaining tracked combos would have assigned (i.e. our narrowing made
-// this specific combo LESS likely than "no information at all" would have
-// -- the concrete signature of "opponent wasn't holding a hand we thought
-// was in his range"). Always prints (not gated behind DH_VERBOSE_STRATEGY):
-// this is a single line per hand, directly answers "did narrowing mislead
-// us this hand", and is useless if silently skipped on ordinary runs. Must
-// be called (from the Python driver) after the real bot_hole_cards are
-// known but BEFORE the next hand's restart_game() resets villain_range.
+// "RANGE MISS" whenever its RANK falls in the bottom half of the tracked
+// combos (see RANGE_MISS_PERCENTILE_THRESHOLD below for why this is
+// rank-based, not weight-based, as of BUILD_NOTES.md section 49). Always
+// prints (not gated behind DH_VERBOSE_STRATEGY): this is a single line per
+// hand, directly answers "did narrowing mislead us this hand", and is
+// useless if silently skipped on ordinary runs. Must be called (from the
+// Python driver) after the real bot_hole_cards are known but BEFORE the
+// next hand's restart_game() resets villain_range.
 void dh_log_actual_hand(unsigned char c1, unsigned char c2) {
 	if (g.villain_range.empty()) {
 		std::fprintf(stderr,
@@ -406,13 +405,34 @@ void dh_log_actual_hand(unsigned char c1, unsigned char c2) {
 		return;
 	}
 
-	bool is_miss = actual_weight < uniform_weight;
+	// RANGE-MISS THRESHOLD, rank/percentile-based (BUILD_NOTES.md section
+	// 49): this USED TO be `actual_weight < uniform_weight` (an absolute-
+	// weight threshold), which broke once narrow_villain_range_postflop()
+	// switched to fresh-prior narrowing (section 49) -- that change makes
+	// villain_range's distribution more sharply peaked (a few combos
+	// legitimately capture more of the relative mass), so *every* other
+	// combo's absolute weight share drops even when its *relative order*
+	// doesn't get worse at all. Confirmed directly in the fresh-prior
+	// prototype's Ac9c/Ad3d sanity check: Ad3d's rank stayed good (27/990)
+	// but its absolute weight fell below uniform -- the old definition
+	// would have wrongly flagged an already-correct result as a miss.
+	// Percentile-of-rank is invariant to how peaked the distribution is,
+	// so this survives that change (and would survive future narrowing
+	// scheme changes too) without needing recalibrating again. Flags a
+	// miss when the actual hand's rank falls in the bottom half of every
+	// combo this file was still tracking as possible -- i.e. our belief
+	// ranked it worse than a coin flip against the rest of the tracked
+	// range, which is what "opponent wasn't holding a hand we thought was
+	// in his range" concretely looks like in rank terms.
+	const double RANGE_MISS_PERCENTILE_THRESHOLD = 0.5;
+	double percentile_from_bottom = (double)rank / (double)n;
+	bool is_miss = percentile_from_bottom > RANGE_MISS_PERCENTILE_THRESHOLD;
 	std::fprintf(stderr,
 		"[DH_RANGE_MODEL] actual villain hand=%s%s weight=%.4f%% rank=%d/%zu "
-		"(uniform=%.4f%%) -- %s. %s:%s\n",
+		"(percentile=%.1f%% from bottom, uniform=%.4f%%) -- %s. %s:%s\n",
 		dh_card_str(c1).c_str(), dh_card_str(c2).c_str(), actual_weight * 100.0, rank, n,
-		uniform_weight * 100.0,
-		is_miss ? "RANGE MISS (weighted BELOW a uniform random guess)" : "within expected range",
+		percentile_from_bottom * 100.0, uniform_weight * 100.0,
+		is_miss ? "RANGE MISS (ranked in the bottom half of tracked combos)" : "within expected range",
 		is_miss ? "All tracked combos, highest weight first" : "Top expected",
 		is_miss ? format_combo_list(n).c_str() : top_str.c_str());
 }
@@ -841,8 +861,27 @@ void narrow_villain_range_postflop(int opp_slot, unsigned char observed_byte) {
 		std::vector<double> tracked_weights;
 		tracked_weights.reserve(g.villain_range.size());
 		for (auto& h : g.villain_range) tracked_weights.push_back(h.weight);
-		if (opp_slot == 0) run_until_converged(resolver, mode, &tracked_weights, nullptr);
-		else run_until_converged(resolver, mode, nullptr, &tracked_weights);
+		// FRESH-PRIOR NARROWING (BUILD_NOTES.md section 49, following the
+		// prototype in tools/test_narrow_cfvalue_replace.cpp / section 48):
+		// always seed this street's narrowing resolve with nullptr/nullptr
+		// -- a flat, undistorted reach (LiveResolver::run()'s own
+		// documented default) -- instead of the running tracked_weights on
+		// whichever side is villain. Production used to chain each
+		// street's already-narrowed belief into the NEXT street's resolve
+		// as external_reach, meaning each street's computed action
+		// probabilities (avg[idx] below) were conditioned on a belief
+		// earlier streets' own approximate resolves had already distorted,
+		// so estimation error could compound onto itself rather than
+		// reflect only this street's genuine signal. Decoupling each
+		// street's likelihood computation from the accumulated narrowing
+		// approximates DeepStack's "replace, don't chain a distorted
+		// belief forward" philosophy (Moravcik et al., Science 2017)
+		// within this codebase's existing range-vector architecture. The
+		// resulting per-street avg[idx] factor is still multiplied into
+		// g.villain_range below -- reach probability along a path is still
+		// fundamentally a product; only what each factor is computed
+		// *conditioned on* has changed.
+		run_until_converged(resolver, mode, nullptr, nullptr);
 		int idx = -1;
 		for (size_t i = 0; i < resolver.root->actions.size(); i++)
 			if (resolver.root->actions[i] == observed_byte) { idx = (int)i; break; }

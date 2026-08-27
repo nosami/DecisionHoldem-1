@@ -6371,3 +6371,176 @@ change to how each street's resolve is seeded, would need the same
 exploitability-curve-style validation as §45/§46 before ever being
 considered for production -- not undertaken here. Left for the user to
 decide whether/how to proceed.
+
+## 49. Productionized Plan B (fresh-prior/decoupled-resolve narrowing) from section 48's prototype, with a rank-based fix for the miss diagnostic
+
+Follow-up to §48: ported `tools/test_narrow_cfvalue_replace.cpp`'s
+validated `narrow_villain_range_postflop_freshprior()` logic into the
+REAL `narrow_villain_range_postflop()` in `dh_native_ai.cpp`, replacing
+the chained-narrowing behavior that §47/§48 showed compounds
+approximation error across streets.
+
+### What changed
+
+**One call site, `dh_native_ai.cpp`'s `narrow_villain_range_postflop()`**
+(~line 794). Before:
+
+```cpp
+if (opp_slot == 0) run_until_converged(resolver, mode, &tracked_weights, nullptr);
+else run_until_converged(resolver, mode, nullptr, &tracked_weights);
+```
+
+After:
+
+```cpp
+run_until_converged(resolver, mode, nullptr, nullptr);
+```
+
+Every street's narrowing resolve is now seeded with a fresh, undistorted
+flat reach (`LiveResolver::run()`'s own documented default) instead of
+the previous street's already-narrowed `tracked_weights`, decoupling each
+street's computed action-probabilities from whatever approximation error
+earlier streets' resolves may have already introduced. The resulting
+per-street `avg[idx]` factor is still multiplied into `g.villain_range`
+exactly as before -- **nothing else in the function changed**: bet-size
+interpolation (the `extended_actions=true` / byte-2 raise-node lookup),
+cluster/leaf-model construction (`TurnClusterLeafModel`/
+`RiverClusterLeafModel`), and renormalization are all untouched.
+`resolve_decision()` (hero's own live decision resolver, a wholly
+separate `LiveResolver` instance) is **also untouched** -- it still
+seeds its resolve with the real tracked `villain_range` belief, since
+that is the live decision itself, not a narrowing update; this change
+only affects what belief *narrowing* is conditioned on between streets.
+
+Preflop narrowing (`narrow_villain_range_preflop()`) was not touched --
+as noted in §48, it's a direct blueprint-cluster-table lookup, not a
+chained resolve, so it isn't subject to this concern.
+
+### Miss-diagnostic threshold: recalibrated to rank/percentile, not absolute weight
+
+§48 flagged that fresh-prior narrowing produces a more sharply-peaked
+`villain_range` distribution (a few combos legitimately capture more of
+the relative mass), so *every* other combo's absolute weight share drops
+even when its *relative order* doesn't get worse -- meaning the old
+`dh_log_actual_hand()` diagnostic's `is_miss = actual_weight <
+uniform_weight` would start flagging previously-correct hands as false
+misses. Fixed by recalibrating that diagnostic to be rank/percentile-
+based instead of absolute-weight-based:
+
+```cpp
+const double RANGE_MISS_PERCENTILE_THRESHOLD = 0.5;
+double percentile_from_bottom = (double)rank / (double)n;
+bool is_miss = percentile_from_bottom > RANGE_MISS_PERCENTILE_THRESHOLD;
+```
+
+i.e. a hand is now flagged a miss when our narrowing ranked it in the
+bottom half of every combo still tracked as possible (worse than a coin
+flip against the rest of the range), rather than when its raw weight
+share happened to fall under `1/n`. This is invariant to how peaked the
+tracked distribution is, so it survives this narrowing change (and would
+survive a future one) without needing recalibrating again. The `uniform`
+weight/percentage is still printed for context, just no longer used to
+decide `is_miss`.
+
+### Validation
+
+Rebuilt `dh_native_ai.dylib` cleanly with the established command (this
+worktree's `PokerAI/cluster/` symlinks to `/Users/jason/dh_local_data/`
+and the Seagate drive had to be recreated first -- worktrees don't share
+untracked/gitignored local data files with the main checkout):
+
+```shell
+cd PokerAI
+g++ -std=c++17 -O2 -Wall -Wextra -DDH_SKIP_RIVER_CLUSTER \
+    -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include \
+    -shared -fPIC -o dh_native_ai.dylib tools/dh_native_ai.cpp \
+    -L/opt/homebrew/opt/libomp/lib -lomp
+```
+
+Zero errors, one pre-existing unrelated warning (`State.h`'s unused
+`_engine` parameter, not touched by this change).
+
+**`tools/test_qq_trips_range_miss` (the flagged `Qh7s` hand, §47/§48),
+now exercising the REAL production `narrow_villain_range_postflop()`:**
+
+| Step | Production (chained, before this change) | Production (fresh-prior, after this change) |
+|---|---|---|
+| final `Qh7s` weight | 0.000097% | **0.000932%** (~10x) |
+| final `Qh7s` rank | 820/990 | **626/990** |
+
+Exact match to §48's prototype numbers (0.000932%, 626/990) -- confirms
+the port is faithful.
+
+**New `tools/test_ac9c_sanity.cpp`** (added; a permanent regression tool
+following the existing `test_*.cpp` pattern, `#include`s
+`dh_native_ai.cpp` directly, no reimplementation) replays the `Ac9c`/
+`Ad3d` sanity hand through the REAL production functions end-to-end:
+
+| Step | Production (chained, before) | Production (fresh-prior, after) |
+|---|---|---|
+| final `Ad3d` weight | 0.1789% | 0.0084% |
+| final `Ad3d` rank | 95/990 | **27/990** (improved) |
+| `dh_log_actual_hand()` verdict | within expected range | **within expected range** (percentile=2.7% from bottom) |
+
+Rank stayed good (actually improved) and the recalibrated diagnostic
+correctly still reports "within expected range" -- confirming the
+percentile-based fix works: under the OLD `weight < uniform` definition
+this hand's dropped absolute weight (0.0084% < uniform 0.1010%) would
+have wrongly flagged it as a fresh false-positive miss, exactly the
+failure mode §48 warned about.
+
+**`tools/test_hand6_range_miss` (hand #6 from the real `-20,000` chip
+Slumbot loss, §41/§44/§45) -- the other real catastrophic-miss hand on
+record, not just the two hands already used to develop the prototype:**
+
+| Step | Production (chained, before) | Production (fresh-prior, after) |
+|---|---|---|
+| final `Jc2c` weight | 0.0020% (rank 641/990, live log) / 0.000057% (rank 641/990, this repro w/o RiverClusterLeafModel) | **0.468151%** (rank 43/990) |
+
+A dramatic improvement on a THIRD, independently-flagged hand -- villain's
+true holding (a slowplayed full house) now ranks 43rd out of 990 tracked
+combos and sits well above uniform, instead of being crushed to a rank-
+641 "miss". This is strong evidence the fresh-prior approach's benefit
+isn't an artifact of the two hands used to build the prototype.
+
+**`tools/test_bet_size_narrowing`** (bet-size interpolation / non-all-in
+raise narrowing, §33): `ALL CHECKS PASSED` -- non-all-in FLOP and TURN
+raise narrowing both still measurably update weights (this function's
+core purpose besides the reach-seeding change), no regression.
+
+**`tools/test_villain_weight_distribution`**: ran end-to-end with no
+exceptions/collapse-to-zero across preflop, FLOP all-in, FLOP call, and a
+second (TURN) narrowing round compounded onto the first -- confirms
+multi-street narrowing sequences remain numerically stable under the new
+reach-seeding.
+
+**`tools/test_resolver_exploitability`** (`RealtimeSearch.h`/
+`LiveResolver` directly, does not `#include` `dh_native_ai.cpp` and so
+is untouched by this change by construction): re-ran as a baseline sanity
+check -- FLOP/RIVER/TURN convergence curves are byte-identical to the
+numbers already on record (§28), confirming this change did not touch
+`RealtimeSearch.h`/`LiveResolver` at all. This is also why hero's own
+live-decision resolver (`resolve_decision()`) and its exploitability are
+unaffected: that resolver still seeds from the real tracked
+`villain_range`, exactly as before -- only the SEPARATE narrowing
+resolver's reach input changed. The whole point of this change is that
+narrowing (a diagnostic/belief-update step) no longer feeds a
+progressively-distorted range into either the next street's narrowing OR
+back into live decisions, without touching the decision-quality code path
+at all.
+
+### Files changed
+
+- `PokerAI/tools/dh_native_ai.cpp` -- the two changes above
+  (`narrow_villain_range_postflop()`'s reach seeding;
+  `dh_log_actual_hand()`'s miss threshold).
+- `PokerAI/tools/test_ac9c_sanity.cpp` -- new, permanent regression tool.
+- `.gitignore` -- added the new tool's compiled binary.
+- `tools/test_narrow_epsilon_floor.cpp` / `tools/test_narrow_cfvalue_replace.cpp`
+  (§48's prototypes) are unchanged and left in place per the task
+  instructions, as the reference/baseline this change was validated
+  against.
+
+No cluster/model data, secrets, or compiled binaries (`.dylib`, test
+tool executables) are committed -- all covered by existing `.gitignore`
+patterns, extended for the one new tool above.
