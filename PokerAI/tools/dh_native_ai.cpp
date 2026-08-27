@@ -366,15 +366,28 @@ void dh_log_actual_hand(unsigned char c1, unsigned char c2) {
 
 	size_t n = g.villain_range.size();
 	double uniform_weight = 1.0 / (double)n;
-	size_t top_k = std::min<size_t>(5, n);
-	std::string top_str;
-	for (size_t k = 0; k < top_k; k++) {
-		const WeightedHand& h = g.villain_range[idx[k]];
-		char buf[32];
-		std::snprintf(buf, sizeof(buf), " %s%s=%.2f%%",
-			dh_card_str(h.c1).c_str(), dh_card_str(h.c2).c_str(), h.weight * 100.0);
-		top_str += buf;
-	}
+
+	// On a genuine miss (including the "not found" case below), print EVERY
+	// tracked combo's weight, not just the top few -- a truncated top-5 list
+	// can't show where the ACTUAL hand sat relative to the rest of the
+	// distribution, or whether other similarly-shaped hands (e.g. other
+	// combos that also make trips on this exact board) were *also*
+	// underweighted, which is exactly the kind of pattern this diagnostic
+	// exists to surface. Ordinary (non-miss) hands stay a compact top-5,
+	// since there's nothing surprising to explain there.
+	auto format_combo_list = [&](size_t count) {
+		std::string s;
+		for (size_t k = 0; k < count; k++) {
+			const WeightedHand& h = g.villain_range[idx[k]];
+			char buf[48];
+			std::snprintf(buf, sizeof(buf), " #%zu %s%s=%.4f%%", k + 1,
+				dh_card_str(h.c1).c_str(), dh_card_str(h.c2).c_str(), h.weight * 100.0);
+			s += buf;
+			if ((k + 1) % 8 == 0 && k + 1 < count) s += "\n   ";
+		}
+		return s;
+	};
+	std::string top_str = format_combo_list(std::min<size_t>(5, n));
 
 	if (rank < 0) {
 		// Should be impossible for a real, legal deal (villain_range covers
@@ -387,19 +400,21 @@ void dh_log_actual_hand(unsigned char c1, unsigned char c2) {
 		std::fprintf(stderr,
 			"[DH_RANGE_MODEL] actual villain hand=%s%s NOT FOUND among %zu "
 			"tracked combos -- RANGE MISS (unexpected: check for an earlier "
-			"'villain range was empty' warning this hand). Top expected:%s\n",
-			dh_card_str(c1).c_str(), dh_card_str(c2).c_str(), n, top_str.c_str());
+			"'villain range was empty' warning this hand). All tracked "
+			"combos, highest weight first:%s\n",
+			dh_card_str(c1).c_str(), dh_card_str(c2).c_str(), n, format_combo_list(n).c_str());
 		return;
 	}
 
 	bool is_miss = actual_weight < uniform_weight;
 	std::fprintf(stderr,
 		"[DH_RANGE_MODEL] actual villain hand=%s%s weight=%.4f%% rank=%d/%zu "
-		"(uniform=%.4f%%) -- %s. Top expected:%s\n",
+		"(uniform=%.4f%%) -- %s. %s:%s\n",
 		dh_card_str(c1).c_str(), dh_card_str(c2).c_str(), actual_weight * 100.0, rank, n,
 		uniform_weight * 100.0,
 		is_miss ? "RANGE MISS (weighted BELOW a uniform random guess)" : "within expected range",
-		top_str.c_str());
+		is_miss ? "All tracked combos, highest weight first" : "Top expected",
+		is_miss ? format_combo_list(n).c_str() : top_str.c_str());
 }
 
 int committed_this_street(int slot) {

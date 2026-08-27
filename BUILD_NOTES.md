@@ -6110,3 +6110,139 @@ command, confirmed all 5 ABI symbols still exported (`_restart_game`,
   caches instead of recomputing per-pair values on every call.
 - `dh_native_ai.dylib` — rebuilt with the change (gitignored build
   artifact, not committed; rebuild with the §43 command to reproduce).
+
+## 47. Two more user-flagged live hands investigated: a genuine (but expected-category) range-narrowing miss on a river-paired board, and a fold that was actually correct GTO play, not a bug — plus range-miss diagnostic now prints every tracked combo, not just the top 5
+
+### Diagnostic change: print ALL tracked combos on a RANGE MISS, not just the top 5
+
+`dh_log_actual_hand()` (fires once per hand, comparing villain's revealed
+hole cards against `g.villain_range`'s tracked belief) previously always
+printed only the top-5 highest-weighted combos, regardless of whether
+the actual hand was a hit or a miss. Requested by the user directly:
+on a genuine RANGE MISS (including the "not found" edge case), it now
+prints **every** tracked combo's weight, highest first, not just the
+top 5 — a truncated list can't show where the real hand sat relative to
+the whole distribution, or whether other similarly-shaped hands were
+*also* underweighted (exactly the kind of pattern this diagnostic exists
+to surface). Ordinary (non-miss) hands are unaffected — still a compact
+top-5, since there's nothing surprising to explain there. Implemented in
+`tools/dh_native_ai.cpp`; rebuilt `dh_native_ai.dylib`, confirmed all 5
+ABI symbols still exported.
+
+### Hand 1: `Ad3c` (hero) vs. `Qh7s` (villain) — trip queens via a river board-pair, missed badly (rank 610/990, weight 0.0004%)
+
+User's report: hero (air, `Ad3c`) bet flop, checked back turn, then
+shoved the river into a board that paired queens (`Qd 4c 2s Js Qc`);
+villain check-called the whole way and showed up with `Qh7s` — trip
+queens — for a -20,000 chip loss. User: "Seems like the bot was
+screaming that it had a Q."
+
+**Correction to a first assumption**: `Qh7s` is not "pure air" on the
+flop — `Qd` is on the flop, so `Qh7s` is **top pair, weak kicker**
+(queens) from the flop onward, not a random unpaired hand. It only
+becomes trip queens once the second board queen (`Qc`) lands on the
+river.
+
+**New reproduction tool** (`tools/test_qq_trips_range_miss.cpp`, replays
+the real sequence through the real production code, same technique as
+`test_hand6_range_miss.cpp`) traced `Qh7s`'s tracked weight after every
+narrowing step:
+
+| Step | Weight | Rank |
+|---|---|---|
+| Fresh preflop prior | 0.0816% | 1/1225 |
+| After preflop call | 0.0557% | 939/1225 |
+| After villain's FLOP check | 0.00248% | 874/1081 |
+| After villain calls hero's FLOP bet | 0.00009% | 891/1081 |
+| After villain's TURN check | 0.00002% | 854/1035 |
+| After villain's RIVER check (board just paired Q) | ~0.000000% | 820/990 |
+| FINAL, after villain calls the river shove | 0.000097% | 820/990 |
+
+**Root cause, confirmed from the actual narrowing code**
+(`narrow_villain_range_postflop()`, `tools/dh_native_ai.cpp` line ~852):
+the update is a straightforward, standard Bayesian multiply —
+`g.villain_range[i].weight *= avg_strategy[i][observed_action]`, applied
+independently at **every** street, then renormalized. This is
+mathematically the right update *given* an accurate per-combo strategy
+estimate at each street. The problem is that it **compounds
+multiplicatively and irreversibly**: `Qh7s`'s weight was already crushed
+to ~30-1000x below where it started by the FLOP check and FLOP call
+alone (when it was "only" top-pair-weak-kicker — a real, but not
+overwhelming, holding that the FLOP-mode leaf model's approximate
+strategy apparently rates as unlikely to just flat a pot-sized bet
+with). By the time the river card turns it into trip queens, its
+absolute weight is already down at the ~0.00002% level — and even a
+correctly-strong river "check" likelihood for a slow-played monster
+cannot pull a near-zero prior back up to a normal-looking posterior;
+multiplying a near-zero number by any bounded factor stays near zero.
+
+**Supporting evidence of a broader, already-documented limitation, not a
+fresh bug**: at every narrowing step, the top-N reported combos are
+various suited/offsuit run-of-the-mill "T-3" combos (e.g. `Td3h`,
+`3sTc`, `Tc3d`) that have no obvious special connection to this board,
+**all sharing the exact same displayed weight to 3 decimal places**
+(e.g. all 8 top combos tied at 1.500% after the river check). This is
+the signature of many structurally-different combos being bucketed into
+the same coarse abstraction cluster (or, per `average_strategy()`'s
+`sum <= 1e-12` fallback, hands whose `strat_sum` never accumulated a
+meaningful signal in this resolve, defaulting to a uniform per-action
+split) — i.e. the FLOP/TURN leaf-model approximation genuinely cannot
+distinguish many different "modest, ambiguous" combos from each other.
+This is the same category of residual imprecision already catalogued in
+§32/§38/§40/§41/§42/§44 ("a fundamental limitation of the bucketed/CFR
+approach, not a discrete bug to patch") — now observed in its most
+costly form yet (a hand that was briefly excellent-on-paper crushed by
+several streets of only-modest downweighting compounding to
+near-nothing before the river even mattered). **This is distinct from
+and not a recurrence of §45's fixed bug** — this replay runs on top of
+the post-§45-fix `dh_native_ai.cpp`, and the checks involved are being
+handled by the corrected code path; the residual issue here is the
+inherent one-way multiplicative narrowing combined with leaf-model
+coarseness, not a state-construction inversion.
+
+**Not fixed in this section** — this is a real, quantified, and now
+well-understood limitation, but a proper fix (e.g. a narrowing floor
+that prevents any combo's weight from being driven below some epsilon
+so a later street's evidence can still recover it, or blending some
+weight toward a "most recent street only" belief instead of full
+multiplicative compounding across all history) is a genuine design
+change to the narrowing algorithm with its own correctness/behavior
+tradeoffs, not a small patch — flagged for the user to decide on rather
+than implemented unilaterally.
+
+### Hand 2: `Ac9c` (hero) vs. `Ad3d` (villain) — a river fold that was correct play, not a miss
+
+User was also surprised hero folded here. Traced through: final board
+`As 9d 8d 8c 7h` **pairs eights on the board itself**. Hero's best hand
+is two pair, **aces and nines** (using `Ac9c` + `As9d`, kicker 8).
+Villain's actual hand `Ad3d` makes two pair, **aces and eights** (using
+`Ad` + board `As`, plus the board's own `8d8c` pair) — hero's actual
+holding narrowly beats villain's actual holding.
+
+This is **not a range-model error**: the hand-end diagnostic already
+correctly reports `Ad3d` as rank 95/990, **"within expected range"**
+(not a RANGE MISS) — the model's belief was not surprised by this
+holding at all. The fold itself is explained by the board texture: a
+board pair (`8d8c`) means **any** ace, eight, or nine in villain's hand
+now makes a full house or better, and villain had raised on every
+single street (flop, turn, river) — the model's own top-ranked combos
+at the point of hero's decision were `AdAh` (full house, aces full of
+eights), `8s8h` (quad eights), `9s9h` (full house, nines full of
+eights), i.e. the *median* of a realistic continued-aggression range on
+this board is a monster, not a mere two pair. Folding a modest two pair
+(aces and nines) into that range at 0.10% modeled exploitability is
+correct, conservative, +EV play — it just happens to have run into the
+weaker tail of villain's legitimate range this one time. This is
+ordinary poker variance (a single hand's outcome, not the range
+model's expected value, is what's "unlucky" here), not a bug.
+
+### Files touched
+
+- `tools/dh_native_ai.cpp` — `dh_log_actual_hand()` now prints every
+  tracked combo on a miss, not just the top 5 (purely additive to the
+  diagnostic; no behavioral/strategy change).
+- `tools/test_qq_trips_range_miss.cpp` (new, purely additive) — repro
+  tool for hand 1 above, reusable for auditing future similar misses.
+- `dh_native_ai.dylib` — rebuilt with the diagnostic change (gitignored
+  build artifact, not committed; rebuild with the §43 command to
+  reproduce).
