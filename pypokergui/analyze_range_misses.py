@@ -6,10 +6,14 @@ dh_log_actual_hand(), and fish_player_setup.py's report_actual_hand()).
 Each such line is printed once per hand, at hand-end, comparing villain's
 REAL revealed hole cards (Slumbot reveals these for every hand, not just
 showdowns) against this run's own tracked villain_range belief at that
-point. A "RANGE MISS" means the actual holding was weighted BELOW a
-uniform random guess -- i.e. narrowing had convinced itself the real hand
-was less likely than having no information at all, the concrete signature
-of "the opponent wasn't holding a hand we thought was in his range".
+point. As of BUILD_NOTES.md section 49, a "RANGE MISS" means the actual
+holding's RANK fell in the bottom half of every tracked combo (rank/n >
+50th percentile) -- i.e. narrowing ranked it worse than a coin flip
+against the rest of the range it was still tracking, the concrete
+signature of "the opponent wasn't holding a hand we thought was in his
+range". (Older logs, predating section 49, instead compared absolute
+weight against a uniform guess -- this script still parses those lines
+too, via the optional `percentile=` field below.)
 
 Usage:
     python3 analyze_range_misses.py /tmp/run.log
@@ -22,8 +26,9 @@ import sys
 LINE_RE = re.compile(
     r"\[DH_RANGE_MODEL\] actual villain hand=(?P<hand>\S{4}) "
     r"weight=(?P<weight>[\d.]+)% rank=(?P<rank>\d+)/(?P<n>\d+) "
-    r"\(uniform=(?P<uniform>[\d.]+)%\) -- (?P<verdict>RANGE MISS[^.]*|within expected range)\. "
-    r"Top expected:(?P<top>.*)"
+    r"\((?:percentile=(?P<percentile>[\d.]+)% from bottom, )?uniform=(?P<uniform>[\d.]+)%\) "
+    r"-- (?P<verdict>RANGE MISS[^.]*|within expected range)\. "
+    r"(?:Top expected|All tracked combos, highest weight first):(?P<top>.*)"
 )
 
 # The "not found" / "empty range" variants don't have weight/rank at all --
