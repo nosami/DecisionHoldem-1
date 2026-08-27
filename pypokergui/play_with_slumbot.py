@@ -398,7 +398,8 @@ def PlayHand(token):
             if bot_hole_cards and hasattr(bot.playsearch, 'report_actual_hand'):
                 actual = [cards_dic[bot_hole_cards[0]], cards_dic[bot_hole_cards[1]]]
                 bot.report_actual_hand(actual[0], actual[1])
-            print('Hand winnings: %i' % winnings)
+            hand_color = '\033[32m' if winnings > 0 else '\033[31m'  # green if profitable, red otherwise
+            print('Hand winnings: %s%i\033[0m' % (hand_color, winnings))
             return (token, winnings)
 
         a = ParseAction(action)
