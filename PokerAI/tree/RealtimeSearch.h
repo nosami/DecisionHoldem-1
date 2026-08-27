@@ -89,6 +89,22 @@
 #include <algorithm>
 #include <fcntl.h>
 #include <unistd.h>
+#include <exception>
+// Live-resolve action/chance-card fan-out parallelism uses OpenMP (the same
+// mechanism $HOME/src/TexasSolver uses -- see BUILD_NOTES.md for the
+// comparison), rather than a std::async-per-call thread spawn: OpenMP keeps a
+// persistent worker thread pool alive for the whole process, so dispatching
+// a parallel loop is a lightweight fork-join wakeup instead of paying full OS
+// thread creation/destruction cost on every single call (which was measured
+// to cap the earlier std::async version's TURN speedup at ~2.2x despite
+// bursting to 35+ threads on a 10-core machine). When built WITHOUT the
+// OpenMP compiler flags (no `-fopenmp`), _OPENMP is undefined and every
+// parallel_map() call below falls back to the original plain serial loop --
+// this keeps existing build commands that don't pass the new flags working
+// unchanged, just without the speedup.
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace RealtimeSearch {
 
@@ -1033,6 +1049,14 @@ public:
 		  extended_actions_(extended_actions), full_ladder_(full_ladder) {
 		N = (int)range_.hero.size();
 		M = (int)range_.villain.size();
+#ifdef _OPENMP
+		// Same default TexasSolver uses (src/solver/PCfrSolver.cpp): use
+		// every logical core visible to this process. Explicit rather than
+		// relying on OpenMP's own default so behavior doesn't silently
+		// change if some other library/tool has set OMP_NUM_THREADS in the
+		// environment this process inherits.
+		omp_set_num_threads(omp_get_num_procs());
+#endif
 	}
 
 	struct Node {
@@ -1077,9 +1101,9 @@ public:
 			if (collides_with_board(range_.villain[h], root->board)) reach1[h] = 0.0;
 		for (int it = 0; it < iterations; it++) {
 			std::vector<double> reach[2] = { reach0, reach1 };
-			cfr(root.get(), reach, 0, true);
+			cfr(root.get(), reach, 0, true, 0);
 			std::vector<double> reach_b[2] = { reach0, reach1 };
-			cfr(root.get(), reach_b, 1, true);
+			cfr(root.get(), reach_b, 1, true, 0);
 		}
 	}
 
@@ -1096,7 +1120,110 @@ public:
 		}
 	}
 
-	std::vector<double> cfr(Node* node, std::vector<double> reach[2], int traverser, bool update) {
+	// Depth-limited action/chance-card fan-out parallelism (see
+	// BUILD_NOTES.md for the writeup). This is a PURE performance change,
+	// not an algorithm change: every action's (or chance card's) subtree
+	// is already, by construction, a fully independent Node object --
+	// node->children[a] for different `a` never alias each other, they
+	// are only combined (into node_util/total) AFTER every recursive call
+	// has returned, in the exact same left-to-right order the original
+	// serial loop used. Running those independent recursive calls on
+	// separate threads therefore produces bit-identical results to the
+	// serial version; it does not touch the alternating-update CFR
+	// ordering (cfr(...,traverser=0,...) still fully completes, in
+	// program order, before cfr(...,traverser=1,...) begins -- see run()
+	// -- so the solver semantics are completely unchanged.
+	// Only shallow depths are parallelized (kParallelDepthCutoff), since
+	// thread-dispatch overhead would dominate for the many small nodes
+	// deep in the tree. With OpenMP (see parallel_map() below) this also
+	// falls out naturally: OpenMP disables NESTED parallel regions by
+	// default (confirmed on this host -- an inner "#pragma omp parallel
+	// for" issued from inside an already-parallel outer region runs with
+	// a team size of 1, i.e. serially, with zero extra overhead), so once
+	// one level of the recursion has fanned out across all cores, any
+	// deeper opportunity naturally collapses back to serial execution
+	// with no oversubscription. kParallelDepthCutoff is kept anyway as a
+	// belt-and-suspenders bound and to document intent.
+	static constexpr int kParallelDepthCutoff = 2;
+
+	// Even a lightweight OpenMP fork-join still costs something (thread
+	// wakeup + an implicit barrier at the end of the "#pragma omp parallel
+	// for" region), so it only pays for itself when there is enough
+	// independent work per branch to amortize that cost. Measured
+	// directly (see BUILD_NOTES.md): the ~44-48-branch TURN river chance
+	// node is a rich parallelization target, while the small (2-4-action)
+	// fold/call/raise/allin decision nodes that dominate FLOP/RIVER mode
+	// have per-branch work small enough that gating still matters.
+	// Gating on branch count (not mode) keeps this general: it lets a
+	// wide node (a real chance node, or a full-ladder opening action with
+	// several native pot-fraction sizes) parallelize, while narrow nodes
+	// (the common facing-a-bet fold/call/allin case) fall back to the
+	// original serial loop with zero added overhead.
+	//
+	// This gate is NOT just an overhead optimization under OpenMP -- it is
+	// load-bearing for correctness-of-performance given OpenMP disables
+	// NESTED parallel regions by default (verified on this host). Only
+	// ONE level of the recursion (whichever hits the gate first, within
+	// kParallelDepthCutoff) actually fans out across cores; every
+	// "#pragma omp parallel for" issued from inside an already-active
+	// parallel region collapses to a team of size 1. Measured directly:
+	// lowering this gate to 2 (so a depth-0 node with only 3-4 actions
+	// grabs the single available parallel slot) made TURN mode ~2x
+	// SLOWER (it never reaches its own much wider depth-1 river chance
+	// node, which is now nested and serial), even though it slightly
+	// helped RIVER mode (~14%, whose tree has no chance node to steal
+	// the slot from at all). Keeping the gate high enough that only a
+	// genuine chance node satisfies it reserves the one available
+	// parallel opportunity for whichever node benefits from it most.
+	static constexpr int kMinParallelBranchCount = 8;
+
+	// Runs `n` independent tasks (each producing a std::vector<double>),
+	// either via a "#pragma omp parallel for" (the same OpenMP-based
+	// persistent-thread-pool mechanism $HOME/src/TexasSolver uses --
+	// src/solver/PCfrSolver.cpp / slice_cfr.cpp -- rather than spawning a
+	// fresh OS thread per call the way std::async did) when `depth` is
+	// shallow enough and `n` is large enough to be worth it, or serially
+	// otherwise -- and always serially if built without OpenMP support
+	// (_OPENMP undefined). `make_task(i)` must return a zero-argument
+	// callable producing the i-th result; results[i] is written only by
+	// the iteration that owns index i, so concurrent writes never alias.
+	template <class MakeTask>
+	std::vector<std::vector<double>> parallel_map(int n, int depth, MakeTask&& make_task) {
+		std::vector<std::vector<double>> results(n);
+#ifdef _OPENMP
+		if (depth < kParallelDepthCutoff && n >= kMinParallelBranchCount) {
+			// A cfr() call can, in principle, throw (e.g. a corrupt/short
+			// cluster-lookup read surfacing as std::exception deeper in
+			// the call chain). An exception escaping an OpenMP parallel
+			// region uncaught is undefined behavior (typically an
+			// immediate std::terminate), so each iteration catches and
+			// stashes the first exception it sees; it is rethrown, from
+			// ordinary serial context, once the parallel region (and its
+			// implicit barrier) has fully finished -- preserving the same
+			// "exception propagates to the caller" behavior the serial
+			// loop always had.
+			std::exception_ptr first_error;
+			#pragma omp parallel for schedule(dynamic)
+			for (int i = 0; i < n; i++) {
+				try {
+					results[i] = make_task(i)();
+				}
+				catch (...) {
+					#pragma omp critical
+					{
+						if (!first_error) first_error = std::current_exception();
+					}
+				}
+			}
+			if (first_error) std::rethrow_exception(first_error);
+			return results;
+		}
+#endif
+		for (int i = 0; i < n; i++) results[i] = make_task(i)();
+		return results;
+	}
+
+	std::vector<double> cfr(Node* node, std::vector<double> reach[2], int traverser, bool update, int depth) {
 		Searchstate& s = node->state;
 		if (s.betting_stage == 5) return terminal_fold(node, reach, traverser);
 		if (mode_ == Mode::FLOP && s.betting_stage >= 2) return terminal_leaf(node, reach, traverser);
@@ -1105,7 +1232,7 @@ public:
 		if (mode_ == Mode::TURN && (int)node->board.size() >= 5) return terminal_showdown(node, reach, traverser);
 
 		expand(node);
-		if (node->is_chance) return chance_value(node, reach, traverser, update);
+		if (node->is_chance) return chance_value(node, reach, traverser, update, depth);
 		if (s.betting_stage >= 4) return terminal_showdown(node, reach, traverser);
 
 		int p = node->state.player_i_index;
@@ -1115,7 +1242,13 @@ public:
 		std::vector<std::vector<double>> strategy(own_n);
 		for (int h = 0; h < own_n; h++) regret_matching(node->regret[h], strategy[h]);
 
-		std::vector<std::vector<double>> action_util(nA);
+		// Pre-create all children BEFORE any parallel dispatch: creating a
+		// std::unique_ptr<Node> at DISTINCT vector indices concurrently is
+		// safe (distinct objects, no reallocation since node->children was
+		// already sized by expand()), but doing it here, serially, up
+		// front keeps the parallel section itself free of any writes to
+		// shared parent state -- only per-branch-local new_reach and the
+		// recursive call itself happen inside each task.
 		for (int a = 0; a < nA; a++) {
 			if (!node->children[a]) {
 				node->children[a].reset(new Node());
@@ -1123,10 +1256,14 @@ public:
 				node->children[a]->state.take_action(node->actions[a]);
 				node->children[a]->board = node->board;
 			}
-			std::vector<double> new_reach[2] = { reach[0], reach[1] };
-			for (int h = 0; h < own_n; h++) new_reach[p][h] *= strategy[h][a];
-			action_util[a] = cfr(node->children[a].get(), new_reach, traverser, update);
 		}
+		auto action_util = parallel_map(nA, depth, [&](int a) {
+			return [this, node, &reach, &strategy, own_n, p, traverser, update, depth, a]() {
+				std::vector<double> new_reach[2] = { reach[0], reach[1] };
+				for (int h = 0; h < own_n; h++) new_reach[p][h] *= strategy[h][a];
+				return cfr(node->children[a].get(), new_reach, traverser, update, depth + 1);
+			};
+		});
 
 		int out_n = (traverser == 0) ? N : M;
 		std::vector<double> node_util(out_n, 0.0);
@@ -1429,22 +1566,35 @@ private:
 		node->children.resize(node->actions.size());
 	}
 
-	std::vector<double> chance_value(Node* node, std::vector<double> reach[2], int traverser, bool update) {
+	std::vector<double> chance_value(Node* node, std::vector<double> reach[2], int traverser, bool update, int depth) {
 		int out_n = (traverser == 0) ? N : M;
 		std::vector<double> total(out_n, 0.0);
 		int nC = (int)node->chance_cards.size();
+		// Same pre-creation-then-parallel-dispatch split as cfr()'s action
+		// loop above (see kParallelDepthCutoff's comment): a real river
+		// chance node here can have ~44-48 undealt cards, each an
+		// independent subtree, making this an even richer parallelization
+		// target than the (typically 2-4-way) action fan-out.
 		for (int ci = 0; ci < nC; ci++) {
-			unsigned char c = node->chance_cards[ci];
 			if (!node->children[ci]) {
+				unsigned char c = node->chance_cards[ci];
 				node->children[ci].reset(new Node());
 				node->children[ci]->state = node->state;
 				node->children[ci]->board = node->board;
 				node->children[ci]->board.push_back(c);
 			}
-			std::vector<double> new_reach[2] = { reach[0], reach[1] };
-			for (int h = 0; h < N; h++) if (range_.hero[h][0] == c || range_.hero[h][1] == c) new_reach[0][h] = 0.0;
-			for (int h = 0; h < M; h++) if (range_.villain[h][0] == c || range_.villain[h][1] == c) new_reach[1][h] = 0.0;
-			std::vector<double> child_util = cfr(node->children[ci].get(), new_reach, traverser, update);
+		}
+		auto child_utils = parallel_map(nC, depth, [&](int ci) {
+			return [this, node, &reach, traverser, update, depth, ci]() {
+				unsigned char c = node->chance_cards[ci];
+				std::vector<double> new_reach[2] = { reach[0], reach[1] };
+				for (int h = 0; h < N; h++) if (range_.hero[h][0] == c || range_.hero[h][1] == c) new_reach[0][h] = 0.0;
+				for (int h = 0; h < M; h++) if (range_.villain[h][0] == c || range_.villain[h][1] == c) new_reach[1][h] = 0.0;
+				return cfr(node->children[ci].get(), new_reach, traverser, update, depth + 1);
+			};
+		});
+		for (int ci = 0; ci < nC; ci++) {
+			const std::vector<double>& child_util = child_utils[ci];
 			for (int h = 0; h < out_n; h++) total[h] += child_util[h] / nC;
 		}
 		return total;

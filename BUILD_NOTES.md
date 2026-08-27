@@ -5417,3 +5417,238 @@ bug to patch, and §40 already showed that ad hoc bet-size-menu changes
 made things worse, not better. The `report_actual_hand`/RANGE MISS
 diagnostic (§41) is the durable, reusable tool for continuing to monitor
 and quantify this over larger samples going forward.
+
+## 43. Parallelizing the live CFR resolve, take 2 — switching from `std::async` to OpenMP (matching `$HOME/src/TexasSolver`'s mechanism)
+
+### Background
+
+The live resolve (`tree/RealtimeSearch.h`'s `LiveResolver`, the only
+resolver class the production `dh_native_ai.cpp` path uses) was
+previously made multi-core (see the "Parallelizing live CFR resolve"
+work referenced from this session) by adding a depth-limited,
+branch-count-gated `parallel_map()` helper that dispatched each
+independent action/chance-card subtree via
+`std::async(std::launch::async, ...)`. That version was validated
+correct (bit-identical exploitability vs. serial) and gave TURN mode
+(the only mode with a wide, ~44-48-branch river chance node) a real
+~2.0-2.25x wall-clock speedup — but it was never committed, and directly
+measuring concurrent thread count during a TURN resolve showed it
+bursting to **~35-37 OS threads on a 10-core machine** every single CFR
+iteration, then immediately tearing them all down again. That
+oversubscription + per-iteration thread-creation/join cost is real
+overhead that a persistent thread pool would avoid entirely.
+
+The user asked for a direct comparison against `$HOME/src/TexasSolver`
+(a separate, mature open-source HUNL solver on this same machine),
+which is known to make full use of all CPU cores. Investigating its
+source confirmed:
+
+- It uses **OpenMP** (`#pragma omp parallel for`, `omp_set_num_threads(omp_get_num_procs())`
+  in `src/solver/PCfrSolver.cpp`), not `std::async` — a persistent
+  worker-thread pool created once, reused for the life of the process,
+  where dispatching a parallel region is a lightweight fork-join wakeup
+  rather than a fresh OS thread spawn.
+- Its hottest loop (`SliceCFR::leaf_cfv` in `src/solver/slice_cfr.cpp`)
+  parallelizes over **the full leaf-node / private-hand-range array**
+  (hundreds to 1000+ independent items per CFR sweep, `schedule(dynamic)`)
+  — a fundamentally larger, flatter, more uniform unit of work than our
+  tree-walker's action (2-4) or chance-card (44-48) branch fan-out.
+- Its `CMakeLists.txt` explicitly handles Apple Clang's lack of a
+  built-in OpenMP runtime by discovering Homebrew's `libomp`
+  (`brew --prefix libomp`, confirmed installed on this machine at
+  `/opt/homebrew/opt/libomp`) and adding `-Xpreprocessor -fopenmp
+  -I<libomp>/include`, linking `OpenMP::OpenMP_CXX`.
+
+The user asked to adopt the *same mechanism* (OpenMP) for our existing
+parallelization points, while explicitly preserving the turn/river
+cluster-based future-street leaf-EV lookup (`TurnClusterLeafModel`/
+`RiverClusterLeafModel` / `terminal_river_leaf`/`terminal_leaf`) exactly
+as-is — i.e. change *how* the existing action/chance-card fan-out is
+dispatched, not *what* gets computed.
+
+### What changed
+
+All changes are still scoped to `LiveResolver` only (confirmed again:
+`FlopResolver`/`StreetChainResolver` are untouched, used only by their
+own standalone test tools) in `tree/RealtimeSearch.h`:
+
+- Replaced `#include <future>`/`#include <thread>` with a guarded
+  `#ifdef _OPENMP / #include <omp.h> / #endif`. **Critically, the
+  `_OPENMP` guard means this is backward compatible**: any existing
+  build command that doesn't pass the new OpenMP flags still compiles
+  and runs correctly, just via the plain serial fallback path (no
+  speedup, but no breakage) — see `parallel_map()` below.
+- `LiveResolver`'s constructor now calls
+  `omp_set_num_threads(omp_get_num_procs())` (guarded by `#ifdef
+  _OPENMP`) — the same default TexasSolver uses — so the process uses
+  every logical core visible to it, explicitly, rather than relying on
+  OpenMP's own default (which is the same thing, but explicit avoids
+  surprises if some other library sets `OMP_NUM_THREADS` in the
+  inherited environment).
+- `parallel_map()` was rewritten to use `#pragma omp parallel for
+  schedule(dynamic)` (writing directly into a pre-sized
+  `std::vector<std::vector<double>> results(n)`, one distinct index per
+  iteration — safe with no aliasing) instead of a
+  `std::async`-per-task/`.get()`-join loop. Falls back to the identical
+  plain serial loop when `_OPENMP` is undefined, or when the existing
+  `depth < kParallelDepthCutoff && n >= kMinParallelBranchCount` gate
+  isn't satisfied.
+- Because a `cfr()` call can, in principle, throw (e.g. a corrupt/short
+  cluster-lookup read surfacing as `std::exception`), and an exception
+  escaping an OpenMP parallel region uncaught is undefined behavior
+  (typically an immediate `std::terminate`), each loop iteration now
+  catches and stashes the *first* exception seen (`std::exception_ptr`,
+  guarded by `#pragma omp critical`), and it is rethrown from ordinary
+  serial context only after the parallel region's implicit barrier has
+  fully finished — preserving the same "exception propagates to the
+  caller" behavior the original serial loop always had.
+- `kParallelDepthCutoff = 2` and `kMinParallelBranchCount = 8` are
+  **unchanged in value**, but their rationale comments were updated (see
+  "A subtle new finding" below) — the gate is no longer just an overhead
+  optimization, it is load-bearing for correctness-of-performance under
+  OpenMP's default nested-parallelism-disabled behavior.
+
+### A subtle new finding: OpenMP's default "no nested parallelism" makes branch-count gating even more important than it was under `std::async`
+
+Directly measured on this host (a small standalone repro, see
+`/tmp/omp_nest.cpp` pattern): `omp_get_nested()` defaults to `0`
+(disabled). An outer `#pragma omp parallel for` that fans out across all
+10 cores, followed by an *inner* `#pragma omp parallel for` issued from
+inside one of those 10 already-parallel workers, runs that inner region
+with a team size of **1** — i.e. it silently collapses to serial, with
+essentially zero added overhead, rather than trying to further
+subdivide already-busy cores. This is actually a *safety feature*: it is
+exactly why the OpenMP conversion does **not** reproduce the earlier
+`std::async` version's 35-thread oversubscription — only one level of
+the recursion ever really fans out.
+
+But it also means the branch-count gate isn't merely "is this node's
+per-branch work big enough to amortize dispatch overhead" anymore — it's
+now also "is this the BEST node, of the (at most two, per
+`kParallelDepthCutoff`) candidate depths, to spend the single available
+parallel opportunity on". This was confirmed empirically: temporarily
+lowering `kMinParallelBranchCount` from `8` to `2` (so a TURN mode's
+shallow, 3-4-action depth-0 decision node now satisfies the gate and
+grabs the one available parallel region) made **TURN mode roughly 2x
+SLOWER** — because its own much richer depth-1 river chance node
+(~44-48 branches) never gets a chance to parallelize; its own `#pragma
+omp parallel for` is now nested inside the already-active (and much
+narrower, 3-4-way) outer region and collapses to serial. The same
+change slightly *helped* RIVER mode (~14% faster) — because RIVER's
+game tree in this mode has no chance node at all to compete with, so
+letting its action nodes parallelize is a pure win with nothing to
+steal the opportunity from.
+
+**Net effect: `kMinParallelBranchCount = 8` remains the correct value**,
+now for two independent reasons instead of one: it still avoids paying
+fork-join overhead on tiny nodes, and it correctly reserves the single
+available (non-nested) parallel opportunity for whichever node in the
+first two recursion depths is actually wide enough to benefit — which
+in practice means "the TURN river chance node", not "whatever
+2-4-action node happens to be shallowest".
+
+### Validation
+
+**Build.** New compile/link invocation (adds Homebrew's `libomp`, only
+needed when the OpenMP speedup is wanted — omitting these flags still
+compiles and runs correctly via the serial fallback):
+
+```
+g++ -std=c++17 -O2 -Wall -Wextra -DDH_SKIP_RIVER_CLUSTER \
+    -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include \
+    -shared -fPIC -o dh_native_ai.dylib tools/dh_native_ai.cpp \
+    -L/opt/homebrew/opt/libomp/lib -lomp
+```
+
+Confirmed the resulting `dh_native_ai.dylib` still exports all 5 ABI
+symbols (`nm -gU`: `_restart_game`, `_Next_stage`, `_opp_take_action`,
+`_getdecision`, `_report_actual_hand`), and `otool -L` shows it now
+additionally links `/opt/homebrew/opt/libomp/lib/libomp.dylib` (an
+absolute path — resolves fine via `ctypes.cdll.LoadLibrary` as long as
+Homebrew's `libomp` stays installed at that path; this is now a **new
+hard prerequisite** for anyone rebuilding the live-resolve path with
+OpenMP enabled — `brew install libomp`).
+
+**Correctness (bit-identical to serial across two different mechanisms
+now).** `tools/test_resolver_exploitability.cpp`, built three ways —
+plain serial (no OpenMP flags, `_OPENMP` undefined), OpenMP-gated
+(current), and (transiently, for the nested-parallelism experiment
+above) OpenMP with a lowered gate — produced **identical** exploitability
+percentages in every case: FLOP 6000→0.795%, 10000→0.543%; RIVER
+15000→0.007%, 30000→0.721%; TURN 200→6.655%, 2000→3.295%. Confirms the
+OpenMP conversion changed nothing about the algorithm, only its thread
+dispatch mechanism.
+
+**Performance (measured back-to-back under identical system load, after
+stopping a concurrent live Slumbot session that had briefly confounded
+an earlier same-session comparison):**
+
+| Mode  | Iterations | Serial (no OpenMP) | OpenMP (gated) | Speedup |
+|-------|-----------:|--------------------:|----------------:|--------:|
+| FLOP  | 10000      | 670.5 ms            | 671.6 ms         | ~1.0x (unaffected, as intended — gate excludes its 2-4-action nodes) |
+| RIVER | 30000      | 3779.8 ms           | 3730.9 ms        | ~1.0x (unaffected, as intended) |
+| TURN  | 2000       | 7472.5 ms           | 3315.4 ms        | **~2.25x** |
+
+**Production-realistic cross-check**
+(`tools/test_run_until_converged.cpp`, mirrors `dh_native_ai.cpp`'s
+actual adaptive `run_until_converged()` loop with per-mode safety caps —
+TURN's is `{batch=50, max_iters=20000, max_ms=12000.0}`):
+
+| Mode  | Serial: iters / exploit | OpenMP: iters / exploit |
+|-------|--------------------------|---------------------------|
+| FLOP  | 4800 / 0.962% (converged under target, 819.4ms) | 4800 / 0.962% (converged, 818.5ms) — identical |
+| RIVER | 12500 / 0.595% (converged under target, 4714.2ms) | 12500 / 0.595% (converged, 4662.8ms) — identical |
+| TURN  | 800 / 4.982% (hit 12s safety cap, 12014.6ms) | **1800** / **1.515%** (hit 12s safety cap, 12189.6ms) |
+
+TURN completed **2.25x more CFR iterations** (1800 vs. 800) within the
+identical ~12-second live-decision time budget, and its exploitability
+at cap dropped from 4.982% to 1.515% — a substantially better-converged
+(less exploitable) TURN strategy for the same wall-clock cost, with zero
+change to the timing/safety-cap logic itself. This exceeds the earlier
+(never-committed) `std::async` version's result on the same tool
+(1700 vs. 850 iterations, ~2.0x) — consistent with OpenMP's lower
+per-iteration dispatch overhead (persistent pool vs. fresh-thread
+creation every call) translating directly into more usable CFR work per
+second.
+
+**Regression suite.** Re-ran `tools/test_live_resolver_iteration_budget.cpp`
+and `tools/test_live_resolver_range_scaling.cpp` against the final
+OpenMP build — both complete without error, no crashes, no NaNs/asserts
+(these tools don't print exploitability, only timing, so they serve as
+crash/hang regression coverage, not a correctness re-check).
+
+**Live smoke test.** Loaded the rebuilt `dh_native_ai.dylib` via
+`ctypes.cdll.LoadLibrary` (the exact mechanism `pypokergui/fish_player_setup.py`
+uses) and drove it through `restart_game` → preflop `getdecision` →
+`Next_stage`(flop) → `getdecision` → `Next_stage`(turn) → `getdecision`
+→ `Next_stage`(river) → `getdecision`, using the real 4-argument
+production ABI (`restart_game(my_id, c1, c2)`, `Next_stage(betting_stage,
+cumulative_board_bytes)`, `opp_take_action(action_bytes)`,
+`getdecision(out_buf)`). All four streets returned valid action strings
+(`call`/`allin`/`call`/`call`) with no crash or exception. (TURN alone
+took ~25s in this specific run only because the test binary was built
+with `-DDH_SKIP_RIVER_CLUSTER`, which disables the river-cluster leaf-EV
+shortcut entirely and forces full-depth showdown expansion every
+iteration — production builds with the real `river_hand_cluster.bin`
+hit the normal ~12-second safety cap instead, as shown in the
+`test_run_until_converged` table above.)
+
+### Practical implication
+
+Live TURN-mode decisions (the single most expensive mode, and the one
+previously identified as usually hitting its safety cap rather than its
+convergence target) now get roughly **2.25x more CFR work done in the
+same time budget** than the original single-threaded implementation,
+translating directly to a lower-exploitability (better) strategy for
+those decisions, with zero measured change to FLOP/RIVER timing or any
+mode's algorithmic output. FLOP/RIVER remain single-threaded by design
+(their action-only trees don't have a branch wide enough to clear
+`kMinParallelBranchCount`, and forcing them to parallelize was measured
+to make them slightly slower before, and to actively harm TURN's own
+parallelization opportunity via OpenMP's non-nested-region semantics).
+
+**New build prerequisite**: Homebrew's `libomp` package
+(`brew install libomp`) is now required to get this speedup; without it
+(or without passing the `-fopenmp`-related flags), the code still
+compiles and runs correctly via the plain serial fallback path, just
+without the TURN-mode speedup.
