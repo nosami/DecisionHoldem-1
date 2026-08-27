@@ -512,7 +512,9 @@ def main():
             (token, hand_winnings) = PlayHand(token)
             total_winnings += hand_winnings
             play_times += 1
-            print('play times: %d, total Winnings: %i' % (play_times,total_winnings))
+            color = '\033[32m' if total_winnings > 0 else '\033[31m'  # green if profitable, red otherwise
+            reset = '\033[0m'
+            print('play times: %d, total Winnings: %s%i%s' % (play_times, color, total_winnings, reset))
         except ValueError as e:
             print(e)
             time.sleep(1)
