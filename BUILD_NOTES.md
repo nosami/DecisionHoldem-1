@@ -6544,3 +6544,143 @@ at all.
 No cluster/model data, secrets, or compiled binaries (`.dylib`, test
 tool executables) are committed -- all covered by existing `.gitignore`
 patterns, extended for the one new tool above.
+
+## 50. Investigated whether the range-narrowing model's "check = weak" pattern ignores check-raise value (user challenge), using a new user-flagged hand (ThTd vs. a slowplayed JhJc trip-jacks cooler, -20,000 chip loss) as the concrete test case
+
+**User's question, verbatim**: "CHECK can be either weak or strong (check raise). We
+discussed this earlier." -- challenging whether
+`narrow_villain_range_postflop()` naively treats every observed check as
+evidence of a weak hand, when a real equilibrium computation should
+already discount that by however often strong hands profitably slowplay
+and check-raise on that specific board.
+
+This section documents a rigorous, code-level (not speculative) answer,
+using a hand the user pasted directly from a live session log: hero
+(ThTd, SB) 3-bet-called preflop, checked flop Ks-Jd-2h through, barrelled
+turn 5h and shoved river Qd as a near-pure semi-bluff (each street's
+`[DH_STRATEGY]` line showed 87-99% bet/raise/allin frequency); villain
+slowplayed flopped trip jacks the entire way (check-check-check) and
+called both barrels, showing JhJc, for a -20,000 chip loss. The live
+log's own post-hand diagnostic said JhJc's tracked rank was 330/990
+(33rd percentile) -- "within expected range," not flagged as a miss --
+so the open question was whether the underlying per-street narrowing
+that fed into hero's own barrelling decisions was itself sound.
+
+### Step 1: is check-raise structurally reachable in this resolver's tree at all?
+
+Read `RealtimeSearch.h`'s `LiveResolver::expand()` (~line 1521) and the
+`Node`/`children` structure it builds. Confirmed the tree is a genuine
+recursive CFR subgame: after villain checks and hero bets, the resulting
+node correctly enumerates villain's OWN subsequent legal actions
+(fold/call/raise/allin) via `Searchstate::legal_actions()` and
+`player_i_index` alternation, stopping only at a chance node (new board
+card) or `betting_stage>=4`. `narrow_villain_range_postflop()`'s resolver
+is additionally built with `extended_actions=true`, giving every node
+(including this check-raise response node) a real "1x-pot raise" branch,
+not just fold/call/allin. So check-raise upside for a checked hand is,
+in principle, already backpropagated into that hand's computed
+`P(check)` via `average_strategy()` -- this is a real CFR self-play
+solve of the actual subgame, not a naive one-shot heuristic that scores
+"check" as inherently weak.
+
+### Step 2: does this hold up empirically for the exact user-flagged hand, not just in theory?
+
+Built `tools/test_jj_slowplay_cooler.cpp`, a standalone tool that replays
+this EXACT hand (same cards, same board, same action sequence) through
+the real production `opp_take_action()`/`apply_own_action()`/
+`Next_stage()` functions (not a reimplementation), printing JhJc's
+tracked weight/rank after every narrowing step. Added a
+`probe_check_strategy()` helper that reconstructs the identical resolver
+`narrow_villain_range_postflop()` builds at the flop-check decision and
+reads `average_strategy()` directly per-combo (bypassing the aggregate
+weight-multiply) to get every tracked combo's raw, un-multiplied
+`P(check)` -- not just the post-narrowing belief weight.
+
+Run at the real production convergence budget (FLOP mode: 200-iteration
+batches, 3000ms wall-clock cap, `run_until_converged()`'s existing
+config, §35/§37):
+
+```
+[2-probe] [production budget] elapsed=538ms exploitability=0.71% of pot
+[2-probe] P(check) stats across 1081 combos: mean=0.4975 median=0.5283 min=0.0004 max=0.9998
+[2-probe] JhJc's OWN P(check)=0.0438 (rank 773/1081, BELOW the median)
+```
+
+So the model's own solved strategy gives JhJc (trip jacks on a dry K-J-2
+rainbow board) only a ~4.4% check frequency, well below the ~53% median
+across all 1081 tracked villain combos -- meaning the resolve concludes
+trip jacks should be betting (not checking) the large majority of the
+time on this specific dry, disconnected texture. This is a real,
+CFR-computed conclusion, not check-raise being ignored by construction.
+
+### Step 3: is 4.4% a converged number, or CFR noise from the tight real-time budget?
+
+`resolver.run()` (`RealtimeSearch.h` ~line 1111) is deterministic vanilla
+CFR with full tree traversal every iteration -- there is no RNG anywhere
+in the solve (confirmed by inspection: no `rand`/`mt19937`/
+`random_device` in the CFR loop). So "noise" here cannot come from a
+random seed; it can only come from how many iterations complete before
+the resolver's wall-clock/iteration cap cuts it off. Extended
+`probe_check_strategy()` to keep running the SAME persistent resolver
+tree (regret/strat_sum accumulation across separate `run()` calls is
+already validated correct in `test_resolver_exploitability.cpp`, per
+`run_until_converged()`'s existing comment) for a further 60 real
+seconds -- roughly **340x** the iteration count actually used in
+production for this node:
+
+```
+[2-probe] [+60000ms / 178400 extra iters] exploitability=0.02% of pot
+[2-probe] P(check) stats across 1081 combos: mean=0.4975 median=0.5283 min=0.0004 max=0.9998
+[2-probe] JhJc's OWN P(check)=0.0550 (rank 625/1081, still BELOW the median)
+```
+
+Exploitability dropped 35x (0.71% -> 0.02%, an essentially fully
+converged solve), yet JhJc's own check frequency moved only 4.4% -> 5.5%
+-- same order of magnitude, still clearly and consistently below the
+median/mean check frequency of the range as a whole. **This rules out
+under-convergence of this specific low-probability action as the
+explanation.** The ~5% check frequency for trip jacks on this board is a
+stable equilibrium property of the model, not an artifact of the
+real-time 3-second production cap.
+
+### Conclusion
+
+The user's challenge was well-founded as a question to ask, but the
+architecture already answers it correctly: check-raise value IS
+structurally modeled (a genuine CFR subgame, not a naive heuristic), and
+empirically the resulting ~5% check frequency for a monster hand on a
+dry, disconnected board (K-J-2 rainbow -- nothing for villain's range to
+catch up with, so slowplaying trades away thin value for limited
+deception upside) is a defensible, stable GTO conclusion, not a
+convergence artifact or a "check == weak" oversimplification. The
+-20,000 chip result in this specific hand is best explained as a
+genuine, low-probability slowplay by a real opponent landing squarely in
+the ~5% of hands consistent with checking trip jacks here -- i.e.
+variance/opponent-specific play within the model's own correctly-modeled
+distribution, not a bug in the narrowing logic.
+
+**What remains open**: this result is specific to ONE board texture (dry,
+disconnected, low-card). It does not rule out that WETTER boards (more
+draws, more incentive to slowplay for protection-neutral value, or where
+check-raise is a bigger part of the strong-hand mix) could show a
+different, possibly more concerning pattern -- that has not been tested.
+The broader unexplained aggregate loss-rate anomaly (z ≈ -2.6 to -2.9
+across historical logs) also remains only partially explained: the
+preflop-confidence fallback, position, resolver convergence quality, and
+blueprint provenance have each been directly ruled out this
+investigation (see conversation history), and this check-raise/slowplay
+mechanism has now been ruled out as well for this specific hand/texture
+category, but no single confirmed root cause for the aggregate anomaly
+has yet been found. The most credible remaining candidate is
+whatever real (if any) subtle bias narrowing might introduce back into
+hero's OWN live decisions (`resolve_decision()` consumes the same
+narrowed `g.villain_range` -- confirmed by code, not multiplied
+speculation) on OTHER board textures/action sequences not yet tested,
+but this has not been quantified.
+
+### Files changed
+
+- `PokerAI/tools/test_jj_slowplay_cooler.cpp` -- new standalone
+  replay/probe tool (this section); not yet committed.
+- No production code (`dh_native_ai.cpp`, `RealtimeSearch.h`) changed
+  this section -- investigation only.
