@@ -5652,3 +5652,91 @@ parallelization opportunity via OpenMP's non-nested-region semantics).
 (or without passing the `-fopenmp`-related flags), the code still
 compiles and runs correctly via the plain serial fallback path, just
 without the TURN-mode speedup.
+
+## 44. Root-causing one specific catastrophic loss (`/tmp/run.log` hand #6, -20,000 chips) down to the exact narrowing step that crushed it — confirms and sharpens §42
+
+**Context**: a live 227-hand Slumbot session (`/tmp/run.log`, final
+`session_total = -35550`) had one hand, #6, responsible for 57% of the
+entire session's net loss by itself: hero (`9c7h`) shoved the river
+(`allin=15.92%` in a real mixed strategy, `expl=0.82%`) on board
+`As Js 2d 2h 7s` into villain's `Jc2c` — a hand that flopped two pair
+(jacks-and-deuces) and turned a full house (deuces full of jacks) when
+the board paired a second time, then **checked every street** (flop,
+turn-open, river-open) before calling both hero's turn bet and the final
+river shove. The hand-end `report_actual_hand()` diagnostic already
+flagged this as a RANGE MISS (`Jc2c` ranked 350th/990 tracked combos,
+weight 0.0020% vs. a 0.1010% uniform baseline).
+
+### Reproducing it step-by-step (`tools/test_hand6_range_miss.cpp`)
+
+Added a new, purely-additive reproduction tool (same pattern as
+`test_villain_weight_distribution.cpp`/`test_bet_size_narrowing.cpp` —
+`#include`s `dh_native_ai.cpp` directly, uses only real production
+functions, no reimplementation) that replays this exact hand's board,
+hole cards, and action sequence through `opp_take_action()`/
+`apply_own_action()`, printing `Jc2c`'s tracked weight/rank after **every
+individual narrowing step** instead of only at hand-end:
+
+```
+BUILD: g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_hand6_range_miss tools/test_hand6_range_miss.cpp
+RUN:   ./tools/test_hand6_range_miss   (~31s: 5 real LiveResolver narrowing resolves)
+
+[0] fresh preflop prior:                     weight=0.081633% rank=1/1225   (uniform=0.0816%) at/above uniform
+[1] after preflop call:                      weight=0.082217% rank=379/1225 (uniform=0.0816%) at/above uniform
+[2] after villain FLOP check:                weight=0.006432% rank=458/1081 (uniform=0.0925%) BELOW uniform   (~13x cut)
+[3] after villain TURN check (opening):       weight=0.000008% rank=439/1035 (uniform=0.0966%) BELOW uniform  (~800x further cut)
+[4] after villain TURN call (of hero's bet):  weight=0.000116% rank=419/1035 (uniform=0.0966%) BELOW uniform  (partial recovery, ~14x up)
+[5] after villain RIVER check (opening):      weight=0.000000% rank=655/990  (uniform=0.1010%) BELOW uniform  (crushed again)
+[6] after villain RIVER call (of shove) FINAL: weight=0.000057% rank=641/990  (uniform=0.1010%) BELOW uniform (partial recovery, still a miss)
+```
+
+(Numbers 0.000057%/rank 641 differ slightly from the live log's
+0.0020%/rank 350 because this reproduction ran with
+`DH_SKIP_RIVER_CLUSTER` set, i.e. without the `RiverClusterLeafModel`
+the live session had loaded for TURN-mode resolves — see §34/§36 — so
+the TURN-mode leaf valuation differs. The qualitative conclusion below
+is unaffected: both runs land `Jc2c` well below its uniform share at
+every postflop step.)
+
+### The concrete finding: it is specifically the *check* actions, not the *call* actions, that crush this hand's weight
+
+Each **check** narrowing step cut `Jc2c`'s weight by 1-3 orders of
+magnitude (preflop-call-adjusted 0.082% → 0.0064% on the flop check,
+then a further ~800x on the turn's opening check, then crushed to
+~0.0000% again on the river's opening check). Each **call** narrowing
+step (of hero's own bet/shove) partially *restored* weight (0.000008% →
+0.000116% after the turn call; 0.000000% → 0.000057% after the river
+call) — consistent with calling a real bet being more informative of
+genuine strength than an ambiguous check. This is a direct, granular
+confirmation of §42's conclusion ("the range model does not just have
+generic noise, it seems to specifically struggle to keep enough weight
+on checks/calls with a very strong made hand"): the resolved CFR
+strategy at these board-paired nodes apparently assigns hands like a
+flopped two pair / turned full house a very low probability of
+*checking* (presumably because the abstraction's own solve concludes
+such hands should be betting/raising for value/protection almost
+always), so observing a check is treated as strong evidence *against*
+holding exactly this class of hand — even though real opponents (and,
+apparently, villain here) routinely slowplay big hands on scary paired
+boards.
+
+### What this does NOT change
+
+- This is the same fundamental abstraction limitation §42 already
+  identified and explicitly decided not to patch ("no further fix is
+  being attempted... this is a fundamental limitation of the
+  bucketed/CFR-blueprint approach, not a discrete bug to patch"). This
+  section adds sharper, per-step evidence for *why*/*where* it happens
+  (specifically the opening-check nodes on paired boards), not a new
+  root cause or a reason to revisit that decision.
+- Hero's river shove itself was not a blunder in isolation — it was a
+  real ~16%-frequency mixed-strategy action at a measured 0.82%
+  exploitability, i.e. correct-strategy variance compounded by (not
+  purely caused by) the range-model's under-weighting of villain's exact
+  holding.
+
+### Files touched
+
+- `tools/test_hand6_range_miss.cpp` (new, purely additive) — direct,
+  reusable reproduction of this specific hand for any future
+  investigation of paired-board narrowing behavior.
