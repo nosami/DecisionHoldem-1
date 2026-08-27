@@ -105,6 +105,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#include "PseudoHarmonic.h"
 
 namespace RealtimeSearch {
 
@@ -119,26 +120,6 @@ namespace RealtimeSearch {
 // well-documented published formula -- it does not depend on anything
 // proprietary and is unit-testable in isolation from cluster data.
 // ---------------------------------------------------------------------------
-inline double pseudo_harmonic_prob_lower(double a, double b, double x) {
-	if (b <= a) return 1.0;
-	if (x <= a) return 1.0;
-	if (x >= b) return 0.0;
-	double num = (b - x) * (1.0 + a);
-	double den = (b - a) * (1.0 + x);
-	if (den <= 0) return 1.0;
-	double p = num / den;
-	if (p < 0) p = 0;
-	if (p > 1) p = 1;
-	return p;
-}
-
-template <typename RNG>
-inline bool randomized_pseudo_harmonic(double a, double b, double x, RNG& rng) {
-	double p_lower = pseudo_harmonic_prob_lower(a, b, x);
-	std::uniform_real_distribution<double> u(0.0, 1.0);
-	return u(rng) < p_lower;
-}
-
 // A concrete hero/villain range: explicit lists of 2-card hole-card combos
 // (card ids 0-51, this repo's native convention -- see poker/Card.h).
 // NOT the same as the .so's opaque "Players_range" struct (whose internal
@@ -1798,4 +1779,3 @@ private:
 };
 
 } // namespace RealtimeSearch
-

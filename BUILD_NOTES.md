@@ -6390,3 +6390,68 @@ change to how each street's resolve is seeded, would need the same
 exploitability-curve-style validation as §45/§46 before ever being
 considered for production -- not undertaken here. Left for the user to
 decide whether/how to proceed.
+
+## 49. Direct indexed flop/turn blueprint policy (default off)
+
+`PokerAI/tree/IndexedBlueprint.h` adds a read-only, positional-I/O reader
+for the trained `blueprint_strategy.dat`. Runtime does not mmap or
+materialize the 16.1 GB tree. A one-time structural scan writes a 5.36 MB
+sidecar containing decision-node source offsets, action bytes, and
+chance-collapsed child links. The sidecar is portable little-endian,
+versioned, checksummed, tied to the source by exact size plus a stable
+five-region sampled hash, bounds-checked, and written by atomic
+temp-file rename.
+
+Build an index from `PokerAI/`:
+
+```sh
+g++ -std=c++17 -O2 -o tools/build_blueprint_index tools/build_blueprint_index.cpp
+./tools/build_blueprint_index cluster/blueprint_strategy.dat \
+  cluster/blueprint_strategy.dat.idx
+```
+
+Enable direct flop/turn use explicitly:
+
+```sh
+export DH_DIRECT_BLUEPRINT=1
+# Optional overrides:
+export DH_BLUEPRINT_PATH=/path/to/blueprint_strategy.dat
+export DH_BLUEPRINT_INDEX=/path/to/blueprint_strategy.dat.idx
+```
+
+The default remains off, preserving the existing `LiveResolver` path.
+When enabled, `dh_native_ai.cpp` tracks one public-tree cursor through
+preflop actions and chance transitions. Arbitrary observed raises are
+mapped only among the current node's real raise actions using exact
+`State.h` chip rounding first, then pseudo-harmonic bracketing/clamping.
+Opponent likelihoods interpolate both bracket policies while one
+reproducibly randomized branch advances the cursor. Flop/turn hero
+policy reads one current-street bucket row; opponent updates load one
+sequential node payload into a bounded 32 MiB LRU. River continues to
+use `LiveResolver`. Any fingerprint, topology, translation, bucket,
+read, or legality failure disables the cursor for that hand and falls
+back to `LiveResolver`.
+
+Focused validation:
+
+```sh
+g++ -std=c++17 -O2 -o tools/test_indexed_blueprint tools/test_indexed_blueprint.cpp
+./tools/test_indexed_blueprint
+g++ -std=c++17 -O2 -o tools/test_blueprint_action_translation \
+  tools/test_blueprint_action_translation.cpp
+./tools/test_blueprint_action_translation
+g++ -std=c++17 -O2 -o tools/test_real_blueprint_index \
+  tools/test_real_blueprint_index.cpp
+./tools/test_real_blueprint_index /path/to/blueprint_strategy.dat \
+  /path/to/blueprint_strategy.dat.idx
+```
+
+The real scan ended at exactly 16,123,074,125 bytes and found 118,616
+decision batches, 10,864 chance nodes, 193,774 terminals, and depth 19.
+It took 10.97 s, produced a 5,357,737-byte index, and peaked at about
+16.3 MB memory. The real integration test verified known
+flop/turn/river offsets and exact single-row versus sequential-payload
+probability equality. On the local SSD, reader startup was 10-15 ms, a
+full 50,000-bucket/eight-action flop payload was about 5.2 ms, 1,081
+cached likelihood-row accesses took about 0.006 ms, a full turn payload
+took about 0.69 ms, and a cached node lookup was below 0.001 ms.

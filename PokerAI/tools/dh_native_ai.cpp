@@ -37,7 +37,8 @@
 //       format writeup and honest validation status (this reader has not
 //       been executed against the real file from within this development
 //       sandbox, which lacks disk access to it -- see BUILD_NOTES.md).
-//     - FLOP/TURN/RIVER decisions use LiveResolver (RealtimeSearch.h): a
+//     - By default FLOP/TURN/RIVER decisions use LiveResolver
+//       (RealtimeSearch.h): a
 //       small, fast, REDUCED-ACTION (fold / call / all-in only -- no
 //       intermediate bet sizes) range-vs-range vanilla CFR resolve. The
 //       opponent's range is NOT a fixed-size sample: LiveGame::villain_range
@@ -53,9 +54,9 @@
 //       fresh vanilla-CFR resolve per decision against the current belief).
 //       Postflop narrowing uses its OWN, separate resolver instance with one
 //       extra genuine branch beyond hero's own fold/call/allin action set: a
-//       canonical 1x-pot raise (native action byte 2). Hero's own live
-//       decisions are unaffected (resolve_decision() always uses the
-//       original 3-action resolver) -- this extra branch exists purely so
+//       canonical 1x-pot raise (native action byte 2). In the default
+//       resolver path, hero's own live decisions still use
+//       resolve_decision()'s original action set -- this extra branch exists so
 //       narrow_villain_range_postflop() has a real node to narrow an
 //       observed non-all-in raise against, instead of silently skipping it
 //       as earlier versions did. Any non-all-in raise size collapses onto
@@ -71,7 +72,16 @@
 //       exactly (real showdown, no cluster approximation) since there are no
 //       more cards to deal. See BUILD_NOTES.md for the design writeup and
 //       measured performance cost of tracking a full (rather than a small,
-//       fixed-size sampled) range.
+//       fixed-size sampled) range. Setting DH_DIRECT_BLUEPRINT=1 opts FLOP
+//       and TURN into IndexedBlueprint.h's direct, positional-I/O policy
+//       lookup instead. One public-tree cursor is advanced through preflop
+//       and chance nodes; arbitrary opponent raises are pseudo-harmonically
+//       translated only among that node's real raise actions, and the same
+//       node's current-street bucket rows update villain_range. The source
+//       and sidecar paths default to cluster/blueprint_strategy.dat and
+//       cluster/blueprint_strategy.dat.idx and can be overridden with
+//       DH_BLUEPRINT_PATH/DH_BLUEPRINT_INDEX. Any failure disables this
+//       opt-in cursor for the hand and transparently restores LiveResolver.
 //     - TURN mode's per-CFR-iteration cost (dealing a real river card via a
 //       chance node, then an exact showdown, for every one of ~44-48
 //       branches, every iteration) can optionally be replaced with a cheap
@@ -101,6 +111,8 @@
 #include "../tree/RealtimeSearch.h"
 #include "../tree/BlueprintReader.h"
 #include "../tree/PreflopCache.h"
+#include "../tree/IndexedBlueprint.h"
+#include "../tree/BlueprintActionTranslation.h"
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -138,6 +150,7 @@ struct LiveGame {
 	int n_raises_this_street = 0;
 	int actions_this_street = 0;
 	int last_raise_size = 0;
+	int blueprint_last_raise_size = 0;
 	bool has_allin = false;
 	int folder = -1; // slot that folded, or -1
 	unsigned char my_hole[2] = { 0, 0 };
@@ -167,6 +180,8 @@ struct LiveGame {
 	// original "call" placeholder rather than guess.
 	std::vector<unsigned char> preflop_action_path;
 	bool preflop_path_confident = true;
+	uint32_t blueprint_node = IndexedBlueprint::NO_CHILD;
+	bool blueprint_cursor_usable = false;
 };
 
 LiveGame g;
@@ -211,6 +226,50 @@ struct PreflopCacheLoader {
 	}
 };
 PreflopCacheLoader g_preflop_cache_loader;
+
+std::unique_ptr<IndexedBlueprint::Reader> g_indexed_blueprint;
+bool g_indexed_blueprint_init_attempted = false;
+
+bool direct_blueprint_enabled() {
+	const char* value = std::getenv("DH_DIRECT_BLUEPRINT");
+	return value && (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+		std::strcmp(value, "TRUE") == 0);
+}
+
+std::string direct_blueprint_path() {
+	const char* value = std::getenv("DH_BLUEPRINT_PATH");
+	return value ? std::string(value) : std::string("cluster/blueprint_strategy.dat");
+}
+
+std::string direct_blueprint_index_path(const std::string& source) {
+	const char* value = std::getenv("DH_BLUEPRINT_INDEX");
+	return value ? std::string(value) : source + ".idx";
+}
+
+void initialize_direct_blueprint() {
+	g.blueprint_cursor_usable = false;
+	g.blueprint_node = IndexedBlueprint::NO_CHILD;
+	if (!direct_blueprint_enabled()) return;
+	if (!g_indexed_blueprint_init_attempted) {
+		g_indexed_blueprint_init_attempted = true;
+		try {
+			std::string source = direct_blueprint_path();
+			g_indexed_blueprint.reset(new IndexedBlueprint::Reader(
+				source, direct_blueprint_index_path(source)));
+			std::fprintf(stderr,
+				"[DH_DIRECT_BLUEPRINT] indexed reader enabled: %zu decision nodes, "
+				"bounded 32 MiB policy cache\n", g_indexed_blueprint->node_count());
+		} catch (const std::exception& e) {
+			std::fprintf(stderr,
+				"[DH_DIRECT_BLUEPRINT] unavailable (%s) -- flop/turn will use LiveResolver\n",
+				e.what());
+		}
+	}
+	if (g_indexed_blueprint) {
+		g.blueprint_node = g_indexed_blueprint->root();
+		g.blueprint_cursor_usable = g.blueprint_node != IndexedBlueprint::NO_CHILD;
+	}
+}
 
 // Optional, purely-additive fast path for TURN-mode decisions (BUILD_NOTES.md
 // section 34): if the DH_RIVER_SPLIT_DIR environment variable is set to the
@@ -427,6 +486,7 @@ void reset_street_counters() {
 	g.n_raises_this_street = 0;
 	g.actions_this_street = 0;
 	g.last_raise_size = 0;
+	g.blueprint_last_raise_size = 0;
 }
 
 // pypokergui's "raise N" amount is always the TOTAL bet for the CURRENT
@@ -462,6 +522,134 @@ int match_raise_action_byte(int total_pot_before, int last_bigbet_before, int my
 			return byte;
 	}
 	return -1;
+}
+
+BlueprintActionTranslation::BettingContext blueprint_betting_context(int acting_slot) {
+	BlueprintActionTranslation::BettingContext context;
+	context.total_pot = (20000 - g.stack[0]) + (20000 - g.stack[1]);
+	context.max_commitment = std::max(20000 - g.stack[0], 20000 - g.stack[1]);
+	context.actor_commitment = 20000 - g.stack[acting_slot];
+	context.actor_stack = g.stack[acting_slot];
+	context.last_raise = g.blueprint_last_raise_size;
+	return context;
+}
+
+void disable_blueprint_cursor(const std::string& reason) {
+	if (g.blueprint_cursor_usable)
+		std::fprintf(stderr,
+			"[DH_DIRECT_BLUEPRINT] cursor disabled for this hand (%s) -- using LiveResolver\n",
+			reason.c_str());
+	g.blueprint_cursor_usable = false;
+	g.blueprint_node = IndexedBlueprint::NO_CHILD;
+}
+
+void advance_blueprint_cursor(unsigned char action) {
+	if (!g.blueprint_cursor_usable || !g_indexed_blueprint) return;
+	uint32_t next = g_indexed_blueprint->child(g.blueprint_node, action);
+	g.blueprint_node = next;
+	if (next == IndexedBlueprint::NO_CHILD) g.blueprint_cursor_usable = false;
+}
+
+BlueprintActionTranslation::Translation translate_current_blueprint_action(
+	int acting_slot,
+	BlueprintActionTranslation::Kind kind,
+	int observed_new_total)
+{
+	if (!g.blueprint_cursor_usable || !g_indexed_blueprint)
+		throw std::runtime_error("indexed blueprint cursor is unavailable");
+	return BlueprintActionTranslation::translate(
+		g_indexed_blueprint->actions(g.blueprint_node), kind,
+		blueprint_betting_context(acting_slot), observed_new_total, g.rng);
+}
+
+void track_blueprint_action(
+	int acting_slot,
+	BlueprintActionTranslation::Kind kind,
+	int observed_new_total = 0)
+{
+	if (!g.blueprint_cursor_usable) return;
+	try {
+		auto translation = translate_current_blueprint_action(acting_slot, kind, observed_new_total);
+		advance_blueprint_cursor(translation.sampled_action);
+	} catch (const std::exception& e) {
+		disable_blueprint_cursor(e.what());
+	}
+}
+
+void track_exact_blueprint_action(unsigned char action) {
+	if (!g.blueprint_cursor_usable) return;
+	try {
+		advance_blueprint_cursor(action);
+	} catch (const std::exception& e) {
+		disable_blueprint_cursor(e.what());
+	}
+}
+
+uint32_t current_postflop_bucket(unsigned char c1, unsigned char c2) {
+	unsigned char hand[2] = {c1, c2};
+	if (g.betting_stage == 1) {
+		if (g.board.size() < 3) throw std::runtime_error("flop board is incomplete");
+		unsigned char board[3] = {g.board[0], g.board[1], g.board[2]};
+		return engine->get_flop_cluster(hand, board);
+	}
+	if (g.betting_stage == 2) {
+		if (g.board.size() < 4) throw std::runtime_error("turn board is incomplete");
+		unsigned char board[4] = {g.board[0], g.board[1], g.board[2], g.board[3]};
+		return engine->get_turn_cluster(hand, board);
+	}
+	throw std::runtime_error("direct blueprint bucket requested outside flop/turn");
+}
+
+bool narrow_villain_range_direct_blueprint(
+	int opp_slot,
+	BlueprintActionTranslation::Kind kind,
+	int observed_new_total = 0)
+{
+	if (!g.blueprint_cursor_usable || !g_indexed_blueprint ||
+		(g.betting_stage != 1 && g.betting_stage != 2)) return false;
+	try {
+		uint32_t node = g.blueprint_node;
+		auto translation = translate_current_blueprint_action(opp_slot, kind, observed_new_total);
+		auto policy = g_indexed_blueprint->all_rows(node);
+		uint32_t expected_buckets = g.betting_stage == 1 ? 50000U : 5000U;
+		if (policy->bucket_count != expected_buckets)
+			throw std::runtime_error("current node has wrong street bucket dimension");
+		auto find_action = [&](unsigned char action) -> size_t {
+			auto it = std::find(policy->actions.begin(), policy->actions.end(), action);
+			if (it == policy->actions.end()) throw std::runtime_error("translated action absent from loaded policy");
+			return static_cast<size_t>(it - policy->actions.begin());
+		};
+		size_t lower = find_action(translation.lower_action);
+		size_t upper = find_action(translation.upper_action);
+		std::vector<double> updated(g.villain_range.size());
+		std::vector<double> before;
+		if (dh_verbose_enabled()) {
+			before.reserve(g.villain_range.size());
+			for (const auto& hand : g.villain_range) before.push_back(hand.weight);
+		}
+		double sum = 0.0;
+		size_t action_count = policy->actions.size();
+		for (size_t i = 0; i < g.villain_range.size(); ++i) {
+			const WeightedHand& hand = g.villain_range[i];
+			uint32_t bucket = current_postflop_bucket(hand.c1, hand.c2);
+			if (bucket >= policy->bucket_count) throw std::runtime_error("opponent bucket exceeds node dimension");
+			const double* row = policy->probabilities.data() + static_cast<size_t>(bucket) * action_count;
+			double likelihood = BlueprintActionTranslation::interpolated_probability(
+				translation, row[lower], row[upper]);
+			updated[i] = hand.weight * likelihood;
+			sum += updated[i];
+		}
+		if (!(sum > 1e-12)) throw std::runtime_error("direct blueprint range update collapsed to zero");
+		for (size_t i = 0; i < g.villain_range.size(); ++i)
+			g.villain_range[i].weight = updated[i] / sum;
+		advance_blueprint_cursor(translation.sampled_action);
+		dh_log_narrowing(g.betting_stage == 1 ? "flop-blueprint" : "turn-blueprint",
+			translation.sampled_action, before);
+		return true;
+	} catch (const std::exception& e) {
+		disable_blueprint_cursor(e.what());
+		return false;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -870,6 +1058,64 @@ void narrow_villain_range_postflop(int opp_slot, unsigned char observed_byte) {
 	}
 }
 
+std::string resolve_direct_blueprint_decision() {
+	if (!g.blueprint_cursor_usable || !g_indexed_blueprint ||
+		(g.betting_stage != 1 && g.betting_stage != 2)) return std::string();
+	try {
+		uint32_t node = g.blueprint_node;
+		const IndexedBlueprint::Entry& entry = g_indexed_blueprint->entry(node);
+		uint32_t expected_buckets = g.betting_stage == 1 ? 50000U : 5000U;
+		if (entry.bucket_count != expected_buckets)
+			throw std::runtime_error("current node has wrong street bucket dimension");
+		uint32_t bucket = current_postflop_bucket(g.my_hole[0], g.my_hole[1]);
+		std::vector<unsigned char> actions = g_indexed_blueprint->actions(node);
+		std::vector<double> probabilities = g_indexed_blueprint->row(node, bucket);
+		if (actions.size() != probabilities.size() || actions.empty())
+			throw std::runtime_error("invalid direct blueprint policy shape");
+		dh_log_strategy(g.betting_stage == 1 ? "FLOP-BLUEPRINT" : "TURN-BLUEPRINT",
+			actions, probabilities, -1.0,
+			(20000 - g.stack[0]) + (20000 - g.stack[1]));
+
+		double random = std::uniform_real_distribution<double>(0.0, 1.0)(g.rng);
+		double cumulative = 0.0;
+		unsigned char action = actions.back();
+		for (size_t i = 0; i < actions.size(); ++i) {
+			cumulative += probabilities[i];
+			if (random <= cumulative || i + 1 == actions.size()) {
+				action = actions[i];
+				break;
+			}
+		}
+
+		Searchstate state = build_current_searchstate(g.my_id);
+		unsigned char legal[32];
+		int legal_count = state.legal_actions(legal);
+		if (std::find(legal, legal + legal_count, action) == legal + legal_count)
+			throw std::runtime_error("sampled blueprint action is illegal in actual game state");
+
+		std::string result;
+		if (action == 'd') result = "fold";
+		else if (action == 'l') result = "call";
+		else if (action == 'n') result = "allin";
+		else {
+			auto context = blueprint_betting_context(g.my_id);
+			int call = context.max_commitment - context.actor_commitment;
+			int increment = BlueprintActionTranslation::raise_increment(context.total_pot + call, action);
+			int whole_hand_total = context.max_commitment + increment;
+			int earlier_streets = 20000 - g.stack_at_street_start[g.my_id];
+			int street_total = whole_hand_total - earlier_streets;
+			if (street_total <= committed_this_street(g.my_id) || street_total >= g.stack_at_street_start[g.my_id])
+				throw std::runtime_error("sampled blueprint raise converts to invalid API amount");
+			result = "raise " + std::to_string(street_total);
+		}
+		advance_blueprint_cursor(action);
+		return result;
+	} catch (const std::exception& e) {
+		disable_blueprint_cursor(e.what());
+		return std::string();
+	}
+}
+
 // Builds the Searchstate snapshot for the current decision, runs the
 // appropriately-scoped LiveResolver against the LIVE, currently-tracked
 // villain_range belief (not a fixed-size sample -- see above), and returns
@@ -1022,6 +1268,7 @@ std::string resolve_decision() {
 // etc.) -- see BUILD_NOTES.md for the full honest writeup.
 std::string resolve_preflop_decision() {
 	if (!g.preflop_path_confident) {
+		track_blueprint_action(g.my_id, BlueprintActionTranslation::Kind::Call);
 		return "call"; // an earlier raise this street didn't match the trained
 		                // abstraction's discrete sizing ladder -- see header.
 	}
@@ -1061,6 +1308,7 @@ std::string resolve_preflop_decision() {
 			if (r <= cum || a + 1 == res.actionstr.size()) {
 				unsigned char act = res.actionstr[a];
 				g.preflop_action_path.push_back(act);
+				track_exact_blueprint_action(act);
 				if (act == 'd') return "fold";
 				if (act == 'n') return "allin";
 				if (act == 'l') return "call";
@@ -1074,6 +1322,7 @@ std::string resolve_preflop_decision() {
 				return "raise " + std::to_string(new_total_bet);
 			}
 		}
+		track_blueprint_action(g.my_id, BlueprintActionTranslation::Kind::Call);
 		return "call"; // defensive, should be unreachable (probs sum to 1)
 	}
 	catch (const std::exception& e) {
@@ -1081,17 +1330,20 @@ std::string resolve_preflop_decision() {
 			"[DH_PREFLOP_BLUEPRINT] real blueprint lookup failed (%s) -- "
 			"falling back to placeholder 'call' for this decision only\n",
 			e.what());
+		track_blueprint_action(g.my_id, BlueprintActionTranslation::Kind::Call);
 		return "call";
 	}
 }
 
 void apply_own_action(const std::string& action) {
 	int me = g.my_id;
+	int prev_facing = std::max(committed_this_street(0), committed_this_street(1));
 	if (action == "fold") {
 		g.folder = me;
 		g.betting_stage = 5;
 	}
 	else if (action == "allin") {
+		g.blueprint_last_raise_size = std::max(0, g.stack_at_street_start[me] - prev_facing);
 		g.stack[me] = 0;
 		g.has_allin = true;
 		g.n_raises_this_street++;
@@ -1099,6 +1351,7 @@ void apply_own_action(const std::string& action) {
 	}
 	else if (action.rfind("raise ", 0) == 0) {
 		int amount = std::stoi(action.substr(6));
+		g.blueprint_last_raise_size = std::max(0, amount - prev_facing);
 		g.stack[me] = street_relative_raise_baseline(me) - amount;
 		g.n_raises_this_street++;
 		g.actions_this_street++;
@@ -1144,6 +1397,7 @@ void restart_game(int myid, int c1id, int c2id) {
 	g.preflop_path_confident = true;
 	init_villain_range();
 	reset_street_counters();
+	initialize_direct_blueprint();
 }
 
 void Next_stage(int betting_stage, char* community_card_idx) {
@@ -1152,6 +1406,15 @@ void Next_stage(int betting_stage, char* community_card_idx) {
 	g.betting_stage = betting_stage;
 	reset_street_counters();
 	prune_villain_range_for_board();
+	if (g.blueprint_cursor_usable && g_indexed_blueprint && betting_stage <= 2) {
+		try {
+			uint32_t expected = betting_stage == 1 ? 50000U : 5000U;
+			if (g_indexed_blueprint->entry(g.blueprint_node).bucket_count != expected)
+				throw std::runtime_error("street transition did not reach expected chance-collapsed node");
+		} catch (const std::exception& e) {
+			disable_blueprint_cursor(e.what());
+		}
+	}
 }
 
 void opp_take_action(char* actionstr_c) {
@@ -1161,24 +1424,34 @@ void opp_take_action(char* actionstr_c) {
 	bool preflop = (g.betting_stage == 0);
 	if (a == "fold") {
 		if (preflop) { if (g.preflop_path_confident) narrow_villain_range_preflop('d'); }
-		else narrow_villain_range_postflop(opp, 'd');
+		else if (!narrow_villain_range_direct_blueprint(
+			opp, BlueprintActionTranslation::Kind::Fold))
+			narrow_villain_range_postflop(opp, 'd');
+		if (preflop) track_blueprint_action(opp, BlueprintActionTranslation::Kind::Fold);
 		g.folder = opp;
 		g.betting_stage = 5;
 		if (preflop && g.preflop_path_confident) g.preflop_action_path.push_back('d');
 	}
 	else if (a == "allin") {
 		if (preflop) { if (g.preflop_path_confident) narrow_villain_range_preflop('n'); }
-		else narrow_villain_range_postflop(opp, 'n');
+		else if (!narrow_villain_range_direct_blueprint(
+			opp, BlueprintActionTranslation::Kind::AllIn))
+			narrow_villain_range_postflop(opp, 'n');
+		if (preflop) track_blueprint_action(opp, BlueprintActionTranslation::Kind::AllIn);
 		g.stack[opp] = 0;
 		g.has_allin = true;
 		int amount = g.stack_at_street_start[opp];
 		g.last_raise_size = std::max(0, amount - prev_facing);
+		g.blueprint_last_raise_size = g.last_raise_size;
 		g.n_raises_this_street++;
 		g.actions_this_street++;
 		if (preflop && g.preflop_path_confident) g.preflop_action_path.push_back('n');
 	}
 	else if (a.rfind("raise ", 0) == 0) {
 		int amount = std::stoi(a.substr(6));
+		int observed_whole_hand_total = amount;
+		if (!preflop)
+			observed_whole_hand_total += 20000 - g.stack_at_street_start[opp];
 		if (preflop && g.preflop_path_confident) {
 			// See street_relative_raise_baseline()'s comment: this must use
 			// the whole-hand-cumulative (20000 - stack) convention, matching
@@ -1209,16 +1482,27 @@ void opp_take_action(char* actionstr_c) {
 			// BUILD_NOTES.md for the full design writeup, including why a
 			// single bucket (not the full native ladder) was chosen.
 			bool would_be_allin = (street_relative_raise_baseline(opp) - amount) == 0;
-			narrow_villain_range_postflop(opp, would_be_allin ? (unsigned char)'n' : (unsigned char)2);
+			bool narrowed = narrow_villain_range_direct_blueprint(
+				opp, would_be_allin ? BlueprintActionTranslation::Kind::AllIn
+					: BlueprintActionTranslation::Kind::Raise,
+				observed_whole_hand_total);
+			if (!narrowed)
+				narrow_villain_range_postflop(opp, would_be_allin ? (unsigned char)'n' : (unsigned char)2);
 		}
+		if (preflop)
+			track_blueprint_action(opp, BlueprintActionTranslation::Kind::Raise, observed_whole_hand_total);
 		g.stack[opp] = street_relative_raise_baseline(opp) - amount;
 		g.last_raise_size = std::max(0, amount - prev_facing);
+		g.blueprint_last_raise_size = g.last_raise_size;
 		g.n_raises_this_street++;
 		g.actions_this_street++;
 	}
 	else { // "call" or "check"
 		if (preflop) { if (g.preflop_path_confident) narrow_villain_range_preflop('l'); }
-		else narrow_villain_range_postflop(opp, 'l');
+		else if (!narrow_villain_range_direct_blueprint(
+			opp, BlueprintActionTranslation::Kind::Call))
+			narrow_villain_range_postflop(opp, 'l');
+		if (preflop) track_blueprint_action(opp, BlueprintActionTranslation::Kind::Call);
 		// See apply_own_action()'s matching comment / BUILD_NOTES.md section
 		// 24: must use the raw 20000 whole-hand baseline here, not
 		// g.stack_at_street_start[opp]-prev_facing, or the small blind's
@@ -1237,7 +1521,8 @@ void getdecision(char* out_buf) {
 		action = resolve_preflop_decision();
 	}
 	else {
-		action = resolve_decision();
+		action = resolve_direct_blueprint_decision();
+		if (action.empty()) action = resolve_decision();
 	}
 	apply_own_action(action);
 	std::strncpy(out_buf, action.c_str(), 19);
