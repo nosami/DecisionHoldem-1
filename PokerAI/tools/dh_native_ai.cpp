@@ -613,7 +613,31 @@ Searchstate build_current_searchstate(int acting_slot) {
 	s.player_i_index = (unsigned char)acting_slot;
 	s.n_raises = (unsigned char)std::min(g.n_raises_this_street, 255);
 	s.cur_round_action_num = (unsigned short)g.actions_this_street;
-	s.first_action_of_current_round = (g.actions_this_street == 0) ? 1 : 0;
+	// BUG FIX (BUILD_NOTES.md section 45): this field's name is
+	// misleading -- State.h's own take_action() (see its "if (actionstr ==
+	// 'l' && first_action_of_current_round)" round-closing check, and
+	// reset_betting_round_state()'s "first_action_of_current_round =
+	// false" at the start of every betting round) uses it to mean "has at
+	// least one action ALREADY been taken this betting round" -- i.e. it
+	// starts false and only becomes true AFTER an action is processed, so
+	// that a check/call closes the round only on the SECOND such action
+	// (once it comes back around), not the first. This used to be set
+	// inverted here (true when g.actions_this_street==0, i.e. exactly
+	// when NOBODY has acted yet) -- which made take_action() treat the
+	// very FIRST check of any betting round as if it were the round-
+	// closing second check, jumping straight from e.g. betting_stage=3
+	// (river) to betting_stage=4 (showdown) the instant CFR's tree-walk
+	// recursed into that action's child node, completely skipping the
+	// other player's turn. Confirmed directly with a minimal Searchstate
+	// reproduction: villain's opening river check went straight to
+	// betting_stage=4 with this field true, vs. correctly staying at
+	// betting_stage=3 (moving to the other player) with it false.
+	// Every resolve rooted at the OPENING decision of a betting round --
+	// both narrow_villain_range_postflop()'s narrowing (villain checks
+	// first) and resolve_decision()'s own live decisions (whenever hero
+	// is first to act) -- was affected, since build_current_searchstate()
+	// is the sole source of this field for both callers.
+	s.first_action_of_current_round = (g.actions_this_street == 0) ? 0 : 1;
 	s.last_raise = (unsigned short)g.last_raise_size;
 	return s;
 }

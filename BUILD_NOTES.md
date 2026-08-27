@@ -5740,3 +5740,196 @@ boards.
 - `tools/test_hand6_range_miss.cpp` (new, purely additive) — direct,
   reusable reproduction of this specific hand for any future
   investigation of paired-board narrowing behavior.
+
+## 45. Found and fixed the ACTUAL root cause of §38/§40/§41/§42/§44's "checks crush strong hands" pattern — a genuine, inverted state-construction bug, not a fundamental CFR-abstraction limitation
+
+**Triggered by a follow-up question to §44**: "for checked hands, we also
+need to consider which hands would check-raise." Investigating this
+required building a new tool that walks one level *deeper* into a
+narrowing resolver's CFR-solved tree than any prior test had gone
+(inspecting the node reached by villain's check, not just the root) —
+and that deeper node turned out to be badly malformed, exposing a real
+bug rather than confirming or refuting the check-raise question directly.
+
+### The bug
+
+`tools/dh_native_ai.cpp`'s `build_current_searchstate()` sets
+`Searchstate::first_action_of_current_round` like this (previously):
+
+```cpp
+s.first_action_of_current_round = (g.actions_this_street == 0) ? 1 : 0;
+```
+
+This field's real meaning, per `poker/State.h`'s own
+`reset_betting_round_state()` (`first_action_of_current_round = false;`
+at the start of every betting round) and `take_action()`'s round-closing
+check (`if ((actionstr=='l'||actionstr=='k') && first_action_of_current_round)
+{ ...close the round... }`), is **"has at least one action already been
+taken this betting round"** — it starts `false` and is set `true`
+unconditionally at the end of every `take_action()` call, so that a
+check/call only closes the round on the action that comes back around a
+*second* time. The line above is exactly backwards: it sets the flag
+`true` precisely when `g.actions_this_street == 0`, i.e. precisely when
+**nobody** has acted yet — the one case where it must be `false`.
+
+**Effect**: any time a `Searchstate` is built for the *first* action of a
+betting round (the common case: the opening decision of any flop/turn/
+river) and that first action turns out to be a check, `take_action()`
+sees `first_action_of_current_round == true` and treats the check as if
+it were the round's closing action — jumping `betting_stage` straight to
+showdown (4) and skipping the other player's turn entirely, one node
+into the tree.
+
+`build_current_searchstate()` is the single call site (confirmed by
+grepping every use of `first_action_of_current_round` in the codebase:
+`State.h` lines 33/91/167/176/220/235/315/503/592/601/655/670, all
+internal to the two state classes' own methods, plus this one external
+call site) supplying this field for **both** `narrow_villain_range_postflop()`
+(narrowing villain's tracked range after an observed action) **and**
+`resolve_decision()` (hero's own live decision-making) — so the bug hit
+both any narrowing rooted at villain's opening check on a street, *and*
+hero's own resolve whenever hero itself is first to act on a street.
+
+### Isolated proof (no game replay needed)
+
+Built a minimal, direct `Searchstate` (river, `cur_round_action_num=0`,
+i.e. nobody has acted this street) and called `take_action('l')` with
+each value of the flag:
+
+```
+BUGGY (first_action_of_current_round=1 on nobody-acted-yet): after villain checks -> betting_stage=4 (river=3,showdown=4) take_action_returned=0
+FIXED  (first_action_of_current_round=0 on nobody-acted-yet): after villain checks -> betting_stage=3 take_action_returned=0 player_i_index=1
+FIXED, hero checks back -> betting_stage=4 take_action_returned=0 (should now be showdown/4)
+```
+
+With the buggy flag, villain's single opening check on the river jumps
+straight from `betting_stage=3` (river) to `4` (showdown) — hero never
+gets a turn. With the fix, the same check correctly stays on the river
+and hands the turn to hero (`player_i_index=1`); a *second* check
+(hero's) then correctly closes the round to showdown. This is not
+subtle or debatable — it is a directly observable, binary difference in
+game-tree structure.
+
+### The fix
+
+```cpp
+s.first_action_of_current_round = (g.actions_this_street == 0) ? 0 : 1;
+```
+
+### Re-running §44's exact reproduction with the fix applied
+
+`tools/test_hand6_range_miss.cpp` (same hand #6, `Jc2c` full house,
+checks every street then calls hero's bets) now produces:
+
+```
+[0] fresh preflop prior:                      weight=0.081633% rank=1/1225   (uniform=0.0816%) -- at/above uniform
+[1] after preflop call:                       weight=0.082217% rank=379/1225 (uniform=0.0816%) -- at/above uniform
+[2] after villain FLOP check:                 weight=0.397491% rank=49/1081  (uniform=0.0925%) -- at/above uniform
+[3] after villain TURN check (opening):       weight=0.449898% rank=43/1035  (uniform=0.0966%) -- at/above uniform
+[4] after villain TURN call (of hero's bet):  weight=0.448684% rank=43/1035  (uniform=0.0966%) -- at/above uniform
+[5] after villain RIVER check (opening):      weight=0.465186% rank=43/990   (uniform=0.1010%) -- at/above uniform
+[6] after villain RIVER call (of shove) FINAL: weight=0.465213% rank=43/990  (uniform=0.1010%) -- at/above uniform
+```
+
+Compare to §44's pre-fix numbers for the exact same hand:
+
+```
+[2] after villain FLOP check:                 weight=0.006432% rank=458/1081 BELOW uniform   (~13x cut)
+[3] after villain TURN check (opening):       weight=0.000008% rank=439/1035 BELOW uniform   (~800x further cut)
+[5] after villain RIVER check (opening):      weight=0.000000% rank=655/990  BELOW uniform   (crushed again)
+[6] after villain RIVER call (of shove) FINAL: weight=0.000057% rank=641/990 BELOW uniform   (still a miss)
+```
+
+**Before the fix**: every check crushed `Jc2c`'s tracked weight by 1-3
+orders of magnitude, landing it around rank 641-655 out of ~990 (bottom
+third) by hand's end. **After the fix**: the same hand's weight stays
+at or above its uniform share through *every single street*, ending at
+rank 43/990 — solidly in the top 5%, the correct region for a hand that
+turned a full house and is a very plausible slowplay. This is not a
+marginal improvement; it reverses the qualitative conclusion for this
+specific, previously-documented catastrophic-loss hand.
+
+### Directly answering the original question: does the model account for check-raising?
+
+With the fix applied, `tools/test_hand6_checkraise.cpp` (walks one level
+deeper: villain's strategy *conditional on* checking and then facing a
+hero bet) now runs to completion with no crash (previously segfaulted —
+see below) and shows, for `Jc2c` at the river:
+
+```
+[root] villain Jc2c strategy (opening river decision): call=0.18%  raise(1.00x pot)=1.90%  allin=97.92%
+[after villain checks, hero bets] villain Jc2c strategy (check-raise decision): fold=3.08%  call=3.08%  raise(1.00x pot)=25.61%  allin=68.24%
+```
+
+So: yes — **conditional on having checked and then facing a bet, this
+exact full house check-raises/check-shoves 93.85% of the time**
+(25.61% + 68.24%) in the model's own solved strategy. The narrowing
+model, once this bug is fixed, correctly recognizes that a check from
+this type of hand is very often a check-raise plan, not a sign of
+weakness — which is exactly why its tracked weight no longer gets
+crushed. Before the fix, this same query segfaulted: the check's child
+node had `betting_stage==4` (bogus showdown) and an empty action/child
+list, so there was no check-raise decision to inspect at all — the tree
+literally did not contain it.
+
+### Revises §42/§44's conclusion
+
+§42 explicitly concluded this pattern was "a fundamental limitation of
+the bucketed/CFR-blueprint approach, not a discrete bug to patch," and
+§44 explicitly reaffirmed that conclusion ("this section adds sharper
+per-step evidence... not a new root cause or a reason to revisit that
+decision"). **That conclusion is superseded by this section**: at least
+for checks that open a betting round, the pattern was substantially
+caused by this one concrete, fixable state-construction defect, not an
+inherent abstraction limitation. It remains true that a *residual*,
+smaller abstraction-driven narrowing imprecision may still exist on top
+of this (bucketing hands into similarity clusters is inherently lossy,
+regardless of this fix) — but the dominant, headline-scale effect
+documented in §38/§40/§41/§42/§44 is this bug, now fixed.
+
+### Validation performed
+
+- **Isolated unit-level repro** (above): direct proof of the flag's
+  effect on `take_action()`'s control flow, independent of any full hand
+  replay.
+- **Regression check — no other test broke**: rebuilt and re-ran
+  `tools/test_bet_size_narrowing` (all PASS, same qualitative bet-size
+  narrowing behavior, non-all-in raises still measurably change weights)
+  and `tools/test_villain_weight_distribution` (sane, non-degenerate
+  weight distributions at every stage, no NaNs/crashes) against the
+  fixed build.
+- **`tools/test_hand6_range_miss` re-run**: full before/after comparison
+  shown above.
+- **`tools/test_hand6_checkraise` re-run**: previously segfaulted one
+  level into the tree; now completes cleanly and returns a real,
+  sane-looking check-raise strategy (see above).
+- **Rebuilt production `dh_native_ai.dylib`** with the exact same flags
+  previously documented (§43: `-DDH_SKIP_RIVER_CLUSTER -Xpreprocessor
+  -fopenmp -I/opt/homebrew/opt/libomp/include -shared -fPIC ... -L/opt/homebrew/opt/libomp/lib -lomp`),
+  confirmed all 5 ABI symbols still exported
+  (`_restart_game`, `_opp_take_action`, `_Next_stage`, `_getdecision`,
+  `_report_actual_hand`), and ran a live smoke test via `ctypes` (the
+  same mechanism `pypokergui/fish_player_setup.py` uses) through
+  preflop → flop → turn decisions with hero facing villain's checks —
+  no crash, sane decisions returned at every street.
+
+### What this does NOT change
+
+- Bucketed/CFR abstraction imprecision in general (§42's broader point
+  that hand-cluster bucketing is inherently lossy) is not eliminated by
+  this fix — only the specific, large, mechanical distortion this bug
+  was causing on every street-opening check.
+- This fix changes **hero's own live decisions** too, not just
+  diagnostics, whenever hero is first to act on a street (same
+  `build_current_searchstate()` call site) — this is a real behavioral
+  change to the bot's play, not merely a reporting/diagnostic
+  correction, and should be watched for in future live-session results.
+
+### Files touched
+
+- `tools/dh_native_ai.cpp` — one-line fix in `build_current_searchstate()`
+  (plus an explanatory comment).
+- `tools/test_hand6_checkraise.cpp` (new, purely additive) — check-raise
+  reproduction/diagnostic tool that surfaced the bug.
+- `dh_native_ai.dylib` — rebuilt with the fix (gitignored build artifact,
+  not committed; rebuild with the §43 command to reproduce).

@@ -42,3 +42,6 @@ PokerAI/tools/test_villain_weight_distribution
 PokerAI/tools/test_bet_size_narrowing
 PokerAI/tools/test_river_rank_seek
 PokerAI/tools/test_turn_leaf_speedup
+PokerAI/tools/test_hand6_range_miss
+PokerAI/tools/test_hand6_checkraise
+PokerAI/tools/test_hand6_checkraise.dSYM/
