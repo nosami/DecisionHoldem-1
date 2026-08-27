@@ -45,3 +45,6 @@ PokerAI/tools/test_turn_leaf_speedup
 PokerAI/tools/test_hand6_range_miss
 PokerAI/tools/test_hand6_checkraise
 PokerAI/tools/test_hand6_checkraise.dSYM/
+PokerAI/tools/test_qq_trips_range_miss
+PokerAI/tools/test_narrow_epsilon_floor
+PokerAI/tools/test_narrow_cfvalue_replace
