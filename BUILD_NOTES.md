@@ -2503,11 +2503,21 @@ the original unlimited behavior for anyone who deliberately wants it.
 
 ```shell
 cd PokerAI   # required: dh_native_ai.dylib and its relative cluster/... paths live here
-python3 ../pypokergui/play_with_slumbot.py --max-hands 5
+python3 -u ../pypokergui/play_with_slumbot.py --max-hands 5
 ```
 
 (`--username`/`--password` are optional, only needed to play under a
-registered Slumbot account instead of anonymously.)
+registered Slumbot account instead of anonymously. **Always use `python3
+-u`** (unbuffered stdout), not plain `python3` -- see the "known caveat"
+in section 41: this script's own `print()` output is otherwise
+block-buffered while the native library's `[DH_STRATEGY]`/
+`[DH_RANGE_MODEL]`/`[DH_RANGE_MODEL] actual villain hand=...` lines go to
+unbuffered `stderr`, so a combined `2>&1 | tee run.log` capture can
+interleave the two streams out of chronological order, or (worse, on long
+unattended runs / when piped rather than to a real terminal) delay
+Python's own output long enough that a run looks stalled or its tail is
+missing when the process is interrupted. `-u` makes both streams flush
+immediately, keeping combined logs in the order they actually happened.)
 
 ### Validation performed
 
@@ -5039,9 +5049,11 @@ do). To see this output live:
 ```
 cd PokerAI
 DH_VERBOSE_STRATEGY=1 DH_RIVER_SPLIT_DIR=/path/to/river_cluster_split \
-  python3 ../pypokergui/play_with_slumbot.py --max-hands 5
+  python3 -u ../pypokergui/play_with_slumbot.py --max-hands 5
 ```
-(add `2>&1 | tee /tmp/run.log` as usual to also capture it to a file).
+(add `2>&1 | tee /tmp/run.log` as usual to also capture it to a file; use
+`python3 -u`, not plain `python3` -- see the "known caveat" note in
+section 41 below.)
 
 ### Files touched
 
@@ -5271,7 +5283,7 @@ it before this section.
   reported `AcKc` ranked 8th of 1225 combos (0.14% weight, clearly
   plausible after a raise), while a reported `7c2d` ranked dead last
   (1225th of 1225, 0.0046% weight) and was correctly flagged `RANGE MISS`.
-- Live smoke test: `python3 pypokergui/play_with_slumbot.py --max-hands 3`
+- Live smoke test: `python3 -u pypokergui/play_with_slumbot.py --max-hands 3`
   against the real Slumbot API produced exactly one `[DH_RANGE_MODEL]
   actual villain hand=...` line per hand (3 for 3 hands), with real
   hand-appropriate rankings; one of the three (`6c5c`, rank 761/1081) was
@@ -5292,6 +5304,13 @@ quirk of this codebase (already noted when investigating "lost logging"
 earlier this session) -- it does not affect correctness, and
 `analyze_range_misses.py` doesn't depend on ordering (it only pattern-
 matches the `[DH_RANGE_MODEL] actual villain hand=...` lines directly).
+
+**Standing recommendation (added later): always invoke this script as
+`python3 -u ...`, never plain `python3`.** `-u` forces Python's stdout to
+be unbuffered too, so it interleaves with the native library's already-
+unbuffered stderr in real chronological order instead of arriving in
+large delayed chunks. This is now the documented invocation everywhere in
+this file and in `play_with_slumbot.py --help` itself.
 
 ### What this does NOT do
 

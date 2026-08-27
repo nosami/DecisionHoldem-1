@@ -480,7 +480,10 @@ def main():
                     "API supports anonymous play (see BUILD_NOTES.md). "
                     "Run this from PokerAI/ so the native library's relative "
                     "cluster/... paths resolve, e.g.:\n"
-                    "  cd PokerAI && python3 ../pypokergui/play_with_slumbot.py --max-hands 5")
+                    "  cd PokerAI && python3 -u ../pypokergui/play_with_slumbot.py --max-hands 5\n"
+                    "(always use -u: this script's stdout is otherwise block-buffered, "
+                    "which interleaves badly with the native library's unbuffered stderr "
+                    "logging when both are combined into one log file -- see BUILD_NOTES.md)")
     parser.add_argument('--max-hands', type=int, default=10,
                          help='Number of hands to play, then stop (default: 10). '
                               'Use 0 for unlimited (runs until interrupted).')
