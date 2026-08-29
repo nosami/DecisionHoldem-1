@@ -41,11 +41,9 @@
 //       (RealtimeSearch.h): a
 //       small, fast, REDUCED-ACTION (fold / call / all-in only -- no
 //       intermediate bet sizes) range-vs-range vanilla CFR resolve. The
-//       opponent's range is NOT a fixed-size sample: LiveGame::villain_range
-//       tracks a persistent, full (every remaining, non-board/hero-blocked
-//       hole-card combo) weighted belief across the WHOLE hand, seeded from
-//       the real trained preflop blueprint's per-cluster strategies and
-//       narrowed, street by street, after every OBSERVED opponent action
+//       both players' ranges are persistent full weighted beliefs across the
+//       whole hand. They are seeded uniformly and narrowed, street by street,
+//       after each player's public action
 //       (preflop: via a direct blueprint-probability Bayesian update;
 //       postflop: via a dedicated LiveResolver run's own strat_sum output at
 //       the exact node the opponent just acted from). This is still "unsafe"
@@ -134,9 +132,7 @@ namespace {
 // hardcoded HU convention (0 acts first preflop, 1 acts first postflop), so
 // no extra translation is needed when handing a snapshot to a resolver.
 // ---------------------------------------------------------------------------
-// A single candidate opponent hole-card combo and its current belief weight
-// (not normalized to any fixed count -- LiveGame::villain_range holds every
-// remaining, non-blocked combo for as long as it stays possible this hand).
+// A single candidate hole-card combo and its current belief weight.
 struct WeightedHand {
 	unsigned char c1, c2;
 	double weight;
@@ -157,16 +153,11 @@ struct LiveGame {
 	std::vector<unsigned char> board;
 	std::mt19937_64 rng{ std::random_device{}() };
 
-	// Persistent, full (no fixed pool size) opponent-range belief, tracked
-	// for the opponent's slot (1 - my_id) across the WHOLE hand: every
-	// hole-card combo not blocked by hero's own hole cards or the board,
-	// each with a running belief weight. Initialized uniformly at
-	// restart_game() (see init_villain_range()), pruned for newly-dealt
-	// board cards at Next_stage() (see prune_villain_range_for_board()),
-	// and Bayesian-narrowed after every observed opponent action (see
-	// narrow_villain_range_preflop()/narrow_villain_range_postflop()).
-	// Deliberately NOT capped at any fixed size -- see BUILD_NOTES.md for
-	// the design rationale and measured performance cost.
+	// Full public beliefs for our own and the opponent's ranges. hero_range
+	// represents what our public actions reveal about our possible holdings;
+	// villain_range represents our belief about the opponent. Both persist
+	// across streets and are Bayesian-updated after their player's actions.
+	std::vector<WeightedHand> hero_range;
 	std::vector<WeightedHand> villain_range;
 
 	// Real preflop blueprint bookkeeping (see BlueprintReader.h): the exact
@@ -346,15 +337,14 @@ void dh_log_strategy(const char* label, const std::vector<unsigned char>& action
 	std::fprintf(stderr, "\n");
 }
 
-// Prints a compact summary of a villain_range narrowing update: how
+// Prints a compact summary of a range narrowing update: how
 // concentrated the tracked belief was before/after (effective # of combos,
 // via the inverse Herfindahl index 1/sum(w_i^2) -- a uniform range over N
 // combos scores N, a range collapsed onto 1 combo scores 1), plus the
 // top-5 most-weighted combos after the update. `weights_before` must be
-// g.villain_range's weights captured immediately before narrowing (already
-// normalized to sum to 1 from the previous step).
 void dh_log_narrowing(const char* label, unsigned char observed_byte,
-	const std::vector<double>& weights_before) {
+	const std::vector<double>& weights_before,
+	const std::vector<WeightedHand>& range) {
 	if (!dh_verbose_enabled()) return;
 	auto effective_n = [](const std::vector<double>& w) {
 		double sum_sq = 0.0;
@@ -363,21 +353,21 @@ void dh_log_narrowing(const char* label, unsigned char observed_byte,
 	};
 	double eff_before = effective_n(weights_before);
 	std::vector<double> weights_after;
-	weights_after.reserve(g.villain_range.size());
-	for (auto& h : g.villain_range) weights_after.push_back(h.weight);
+	weights_after.reserve(range.size());
+	for (const auto& h : range) weights_after.push_back(h.weight);
 	double eff_after = effective_n(weights_after);
 
-	std::vector<size_t> idx(g.villain_range.size());
+	std::vector<size_t> idx(range.size());
 	for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
 	size_t top_k = std::min<size_t>(5, idx.size());
 	std::partial_sort(idx.begin(), idx.begin() + top_k, idx.end(),
-		[&](size_t a, size_t b) { return g.villain_range[a].weight > g.villain_range[b].weight; });
+		[&](size_t a, size_t b) { return range[a].weight > range[b].weight; });
 
 	std::fprintf(stderr,
 		"[DH_RANGE_MODEL] %s narrow observed=%s combos=%zu effective_hands %.1f -> %.1f, top:",
-		label, dh_action_name(observed_byte).c_str(), g.villain_range.size(), eff_before, eff_after);
+		label, dh_action_name(observed_byte).c_str(), range.size(), eff_before, eff_after);
 	for (size_t k = 0; k < top_k; k++) {
-		const WeightedHand& h = g.villain_range[idx[k]];
+		const WeightedHand& h = range[idx[k]];
 		std::fprintf(stderr, " %s%s=%.2f%%",
 			dh_card_str(h.c1).c_str(), dh_card_str(h.c2).c_str(), h.weight * 100.0);
 	}
@@ -600,6 +590,42 @@ uint32_t current_postflop_bucket(unsigned char c1, unsigned char c2) {
 	throw std::runtime_error("direct blueprint bucket requested outside flop/turn");
 }
 
+void apply_direct_blueprint_likelihood(
+	std::vector<WeightedHand>& range,
+	const std::shared_ptr<const IndexedBlueprint::NodePolicy>& policy,
+	const BlueprintActionTranslation::Translation& translation,
+	const char* label)
+{
+	auto find_action = [&](unsigned char action) -> size_t {
+		auto it = std::find(policy->actions.begin(), policy->actions.end(), action);
+		if (it == policy->actions.end()) throw std::runtime_error("translated action absent from loaded policy");
+		return static_cast<size_t>(it - policy->actions.begin());
+	};
+	size_t lower = find_action(translation.lower_action);
+	size_t upper = find_action(translation.upper_action);
+	std::vector<double> updated(range.size());
+	std::vector<double> before;
+	if (dh_verbose_enabled()) {
+		before.reserve(range.size());
+		for (const auto& hand : range) before.push_back(hand.weight);
+	}
+	double sum = 0.0;
+	size_t action_count = policy->actions.size();
+	for (size_t i = 0; i < range.size(); ++i) {
+		const WeightedHand& hand = range[i];
+		uint32_t bucket = current_postflop_bucket(hand.c1, hand.c2);
+		if (bucket >= policy->bucket_count) throw std::runtime_error("hand bucket exceeds node dimension");
+		const double* row = policy->probabilities.data() + static_cast<size_t>(bucket) * action_count;
+		double likelihood = BlueprintActionTranslation::interpolated_probability(
+			translation, row[lower], row[upper]);
+		updated[i] = hand.weight * likelihood;
+		sum += updated[i];
+	}
+	if (!(sum > 1e-12)) throw std::runtime_error("direct blueprint range update collapsed to zero");
+	for (size_t i = 0; i < range.size(); ++i) range[i].weight = updated[i] / sum;
+	dh_log_narrowing(label, translation.sampled_action, before, range);
+}
+
 bool narrow_villain_range_direct_blueprint(
 	int opp_slot,
 	BlueprintActionTranslation::Kind kind,
@@ -614,37 +640,9 @@ bool narrow_villain_range_direct_blueprint(
 		uint32_t expected_buckets = g.betting_stage == 1 ? 50000U : 5000U;
 		if (policy->bucket_count != expected_buckets)
 			throw std::runtime_error("current node has wrong street bucket dimension");
-		auto find_action = [&](unsigned char action) -> size_t {
-			auto it = std::find(policy->actions.begin(), policy->actions.end(), action);
-			if (it == policy->actions.end()) throw std::runtime_error("translated action absent from loaded policy");
-			return static_cast<size_t>(it - policy->actions.begin());
-		};
-		size_t lower = find_action(translation.lower_action);
-		size_t upper = find_action(translation.upper_action);
-		std::vector<double> updated(g.villain_range.size());
-		std::vector<double> before;
-		if (dh_verbose_enabled()) {
-			before.reserve(g.villain_range.size());
-			for (const auto& hand : g.villain_range) before.push_back(hand.weight);
-		}
-		double sum = 0.0;
-		size_t action_count = policy->actions.size();
-		for (size_t i = 0; i < g.villain_range.size(); ++i) {
-			const WeightedHand& hand = g.villain_range[i];
-			uint32_t bucket = current_postflop_bucket(hand.c1, hand.c2);
-			if (bucket >= policy->bucket_count) throw std::runtime_error("opponent bucket exceeds node dimension");
-			const double* row = policy->probabilities.data() + static_cast<size_t>(bucket) * action_count;
-			double likelihood = BlueprintActionTranslation::interpolated_probability(
-				translation, row[lower], row[upper]);
-			updated[i] = hand.weight * likelihood;
-			sum += updated[i];
-		}
-		if (!(sum > 1e-12)) throw std::runtime_error("direct blueprint range update collapsed to zero");
-		for (size_t i = 0; i < g.villain_range.size(); ++i)
-			g.villain_range[i].weight = updated[i] / sum;
+		apply_direct_blueprint_likelihood(g.villain_range, policy, translation,
+			g.betting_stage == 1 ? "villain-flop-blueprint" : "villain-turn-blueprint");
 		advance_blueprint_cursor(translation.sampled_action);
-		dh_log_narrowing(g.betting_stage == 1 ? "flop-blueprint" : "turn-blueprint",
-			translation.sampled_action, before);
 		return true;
 	} catch (const std::exception& e) {
 		disable_blueprint_cursor(e.what());
@@ -653,46 +651,41 @@ bool narrow_villain_range_direct_blueprint(
 }
 
 // ---------------------------------------------------------------------------
-// Persistent, full opponent-range belief tracking (LiveGame::villain_range).
+// Persistent, full range-belief tracking.
 //
-// Unlike the earlier fixed-40-hand uniform sample this replaces, this is a
-// weighted belief over EVERY currently-possible opponent hole-card combo,
-// carried across the whole hand and narrowed after each observed opponent
-// action -- preflop via the real trained blueprint's per-cluster
-// strategies, postflop via a dedicated LiveResolver run's own strat_sum
-// output. See BUILD_NOTES.md for the full design writeup, the
-// button-vs-BB acting-order asymmetry it accounts for, and measured
-// performance cost (a full-range resolve is markedly more expensive than
-// the old 40-hand pool).
+// Each belief is carried across the whole hand and narrowed after that
+// player's actions: preflop via the trained blueprint and postflop via either
+// the indexed blueprint or LiveResolver's average strategy.
 // ---------------------------------------------------------------------------
 
-// Re-seeds villain_range to a uniform prior over every hole-card combo not
-// blocked by hero's own two cards (1225 combos before any board is dealt).
-// Called once per hand, from restart_game(), after g.my_hole is set.
-void init_villain_range() {
-	g.villain_range.clear();
+void init_uniform_range(std::vector<WeightedHand>& range, bool block_actual_hand) {
+	range.clear();
 	std::vector<unsigned char> deck;
 	for (int c = 0; c < 52; c++) {
-		if (c == g.my_hole[0] || c == g.my_hole[1]) continue;
+		if (block_actual_hand && (c == g.my_hole[0] || c == g.my_hole[1])) continue;
 		deck.push_back((unsigned char)c);
 	}
 	for (size_t i = 0; i < deck.size(); i++)
 		for (size_t j = i + 1; j < deck.size(); j++)
-			g.villain_range.push_back({ deck[i], deck[j], 0.0 });
-	double w = 1.0 / (double)g.villain_range.size();
-	for (auto& h : g.villain_range) h.weight = w;
+			range.push_back({ deck[i], deck[j], 0.0 });
+	double w = 1.0 / (double)range.size();
+	for (auto& h : range) h.weight = w;
 }
 
-// Permanently removes (not just zero-weights) any tracked combo that now
-// collides with the board, then renormalizes. Called from Next_stage()
-// whenever new board cards are dealt, so the tracked range keeps shrinking
-// (both from card-removal AND from behavioral narrowing) rather than
-// growing stale entries forever.
-void prune_villain_range_for_board() {
+void init_ranges() {
+	// Our public range cannot use our private cards as blockers; the opponent
+	// range can, because our decisions condition on the hand we actually hold.
+	init_uniform_range(g.hero_range, false);
+	init_uniform_range(g.villain_range, true);
+}
+
+// Permanently removes board-colliding combos and renormalizes.
+void prune_range_for_board(std::vector<WeightedHand>& range, const char* label,
+	bool block_actual_hand) {
 	std::vector<WeightedHand> kept;
-	kept.reserve(g.villain_range.size());
+	kept.reserve(range.size());
 	double sum = 0.0;
-	for (auto& h : g.villain_range) {
+	for (const auto& h : range) {
 		bool collide = false;
 		for (unsigned char b : g.board) if (h.c1 == b || h.c2 == b) { collide = true; break; }
 		if (collide) continue;
@@ -707,12 +700,12 @@ void prune_villain_range_for_board() {
 		// combos rather than leaving an empty range that would silently
 		// break every subsequent resolve.
 		std::fprintf(stderr,
-			"[DH_RANGE_MODEL] villain range was empty after board-collision pruning -- "
+			"[DH_RANGE_MODEL] %s range was empty after board-collision pruning -- "
 			"this should be impossible with a legal board/hole-card combination; "
-			"resetting to a uniform prior over remaining combos\n");
+			"resetting to a uniform prior over remaining combos\n", label);
 		std::vector<unsigned char> deck;
 		for (int c = 0; c < 52; c++) {
-			if (c == g.my_hole[0] || c == g.my_hole[1]) continue;
+			if (block_actual_hand && (c == g.my_hole[0] || c == g.my_hole[1])) continue;
 			bool on_board = false;
 			for (unsigned char b : g.board) if (b == c) { on_board = true; break; }
 			if (on_board) continue;
@@ -727,7 +720,50 @@ void prune_villain_range_for_board() {
 	else if (sum > 1e-12) {
 		for (auto& h : kept) h.weight /= sum;
 	}
-	g.villain_range = std::move(kept);
+	else {
+		std::fprintf(stderr,
+			"[DH_RANGE_MODEL] %s range retained legal combos but no probability "
+			"mass after board pruning; resetting those combos to a uniform prior\n",
+			label);
+		double w = 1.0 / (double)kept.size();
+		for (auto& h : kept) h.weight = w;
+	}
+	range = std::move(kept);
+}
+
+void prune_ranges_for_board() {
+	prune_range_for_board(g.hero_range, "hero", false);
+	prune_range_for_board(g.villain_range, "villain", true);
+}
+
+std::vector<WeightedHand>& range_for_slot(int slot) {
+	return slot == g.my_id ? g.hero_range : g.villain_range;
+}
+
+void build_resolver_ranges(Players_range& range,
+	std::vector<double>& reach0, std::vector<double>& reach1) {
+	const std::vector<WeightedHand>& slot0 = range_for_slot(0);
+	const std::vector<WeightedHand>& slot1 = range_for_slot(1);
+	range.hero.reserve(slot0.size());
+	range.villain.reserve(slot1.size());
+	reach0.reserve(slot0.size());
+	reach1.reserve(slot1.size());
+	for (const auto& h : slot0) {
+		range.hero.push_back({h.c1, h.c2});
+		reach0.push_back(h.weight);
+	}
+	for (const auto& h : slot1) {
+		range.villain.push_back({h.c1, h.c2});
+		reach1.push_back(h.weight);
+	}
+}
+
+size_t find_hand_index(const std::vector<WeightedHand>& range,
+	unsigned char c1, unsigned char c2) {
+	if (c2 < c1) std::swap(c1, c2);
+	for (size_t i = 0; i < range.size(); ++i)
+		if (range[i].c1 == c1 && range[i].c2 == c2) return i;
+	throw std::runtime_error("actual hero hand is absent from tracked hero range");
 }
 
 // Bayesian-narrows villain_range using the REAL trained preflop blueprint:
@@ -746,8 +782,9 @@ void prune_villain_range_for_board() {
 // unchanged for this action only -- never a crash, never fabricated data,
 // matching resolve_preflop_decision()'s own established error-handling
 // style.
-void narrow_villain_range_preflop(unsigned char observed_byte) {
-	if (!g.preflop_path_confident) return;
+bool narrow_range_preflop(std::vector<WeightedHand>& range,
+	unsigned char observed_byte, const char* label) {
+	if (!g.preflop_path_confident) return false;
 	try {
 		BlueprintReader::AllClustersResult res;
 		bool used_cache = false;
@@ -772,35 +809,41 @@ void narrow_villain_range_preflop(unsigned char observed_byte) {
 			throw std::runtime_error("observed action byte not found among this node's legal actions");
 		std::vector<double> weights_before;
 		if (dh_verbose_enabled()) {
-			weights_before.reserve(g.villain_range.size());
-			for (auto& h : g.villain_range) weights_before.push_back(h.weight);
+			weights_before.reserve(range.size());
+			for (const auto& h : range) weights_before.push_back(h.weight);
 		}
 		double sum = 0.0;
-		for (auto& h : g.villain_range) {
+		std::vector<double> updated(range.size());
+		for (size_t i = 0; i < range.size(); ++i) {
+			const WeightedHand& h = range[i];
 			unsigned char hand[2] = { h.c1, h.c2 };
 			int cluster = engine->get_preflop_cluster(hand);
 			double p = (cluster >= 0 && cluster < (int)res.probs.size()) ? res.probs[cluster][idx] : 0.0;
-			h.weight *= p;
-			sum += h.weight;
+			updated[i] = h.weight * p;
+			sum += updated[i];
 		}
 		if (!(sum > 1e-12))
-			throw std::runtime_error("villain range collapsed to ~0 total weight after this update -- refusing to apply");
-		for (auto& h : g.villain_range) h.weight /= sum;
-		dh_log_narrowing("preflop", observed_byte, weights_before);
+			throw std::runtime_error("range collapsed to ~0 total weight after this update -- refusing to apply");
+		for (size_t i = 0; i < range.size(); ++i) range[i].weight = updated[i] / sum;
+		dh_log_narrowing(label, observed_byte, weights_before, range);
+		return true;
 	}
 	catch (const std::exception& e) {
 		std::fprintf(stderr,
-			"[DH_RANGE_MODEL] preflop villain-range narrowing failed (%s) -- "
-			"range left unchanged for this action\n", e.what());
+			"[DH_RANGE_MODEL] %s preflop range narrowing failed (%s) -- "
+			"range left unchanged for this action\n", label, e.what());
+		return false;
 	}
+}
+
+void narrow_villain_range_preflop(unsigned char observed_byte) {
+	narrow_range_preflop(g.villain_range, observed_byte, "villain-preflop");
 }
 
 // Builds the Searchstate snapshot for whichever slot is about to act, from
 // the LiveGame fields AS THEY STAND RIGHT NOW (i.e. must be called before
 // that action's own bookkeeping mutates them). Shared by resolve_decision()
-// (hero's own real decision) and narrow_villain_range_postflop() (a
-// dedicated resolve purely to extract the opponent's just-taken action's
-// conditional probability per tracked hand, for narrowing).
+// (hero's own real decision) and narrow_villain_range_postflop().
 Searchstate build_current_searchstate(int acting_slot) {
 	Searchstate s;
 	s.small_blind = 50;
@@ -990,14 +1033,9 @@ void narrow_villain_range_postflop(int opp_slot, unsigned char observed_byte) {
 	}
 	try {
 		Searchstate s = build_current_searchstate(opp_slot);
-		std::array<unsigned char, 2> my_hand = { g.my_hole[0], g.my_hole[1] };
-		std::vector<std::array<unsigned char, 2>> tracked_hands;
-		tracked_hands.reserve(g.villain_range.size());
-		for (auto& h : g.villain_range) tracked_hands.push_back({ h.c1, h.c2 });
-
 		Players_range range;
-		if (opp_slot == 0) { range.hero = tracked_hands; range.villain = { my_hand }; }
-		else { range.hero = { my_hand }; range.villain = tracked_hands; }
+		std::vector<double> reach0, reach1;
+		build_resolver_ranges(range, reach0, reach1);
 
 		LiveResolver::Mode mode = (g.betting_stage == 1) ? LiveResolver::Mode::FLOP
 			: (g.betting_stage == 2) ? LiveResolver::Mode::TURN
@@ -1026,30 +1064,29 @@ void narrow_villain_range_postflop(int opp_slot, unsigned char observed_byte) {
 		// measured cost of the extra action.
 		LiveResolver resolver(range, engine, leaf.get(), mode, /*extended_actions=*/true, river_leaf.get());
 		resolver.init_root(s, g.board);
-		std::vector<double> tracked_weights;
-		tracked_weights.reserve(g.villain_range.size());
-		for (auto& h : g.villain_range) tracked_weights.push_back(h.weight);
-		if (opp_slot == 0) run_until_converged(resolver, mode, &tracked_weights, nullptr);
-		else run_until_converged(resolver, mode, nullptr, &tracked_weights);
+		run_until_converged(resolver, mode, &reach0, &reach1);
 		int idx = -1;
 		for (size_t i = 0; i < resolver.root->actions.size(); i++)
 			if (resolver.root->actions[i] == observed_byte) { idx = (int)i; break; }
 		if (idx < 0)
 			throw std::runtime_error("observed action not found among this node's resolved actions");
 
+		std::vector<double> before;
+		before.reserve(g.villain_range.size());
+		for (const auto& h : g.villain_range) before.push_back(h.weight);
+		std::vector<double> updated(g.villain_range.size());
 		double sum = 0.0;
 		for (size_t i = 0; i < g.villain_range.size(); i++) {
 			std::vector<double> avg;
 			LiveResolver::average_strategy(resolver.root.get(), (int)i, avg);
-			g.villain_range[i].weight *= avg[idx];
-			sum += g.villain_range[i].weight;
+			updated[i] = g.villain_range[i].weight * avg[idx];
+			sum += updated[i];
 		}
 		if (!(sum > 1e-12))
 			throw std::runtime_error("villain range collapsed to ~0 total weight after this update -- refusing to apply");
-		for (auto& h : g.villain_range) h.weight /= sum;
-		// tracked_weights (captured above, before this update) doubles as
-		// the "before" snapshot dh_log_narrowing needs -- no extra copy.
-		dh_log_narrowing("postflop", observed_byte, tracked_weights);
+		for (size_t i = 0; i < g.villain_range.size(); ++i)
+			g.villain_range[i].weight = updated[i] / sum;
+		dh_log_narrowing("villain-postflop", observed_byte, before, g.villain_range);
 	}
 	catch (const std::exception& e) {
 		std::fprintf(stderr,
@@ -1108,6 +1145,14 @@ std::string resolve_direct_blueprint_decision() {
 				throw std::runtime_error("sampled blueprint raise converts to invalid API amount");
 			result = "raise " + std::to_string(street_total);
 		}
+		auto policy = g_indexed_blueprint->all_rows(node);
+		BlueprintActionTranslation::Translation exact;
+		exact.lower_action = action;
+		exact.upper_action = action;
+		exact.sampled_action = action;
+		exact.lower_probability = 1.0;
+		apply_direct_blueprint_likelihood(g.hero_range, policy, exact,
+			g.betting_stage == 1 ? "hero-flop-blueprint" : "hero-turn-blueprint");
 		advance_blueprint_cursor(action);
 		return result;
 	} catch (const std::exception& e) {
@@ -1117,27 +1162,14 @@ std::string resolve_direct_blueprint_decision() {
 }
 
 // Builds the Searchstate snapshot for the current decision, runs the
-// appropriately-scoped LiveResolver against the LIVE, currently-tracked
-// villain_range belief (not a fixed-size sample -- see above), and returns
-// "fold" / "call" / "allin" sampled from hero's (my_id's) average strategy
-// for my actual hole cards.
+// appropriately-scoped LiveResolver against both live public range beliefs,
+// then samples the strategy for our actual private hand.
 std::string resolve_decision() {
 	Searchstate s = build_current_searchstate(g.my_id);
 
-	std::array<unsigned char, 2> my_hand = { g.my_hole[0], g.my_hole[1] };
-	std::vector<std::array<unsigned char, 2>> tracked_hands;
-	std::vector<double> tracked_weights;
-	tracked_hands.reserve(g.villain_range.size());
-	tracked_weights.reserve(g.villain_range.size());
-	for (auto& h : g.villain_range) {
-		tracked_hands.push_back({ h.c1, h.c2 });
-		tracked_weights.push_back(h.weight);
-	}
-
 	Players_range range;
-	int opp_slot = 1 - g.my_id;
-	if (opp_slot == 0) { range.hero = tracked_hands; range.villain = { my_hand }; }
-	else { range.hero = { my_hand }; range.villain = tracked_hands; }
+	std::vector<double> reach0, reach1;
+	build_resolver_ranges(range, reach0, reach1);
 
 	LiveResolver::Mode mode = (g.betting_stage == 1) ? LiveResolver::Mode::FLOP
 		: (g.betting_stage == 2) ? LiveResolver::Mode::TURN
@@ -1177,8 +1209,7 @@ std::string resolve_decision() {
 	LiveResolver resolver(range, engine, leaf.get(), mode, /*extended_actions=*/false, river_leaf.get(),
 		full_ladder);
 	resolver.init_root(s, g.board);
-	if (opp_slot == 0) run_until_converged(resolver, mode, &tracked_weights, nullptr, full_ladder);
-	else run_until_converged(resolver, mode, nullptr, &tracked_weights, full_ladder);
+	run_until_converged(resolver, mode, &reach0, &reach1, full_ladder);
 	// Adaptive iteration budget -- keeps iterating until measured
 	// exploitability drops under ~1% of the pot (or a safety cap is hit);
 	// see run_until_converged()'s comment above for the real measured
@@ -1187,18 +1218,14 @@ std::string resolve_decision() {
 	// than a fixed-size sample is markedly more expensive per iteration --
 	// see BUILD_NOTES.md's range-model section for measured timings.
 
-	// my_hand was placed at index 0 of whichever range list corresponds to
-	// my slot (see above), and the root's acting player is always me (that
-	// is the whole reason getdecision() was called), so index 0 always
-	// addresses my own hand's strategy regardless of which slot I'm in.
+	size_t my_hand_index = find_hand_index(g.hero_range, g.my_hole[0], g.my_hole[1]);
 	std::vector<double> avg;
-	LiveResolver::average_strategy(resolver.root.get(), 0, avg);
+	LiveResolver::average_strategy(resolver.root.get(), (int)my_hand_index, avg);
 
 	if (dh_verbose_enabled()) {
 		double pot = (double)resolver.root->state.table.total_pot;
 		double expl_pct = (pot > 1e-9)
-			? 100.0 * resolver.exploitability(opp_slot == 0 ? &tracked_weights : nullptr,
-				opp_slot == 0 ? nullptr : &tracked_weights) / pot
+			? 100.0 * resolver.exploitability(&reach0, &reach1) / pot
 			: 0.0;
 		const char* mode_name = (mode == LiveResolver::Mode::FLOP) ? "FLOP"
 			: (mode == LiveResolver::Mode::TURN) ? "TURN" : "RIVER";
@@ -1212,42 +1239,49 @@ std::string resolve_decision() {
 	// full_ladder gave this decision access to the real ladder above).
 	double r = std::uniform_real_distribution<double>(0.0, 1.0)(g.rng);
 	double cum = 0.0;
+	size_t selected_action = resolver.root->actions.size() - 1;
 	for (size_t a = 0; a < resolver.root->actions.size(); a++) {
 		cum += avg[a];
 		if (r <= cum || a + 1 == resolver.root->actions.size()) {
-			unsigned char act = resolver.root->actions[a];
-			if (act == 'd') return "fold";
-			if (act == 'n') return "allin";
-			if (act == 'l') return "call";
-			// Pot-fraction raise byte: compute the real chip total using
-			// the EXACT same formula State.h's take_action() uses to apply
-			// this same byte, and resolve_preflop_decision() already uses
-			// for its own raise bytes (last_raise = pot * byte / 200 * 100).
-			// s.table.total_pot/s.last_bigbet (from build_current_searchstate())
-			// are in the WHOLE-HAND (20000-baseline) convention this
-			// resolver's own math (and the real State.h engine) uses
-			// internally -- but apply_own_action()'s "raise N" parser
-			// expects N in the STREET-RELATIVE convention for any street
-			// other than preflop (street_relative_raise_baseline(); see its
-			// own comment). Compute the whole-hand total first, then
-			// convert down to street-relative by subtracting whatever was
-			// already committed in EARLIER streets, exactly mirroring
-			// opp_take_action()'s inverse (amount = street_relative_raise_
-			// baseline(opp) - g.stack[opp]) for the same conversion in the
-			// other direction.
-			int total_pot_before = (int)s.table.total_pot;
-			int last_bigbet_before = (int)s.last_bigbet;
-			int my_bet_before = 20000 - g.stack[g.my_id];
-			int n_chips_to_call = last_bigbet_before - my_bet_before;
-			int pot = total_pot_before + n_chips_to_call;
-			int last_raise = pot * act / 200 * 100;
-			int new_total_bet_whole_hand = last_bigbet_before + last_raise;
-			int already_committed_earlier_streets = 20000 - g.stack_at_street_start[g.my_id];
-			int new_total_bet_street_relative = new_total_bet_whole_hand - already_committed_earlier_streets;
-			return "raise " + std::to_string(new_total_bet_street_relative);
+			selected_action = a;
+			break;
 		}
 	}
-	return "call"; // defensive fallback, should be unreachable
+
+	std::vector<double> before;
+	before.reserve(g.hero_range.size());
+	for (const auto& h : g.hero_range) before.push_back(h.weight);
+	std::vector<double> updated(g.hero_range.size());
+	double sum = 0.0;
+	for (size_t i = 0; i < g.hero_range.size(); ++i) {
+		std::vector<double> hand_strategy;
+		LiveResolver::average_strategy(resolver.root.get(), (int)i, hand_strategy);
+		updated[i] = g.hero_range[i].weight * hand_strategy[selected_action];
+		sum += updated[i];
+	}
+	if (!(sum > 1e-12))
+		throw std::runtime_error("hero range collapsed to ~0 total weight after resolved action");
+	for (size_t i = 0; i < g.hero_range.size(); ++i)
+		g.hero_range[i].weight = updated[i] / sum;
+	unsigned char act = resolver.root->actions[selected_action];
+	dh_log_narrowing("hero-postflop", act, before, g.hero_range);
+
+	if (act == 'd') return "fold";
+	if (act == 'n') return "allin";
+	if (act == 'l') return "call";
+	// Pot-fraction raise byte: compute the real chip total using the EXACT
+	// same formula State.h uses, then convert it to the API's street-relative
+	// amount.
+	int total_pot_before = (int)s.table.total_pot;
+	int last_bigbet_before = (int)s.last_bigbet;
+	int my_bet_before = 20000 - g.stack[g.my_id];
+	int n_chips_to_call = last_bigbet_before - my_bet_before;
+	int pot = total_pot_before + n_chips_to_call;
+	int last_raise = pot * act / 200 * 100;
+	int new_total_bet_whole_hand = last_bigbet_before + last_raise;
+	int already_committed_earlier_streets = 20000 - g.stack_at_street_start[g.my_id];
+	int new_total_bet_street_relative = new_total_bet_whole_hand - already_committed_earlier_streets;
+	return "raise " + std::to_string(new_total_bet_street_relative);
 }
 
 // Facing hero's very first preflop decision, or having watched only
@@ -1307,6 +1341,7 @@ std::string resolve_preflop_decision() {
 			cum += res.probs[a];
 			if (r <= cum || a + 1 == res.actionstr.size()) {
 				unsigned char act = res.actionstr[a];
+				narrow_range_preflop(g.hero_range, act, "hero-preflop");
 				g.preflop_action_path.push_back(act);
 				track_exact_blueprint_action(act);
 				if (act == 'd') return "fold";
@@ -1395,7 +1430,7 @@ void restart_game(int myid, int c1id, int c2id) {
 	g.board.clear();
 	g.preflop_action_path.clear();
 	g.preflop_path_confident = true;
-	init_villain_range();
+	init_ranges();
 	reset_street_counters();
 	initialize_direct_blueprint();
 }
@@ -1405,7 +1440,7 @@ void Next_stage(int betting_stage, char* community_card_idx) {
 	g.board.assign((unsigned char*)community_card_idx, (unsigned char*)community_card_idx + lenc);
 	g.betting_stage = betting_stage;
 	reset_street_counters();
-	prune_villain_range_for_board();
+	prune_ranges_for_board();
 	if (g.blueprint_cursor_usable && g_indexed_blueprint && betting_stage <= 2) {
 		try {
 			uint32_t expected = betting_stage == 1 ? 50000U : 5000U;

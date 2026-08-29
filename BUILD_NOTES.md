@@ -6470,3 +6470,34 @@ probability equality. On the local SSD, reader startup was 10-15 ms, a
 full 50,000-bucket/eight-action flop payload was about 5.2 ms, 1,081
 cached likelihood-row accesses took about 0.006 ms, a full turn payload
 took about 0.69 ms, and a cached node lookup was below 0.001 ms.
+## Symmetric public-range narrowing
+
+`PokerAI/tools/dh_native_ai.cpp` now maintains two persistent, normalized
+public beliefs: `hero_range` for the hands represented by our own public
+actions and `villain_range` for the opponent. Both are initialized over their
+legal combo sets, pruned when board cards arrive, and Bayesian-updated after
+their respective player's actions:
+
+```
+new_weight[hand] = old_weight[hand] * P(observed_action | hand)
+```
+
+Preflop and direct flop/turn updates use the trained blueprint's per-bucket
+policy. LiveResolver updates use the resolved root average strategy. Resolver
+calls receive both complete ranges and both normalized reach vectors; the
+action returned to the API is still sampled from the strategy for the bot's
+actual private hand. This mirrors the original Linux player's two-sided range
+tracking rather than treating the bot's public range as a permanent singleton.
+The exact river showdown evaluator uses strength-sorted cumulative reach,
+including exact shared-card exclusions, rather than an `O(N*M)` pair scan.
+This reduced the measured no-river-cluster turn narrowing case from about
+86.1 seconds to 13.9 seconds with full ranges; direct indexed flop/turn play
+does not invoke that fallback while its cursor remains valid.
+
+Focused validation:
+
+```
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER \
+  -o tools/test_hero_range_narrowing tools/test_hero_range_narrowing.cpp
+./tools/test_hero_range_narrowing
+```

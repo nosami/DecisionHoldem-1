@@ -1739,31 +1739,84 @@ private:
 			node->strength_cache_ready = true;
 		}
 
+		struct StrengthReach {
+			int strength;
+			double reach;
+		};
+		auto by_strength = [](const StrengthReach& a, const StrengthReach& b) {
+			return a.strength < b.strength;
+		};
+		std::vector<StrengthReach> all;
+		std::array<std::vector<StrengthReach>, 52> by_card;
+		std::array<double, 2652> exact_reach{};
+		all.reserve(other_n);
+		for (int oh = 0; oh < other_n; ++oh) {
+			double r = reach[1 - traverser][oh];
+			if (r == 0.0) continue;
+			const auto& hand = (traverser == 0) ? range_.villain[oh] : range_.hero[oh];
+			if (collides_with_board(hand, node->board)) continue;
+			int strength = (traverser == 0)
+				? node->villain_strength_cache[oh] : node->hero_strength_cache[oh];
+			all.push_back({strength, r});
+			by_card[hand[0]].push_back({strength, r});
+			by_card[hand[1]].push_back({strength, r});
+			int c1 = std::min<int>(hand[0], hand[1]);
+			int c2 = std::max<int>(hand[0], hand[1]);
+			exact_reach[c1 * 52 + c2] = r;
+		}
+		auto prepare_prefix = [&](std::vector<StrengthReach>& entries) {
+			std::sort(entries.begin(), entries.end(), by_strength);
+			double cumulative = 0.0;
+			for (auto& entry : entries) {
+				cumulative += entry.reach;
+				entry.reach = cumulative;
+			}
+		};
+		prepare_prefix(all);
+		for (auto& entries : by_card) prepare_prefix(entries);
+		auto prefix_before = [](const std::vector<StrengthReach>& entries, int strength) {
+			auto it = std::lower_bound(entries.begin(), entries.end(), strength,
+				[](const StrengthReach& entry, int value) { return entry.strength < value; });
+			return it == entries.begin() ? 0.0 : std::prev(it)->reach;
+		};
+		auto prefix_through = [](const std::vector<StrengthReach>& entries, int strength) {
+			auto it = std::upper_bound(entries.begin(), entries.end(), strength,
+				[](int value, const StrengthReach& entry) { return value < entry.strength; });
+			return it == entries.begin() ? 0.0 : std::prev(it)->reach;
+		};
+		auto category = [&](const std::vector<StrengthReach>& entries, int strength, int which) {
+			double total = entries.empty() ? 0.0 : entries.back().reach;
+			double before = prefix_before(entries, strength);
+			double through = prefix_through(entries, strength);
+			if (which < 0) return before;
+			if (which > 0) return total - through;
+			return through - before;
+		};
+
 		std::vector<double> util(out_n, 0.0);
 		for (int th = 0; th < out_n; th++) {
 			const auto& own_hand = (traverser == 0) ? range_.hero[th] : range_.villain[th];
 			if (collides_with_board(own_hand, node->board)) { util[th] = 0.0; continue; }
-			double v = 0.0;
-			for (int oh = 0; oh < other_n; oh++) {
-				double r = reach[1 - traverser][oh];
-				if (r == 0.0) continue;
-				const auto& hero_hand = (traverser == 0) ? range_.hero[th] : range_.hero[oh];
-				const auto& villain_hand = (traverser == 0) ? range_.villain[oh] : range_.villain[th];
-				const auto& other_hand = (traverser == 0) ? villain_hand : hero_hand;
-				if (collides_with_board(other_hand, node->board)) continue;
-				if (!hands_compatible(hero_hand, villain_hand)) continue;
-				int hero_idx = (traverser == 0) ? th : oh;
-				int villain_idx = (traverser == 0) ? oh : th;
-				int hs = node->hero_strength_cache[hero_idx];
-				int vs = node->villain_strength_cache[villain_idx];
-				unsigned char w = (hs < vs) ? 0 : (hs > vs) ? 1 : 255; // matches Engine::compute_winner() exactly
-				double val;
-				if (w == 255) val = pot / 2.0 - traverser_contrib;
-				else if ((int)w == traverser) val = pot - traverser_contrib;
-				else val = -traverser_contrib;
-				v += r * val;
-			}
-			util[th] = v;
+			int own_strength = (traverser == 0)
+				? node->hero_strength_cache[th] : node->villain_strength_cache[th];
+			int c1 = std::min<int>(own_hand[0], own_hand[1]);
+			int c2 = std::max<int>(own_hand[0], own_hand[1]);
+			double identical = exact_reach[c1 * 52 + c2];
+			auto compatible_category = [&](int which) {
+				double result = category(all, own_strength, which)
+					- category(by_card[c1], own_strength, which)
+					- category(by_card[c2], own_strength, which);
+				// The identical combo appears in both per-card sets. It can
+				// only be in the equal-strength category.
+				if (which == 0) result += identical;
+				return std::max(0.0, result);
+			};
+			double losing_reach = compatible_category(-1);
+			double tying_reach = compatible_category(0);
+			double winning_reach = compatible_category(1);
+			util[th] = winning_reach * (pot - traverser_contrib)
+				+ tying_reach * (pot / 2.0 - traverser_contrib)
+				- losing_reach * traverser_contrib;
 		}
 		return util;
 	}
