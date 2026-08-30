@@ -1927,6 +1927,59 @@ void opp_take_action(char* actionstr_c) {
 		g.street_action_path.push_back(
 			texassolver_bet_or_raise_token(prev_facing, opp_committed_before, g.stack_at_street_start[opp]));
 	}
+	// BUG FIX (found investigating live hand #12475294621, see BUILD_NOTES.md):
+	// decisionholdem_bridge.py's opponent_action() has, for some time, been
+	// able to send this exact "allin <amount>" command (a real, stack-diff-
+	// corrected whole-hand-cumulative commitment, used instead of the bare
+	// "allin" below whenever a reliable real-stack amount is known -- see
+	// its own comment, which explicitly names this branch) -- but this
+	// engine never actually implemented it. Since "allin 10840" matches
+	// neither the exact "allin" check above nor the "raise " prefix check
+	// below, it fell all the way through to the final call/check branch,
+	// silently mis-recording a genuine opponent all-in as a plain call: the
+	// tracked g.preflop_action_path got a phantom 'l' byte instead of the
+	// real 'n' byte. For hand #12475294621 (villain shoved EUR10.84 over
+	// hero's 3xBB open), this desynced the tracked path from the real
+	// trained tree just enough that the next lookup (for hero's own
+	// resulting decision) walked into an unrelated chance-node subtree and
+	// threw BlueprintReader's "encountered a chance-node marker" exception,
+	// falling back to a hardcoded, hand-strength-blind "call" -- exactly
+	// the failure mode the bare "allin" path (and section 51's fix) exist
+	// to avoid. This branch is identical to the bare "allin" branch above
+	// except it uses the caller's real amount (already in native chip
+	// units) instead of assuming the opponent shoved this engine's
+	// fictional stack_at_street_start[opp] baseline (every hand is
+	// internally modeled with a fixed 20000-chip stack) -- see the
+	// existing "allin <amount>" comment in decisionholdem_bridge.py, which
+	// this now actually implements.
+	else if (a.rfind("allin ", 0) == 0) {
+		int amount = std::stoi(a.substr(6));
+		if (preflop) { if (g.preflop_path_confident) narrow_villain_range_preflop('n'); }
+		else if (!narrow_villain_range_direct_blueprint(
+			opp, BlueprintActionTranslation::Kind::AllIn))
+			narrow_villain_range_postflop(opp, 'n');
+		if (preflop) track_blueprint_action(opp, BlueprintActionTranslation::Kind::AllIn);
+		// Unlike the bare "allin" branch above (which has no real number and
+		// must assume the opponent shoved this engine's entire fictional
+		// stack_at_street_start[opp] baseline), the whole point of the
+		// caller supplying a real amount here is to represent a genuinely
+		// short (in real-money terms) opponent stack accurately -- so the
+		// pot/stack bookkeeping must actually USE it, exactly like the
+		// "raise " branch just below does for a non-all-in raise, rather
+		// than always collapsing to 0. Using street_relative_raise_baseline()
+		// here (not a hardcoded 20000) mirrors the "raise " branch exactly,
+		// including its preflop-vs-postflop whole-hand-vs-this-street
+		// distinction (see that function's own comment).
+		g.stack[opp] = street_relative_raise_baseline(opp) - amount;
+		g.has_allin = true;
+		g.last_raise_size = std::max(0, amount - prev_facing);
+		g.blueprint_last_raise_size = g.last_raise_size;
+		g.n_raises_this_street++;
+		g.actions_this_street++;
+		if (preflop && g.preflop_path_confident) g.preflop_action_path.push_back('n');
+		g.street_action_path.push_back(
+			texassolver_bet_or_raise_token(prev_facing, opp_committed_before, amount));
+	}
 	else if (a.rfind("raise ", 0) == 0) {
 		int amount = std::stoi(a.substr(6));
 		int observed_whole_hand_total = amount;

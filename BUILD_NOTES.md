@@ -7436,6 +7436,205 @@ All 20 checks pass.
   all 5 ABI symbols still exported via `nm -gU`. **Not** copied over the
   main checkout's live copy.
 
+## 53. Investigating a user-flagged live all-in preflop call (5s9d SB vs. a
+covering-stack BB shove, hand #12475294621), and fixing the real bug it
+exposed: `opp_take_action()` never implemented the "allin <amount>" command
+`decisionholdem_bridge.py` already sends (2026-08-30)
+
+### The hand
+
+Live hand `12475294621` (`game_logs/hand_12475294621/`, `$HOME/src/
+TexasSolver`): nosami (SB, real stack EUR8.58) opened to EUR0.30 (3xBB, hand
+`5s9d`); insightx1 (BB, real stack EUR10.84) shoved all-in over the top for
+their entire stack. Since nosami's real stack (EUR8.58) is the *shorter* of
+the two, the site capped nosami's decision at "Fold" or "All In EUR8.28" (no
+raise option) -- confirmed directly in `events.log`'s `turn_start`/
+`action_buttons` for this decision. DecisionHoldem recommended **CALL
+EUR10.59** (`recommendations.jsonl`'s second entry, `is_all_in: true`). Note
+the recommendation's own `to_call`/`amount` (EUR10.59) is a separate, minor
+overstatement versus nosami's real capped exposure (EUR8.28) -- a Python-
+side (`$HOME/src/TexasSolver`) to-call bookkeeping quirk that did not cause
+any real overbet, since the site only ever exposed the one correctly-capped
+"All In EUR8.28" button regardless of the recommendation's printed figure.
+Not investigated further here (out of scope: a different repository, and
+not the mechanism behind the actual decision quality question below).
+
+### Was the blueprint genuinely consulted?
+
+`DH_VERBOSE_STRATEGY=1` was confirmed set on the live bridge process's real
+environment (`ps eww`), so this was fully observable. nosami's *first*
+decision (the open) has a completely genuine `[DH_STRATEGY]` line with real
+percentages (`fold=0.00% call=11.87% raise(0.50x pot)=61.55% ...`) and a
+matching `strategy_percentages` field in `recommendations.jsonl` -- a real
+blueprint consult. nosami's *second* decision (the all-in call) has **no**
+`[DH_STRATEGY]` line and **no** `strategy_percentages` field at all.
+Instead, `server.log` shows:
+```
+[DH_PREFLOP_BLUEPRINT] real blueprint lookup failed (BlueprintReader:
+encountered a chance-node marker (action_len >= 100) while navigating what
+should be a preflop-only path -- refusing to trust nearby bytes as strategy
+data (this means our navigation of the tree took a wrong turn, most likely
+an action byte that doesn't actually match this training run's tree)) --
+falling back to placeholder 'call' for this decision only
+```
+This is `resolve_preflop_decision()`'s catch block (`dh_native_ai.cpp`,
+around line 1765 pre-fix). Critically, `g.preflop_path_confident` was
+**still true** at this point (section 51's fuzzy-bracketing fix -- already
+deployed live, confirmed via the running `.dylib`'s build timestamp
+post-dating that commit -- correctly avoided the *old* confidence-loss
+bug), so this is a **different, new** failure: the real blueprint lookup
+was genuinely attempted and then failed deeper in, during tree navigation.
+
+### Root cause
+
+Confirmed by walking the REAL `blueprint_stgy.dat` directly (a read-only,
+throwaway diagnostic against `BlueprintReader.h`, not checked in) with
+candidate `action_path` byte sequences for "hero raises 3xBB (byte 2), then
+villain's shove maps to byte X": path `[2,108]` (108=`'l'`, call) is the
+*only* one that reproduces the exact observed exception -- `[2,110]`
+(110=`'n'`, allin), `[2,20]`, and `[2,40]` all resolve cleanly. This proves
+villain's shove was recorded as a plain **call**, not a raise or an allin.
+
+Tracing why: `decisionholdem_bridge.py`'s `opponent_action()` already
+supports (and, per its own comment, is meant to) send a distinct
+`"allin <amount>"` native command -- a real, stack-diff-corrected
+whole-hand-cumulative commitment -- whenever a reliable real-stack amount
+is known for an opponent's all-in (its comment literally reads "See
+dh_native_ai.cpp's opp_take_action()'s 'allin <amount>' comment"). But
+`opp_take_action()` (`dh_native_ai.cpp`) never actually implemented that
+format: it only recognized the bare, exact string `"allin"` (no amount) and
+strings starting with `"raise "`. `"allin 10840"` matches **neither**, so it
+fell all the way through to the final generic call/check branch -- which
+records byte `'l'` and applies call-shaped stack bookkeeping. `git log --all
+-S'allin <amount>'` confirms this format was never implemented in this
+file's history, on any branch: a genuine cross-repo protocol gap, not a
+regression. This desynced `g.preflop_action_path` from the real trained
+tree just enough that the very next lookup (hero's own resulting decision)
+walked into an unrelated chance-node subtree and threw.
+
+### The fix
+
+Added a new `else if (a.rfind("allin ", 0) == 0)` branch in
+`opp_take_action()`, mirroring the existing bare-`"allin"` branch exactly
+(byte `'n'`, `g.has_allin = true`, same range-narrowing calls), except it
+parses the caller's real amount and uses it for stack/pot bookkeeping via
+`street_relative_raise_baseline(opp) - amount` -- the same expression the
+`"raise "` branch already uses -- instead of hardcoding `g.stack[opp] = 0`
+(which would have silently discarded the entire point of passing a real
+amount: representing a genuinely short, in real-money terms, opponent
+stack accurately rather than assuming their fictional 20000-chip abstraction
+baseline). An initial version of this fix kept the hardcoded `= 0`; it
+compiled and "worked" (fixed the crash) but produced a nonsensical
+`pot=20300` in the resulting `[DH_STRATEGY]` line -- caught by comparing
+against the real hand's own numbers before finalizing.
+
+### Concrete confirmation this changes a real decision, not just a log line
+
+Replaying hand #12475294621's exact scenario (`restart_game(0, "5s", "9d")`,
+`apply_own_action("raise 300")`, `opp_take_action("allin 10840")`) with the
+fix in place: `g.preflop_action_path` now ends in byte `'n'` (not `'l'`);
+`getdecision()` logs a genuine line instead of the fallback error:
+```
+[DH_STRATEGY] PREFLOP hand=5s9d pot=11140 expl=n/a: fold=100.00% call=0.00%
+```
+**The real blueprint says fold=100% here** -- the opposite of the live
+hand's actual "CALL" recommendation. Independent Monte Carlo equity (`treys`,
+disposable script per this file's own precedent) for hero's `9d5s` against
+several plausible BB all-in-shoving ranges at this depth confirms the same
+verdict decisively, not marginally:
+
+| Villain range assumption | Hero equity | vs. 48.25% pot odds needed |
+|---|---|---|
+| Tight/premium (QQ+, AK) | 23.57% | -EV call |
+| Standard shove (TT+, AQ+) | 24.00% | -EV call |
+| Wide/"maniac" (77+, A9+, KTs+, QJs) | 27.93% | -EV call |
+| Villain's actual real hand only (AK, reference) | 33.67% | -EV call |
+
+Every single assumption -- including calling only against villain's own
+exact real hand -- falls far short of the 48.25% (EUR8.28 call / EUR17.16
+final pot) needed. This was not a close spot the bug happened to flip; the
+bug produced a clearly wrong answer.
+
+### Validation
+
+**Build** (from `PokerAI/`, standard non-OpenMP test command, matching every
+other `test_*.cpp` in this suite):
+```sh
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_allin_amount_command tools/test_allin_amount_command.cpp
+```
+**New test** (`tools/test_allin_amount_command.cpp`, 4 checks against the
+real blueprint file, all pass): a bare `"allin"` is unaffected (byte `'n'`,
+stack still assumes the fictional baseline); `"allin <amount>"` now also
+resolves to byte `'n'` (not `'l'`) with `preflop_path_confident` staying
+true and the tracked stack correctly reflecting the *real* amount
+(20000-10840=9160, not a hardcoded 0); an ordinary `"raise <amount>"` is
+unaffected (disjoint prefix); and an end-to-end replay of the real hand
+scenario logs a genuine `[DH_STRATEGY] PREFLOP` line with no
+`[DH_PREFLOP_BLUEPRINT] real blueprint lookup failed` fallback.
+
+**Full existing regression suite**, rebuilt and re-run unmodified against
+the fixed source (all `PokerAI/cluster/*.bin` symlinked to
+`/Users/jason/dh_local_data/`, matching the existing sibling-worktree
+convention; all 6 live-session `DH_*` env vars set explicitly) -- every
+`test_*.cpp` that calls `opp_take_action()` (14 files, the complete blast
+radius of this change) was rebuilt and run:
+```sh
+for f in test_bet_size_narrowing test_hero_range_narrowing \
+  test_villain_weight_distribution test_preflop_offladder_sizing \
+  test_default_env_vars test_hand6_checkraise test_hand6_range_miss \
+  test_narrow_cfvalue_replace test_narrow_epsilon_floor \
+  test_qq_trips_range_miss test_kcflush_river_range \
+  test_texassolver_fallback test_hand_12473146716_texassolver_compare \
+  test_hand_12473147059_texassolver_compare; do
+  g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/$f tools/$f.cpp && ./tools/$f
+done
+# test_turn_leaf_speedup needs an extra arg:
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_turn_leaf_speedup tools/test_turn_leaf_speedup.cpp \
+  && ./tools/test_turn_leaf_speedup /Users/jason/dh_local_data/river_cluster_split
+```
+**13 of 14 pass cleanly** (exit code 0, `ALL CHECKS PASSED` where
+applicable). `test_turn_leaf_speedup` fails one assertion
+("implausible action") -- confirmed **pre-existing and unrelated**: `git
+stash`-ing this fix and rebuilding the identical test against the
+*original* unmodified source reproduces the exact same failure
+byte-for-byte (an unseeded-RNG TURN-decision plausibility check, nothing to
+do with preflop `opp_take_action()` string parsing). Restored the fix
+immediately after confirming this.
+
+### Scope and honest caveats
+
+- This only teaches the engine to correctly parse a command format its own
+  Python caller was already documented as sending; it does not change how
+  `decisionholdem_bridge.py`/`web/decisionholdem.py` (a different
+  repository, `$HOME/src/TexasSolver`) decide *when* to send `"allin
+  <amount>"` versus a scaled `"raise <amount>"` for a covering-stack shove
+  like this hand's -- that heuristic (`opponent_stack_now <= 0.005`,
+  designed for when the *shover* is the short stack) is out of scope here
+  and untouched.
+- The bare `"allin"` (no amount) branch is completely unchanged -- verified
+  byte-for-byte identical behavior in the new test's Check 1.
+- Like section 51's fix, this changes how an opponent's *already-classified-
+  as-all-in* action is recorded; it does not add new information the
+  engine didn't have, and does not touch `apply_own_action()` (hero's own
+  actions never need this format -- `getdecision()` always emits exact
+  native amounts for hero's own play).
+- The rebuilt `dh_native_ai.dylib` has not been copied over the main
+  checkout's live copy -- deploying requires a live session restart at a
+  moment of the user's choosing, per this file's established precedent
+  (sections 51/52).
+
+### Files touched
+
+- `PokerAI/tools/dh_native_ai.cpp`: added the `"allin <amount>"` branch to
+  `opp_take_action()` (~25 lines), immediately after the existing bare
+  `"allin"` branch.
+- `PokerAI/tools/test_allin_amount_command.cpp` (new): 4 focused checks
+  described above, including a full replay of the real hand.
+- `.gitignore`: added `PokerAI/tools/test_allin_amount_command` (the new
+  test's compiled binary), matching the existing per-binary pattern.
+- Rebuilt `dh_native_ai.dylib` in this isolated worktree only (see caveat
+  above); **not** copied over the main checkout's live copy.
+
 ## Symmetric public-range narrowing
 
 `PokerAI/tools/dh_native_ai.cpp` now maintains two persistent, normalized
