@@ -221,7 +221,15 @@ struct LiveGame {
 	// raise is seen whose size can't be matched EXACTLY to one of the
 	// trained abstraction's discrete byte codes -- at that point the path
 	// can no longer be trusted, so preflop decisions fall back to the
-	// original "call" placeholder rather than guess.
+	// original "call" placeholder rather than guess. The transition itself
+	// is logged once, unconditionally, as "[DH_PREFLOP_BLUEPRINT] preflop
+	// path confidence lost ..." (see opp_take_action()'s raise branch) --
+	// this is the ONLY diagnostic for this fallback: resolve_preflop_
+	// decision()'s own "!preflop_path_confident" guard has no strategy
+	// distribution left to log, so unlike every other preflop/postflop
+	// decision, a hand that hits this fallback prints no "[DH_STRATEGY]
+	// PREFLOP ..." line at all -- that is expected, not a bug, once this
+	// message is present to explain why.
 	std::vector<unsigned char> preflop_action_path;
 	bool preflop_path_confident = true;
 	uint32_t blueprint_node = IndexedBlueprint::NO_CHILD;
@@ -604,8 +612,10 @@ int street_relative_raise_baseline(int slot) {
 // new whole-hand total bet for a player, given the true state immediately
 // before their action. Returns -1 if no exact match exists (e.g. a human
 // GUI player chose an arbitrary custom size the training abstraction never
-// modeled) -- callers must treat that as "can't use the real blueprint for
-// the rest of this preflop street," never round/guess a nearby bucket.
+// modeled). See match_raise_action_byte_fuzzy() below, which is what
+// opp_take_action() actually calls -- this exact-match-only helper is kept
+// as its first step and as the target of test_bet_size_narrowing's existing
+// exact-match assertions.
 int match_raise_action_byte(int total_pot_before, int last_bigbet_before, int my_bet_before, int observed_new_total_bet) {
 	int n_chips_to_call = last_bigbet_before - my_bet_before;
 	int pot = total_pot_before + n_chips_to_call;
@@ -616,6 +626,76 @@ int match_raise_action_byte(int total_pot_before, int last_bigbet_before, int my
 			return byte;
 	}
 	return -1;
+}
+
+// BUG FIX (BUILD_NOTES.md section 51; found investigating hand #12474088712,
+// a live opponent's 6x-BB preflop open that doesn't hit any of
+// match_raise_action_byte()'s seven exact discrete sizes). Previously, ANY
+// non-exact preflop raise size permanently set g.preflop_path_confident =
+// false for the rest of the hand's preflop street, and resolve_preflop_decision()
+// silently returned a placeholder "call" -- with no [DH_STRATEGY] percentages
+// logged and, critically, no dependence on hero's actual hand strength AT ALL
+// -- for every one of hero's remaining preflop decisions this hand, regardless
+// of how good or bad hero's cards were. This was a real decision-quality
+// defect (not by-design; git blame shows it was never intentionally scoped to
+// "only handle exact sizes"), and it is NOT rare: any live opponent whose bet
+// sizing doesn't happen to land on one of the 7 trained multiples (a near
+// certainty against human players, who don't size in exact fractions of pot)
+// triggers it.
+//
+// The fix applies the SAME pseudo-harmonic bet-size-abstraction-translation
+// technique already used, and already validated, for postflop raises (see
+// BlueprintActionTranslation::translate() in ../tree/BlueprintActionTranslation.h,
+// which itself uses ../tree/PseudoHarmonic.h) -- a standard, published action-
+// translation method (Ganzfried & Sandholm, "Action Translation in Extensive-
+// Form Games with Large Action Spaces", IJCAI 2013), already in production use
+// elsewhere in this file. Instead of giving up when no exact byte matches, it
+// brackets the observed raise between its two nearest trained sizes (by
+// pot-relative fraction) and randomly samples one of the two, weighted by
+// pseudo-harmonic interpolation toward whichever is closer -- so hero's
+// subsequent preflop decisions still consult the real trained blueprint
+// (hand-strength-aware, with real [DH_STRATEGY] percentages), instead of an
+// always-identical placeholder "call". If the observed size falls entirely
+// outside the trained ladder (bigger than the largest trained multiple, or
+// smaller than the smallest -- effectively a near-min-raise or a huge
+// overbet), it clamps to that nearest end bucket rather than extrapolating.
+//
+// This can still legitimately return -1 for a genuinely degenerate input (a
+// non-positive pot or call amount, indicating a bookkeeping inconsistency
+// upstream) -- that is NOT a sizing-abstraction issue and callers must still
+// treat it as "can't trust the tracked path for the rest of this street."
+template <typename RNG>
+int match_raise_action_byte_fuzzy(int total_pot_before, int last_bigbet_before, int my_bet_before,
+	int observed_new_total_bet, RNG& rng) {
+	int exact = match_raise_action_byte(total_pot_before, last_bigbet_before, my_bet_before, observed_new_total_bet);
+	if (exact >= 0) return exact;
+
+	int n_chips_to_call = last_bigbet_before - my_bet_before;
+	int pot = total_pot_before + n_chips_to_call;
+	int observed_increment = observed_new_total_bet - last_bigbet_before;
+	if (pot <= 0 || observed_increment <= 0) return -1; // degenerate, not a sizing issue
+
+	struct Candidate { int byte; double fraction; };
+	std::vector<Candidate> candidates;
+	static const int bytes[] = { 1, 2, 3, 4, 8, 20, 40 };
+	for (int b : bytes) {
+		int last_raise = (b != 3) ? (pot * b / 200 * 100) : (pot / 400 * 100);
+		if (last_raise <= 0) continue;
+		candidates.push_back({ b, static_cast<double>(last_raise) / pot });
+	}
+	if (candidates.empty()) return -1;
+	std::sort(candidates.begin(), candidates.end(),
+		[](const Candidate& a, const Candidate& c) { return a.fraction < c.fraction; });
+
+	double x = static_cast<double>(observed_increment) / pot;
+	if (x <= candidates.front().fraction) return candidates.front().byte;
+	if (x >= candidates.back().fraction) return candidates.back().byte;
+	auto upper = std::upper_bound(candidates.begin(), candidates.end(), x,
+		[](double value, const Candidate& c) { return value < c.fraction; });
+	const Candidate& hi = *upper;
+	const Candidate& lo = *(upper - 1);
+	bool pick_lower = RealtimeSearch::randomized_pseudo_harmonic(lo.fraction, hi.fraction, x, rng);
+	return pick_lower ? lo.byte : hi.byte;
 }
 
 BlueprintActionTranslation::BettingContext blueprint_betting_context(int acting_slot) {
@@ -1811,12 +1891,39 @@ void opp_take_action(char* actionstr_c) {
 			int total_pot_before = (20000 - g.stack[0]) + (20000 - g.stack[1]);
 			int last_bigbet_before = std::max(20000 - g.stack[0], 20000 - g.stack[1]);
 			int my_bet_before = 20000 - g.stack[opp];
-			int byte = match_raise_action_byte(total_pot_before, last_bigbet_before, my_bet_before, amount);
+			// match_raise_action_byte_fuzzy() (BUILD_NOTES.md section 51) only
+			// returns -1 for a genuinely degenerate pot/call bookkeeping state
+			// now, not merely an off-abstraction size -- an off-ladder size
+			// (the common case against real opponents) is bracketed/sampled
+			// via pseudo-harmonic interpolation instead, exactly like the
+			// existing postflop raise-size translation.
+			int byte = match_raise_action_byte_fuzzy(total_pot_before, last_bigbet_before, my_bet_before, amount, g.rng);
 			if (byte >= 0) {
 				narrow_villain_range_preflop((unsigned char)byte);
 				g.preflop_action_path.push_back((unsigned char)byte);
 			}
-			else g.preflop_path_confident = false; // can no longer trust the tracked path this hand
+			else {
+				// Mirrors disable_blueprint_cursor()'s sibling diagnostic for the
+				// flop/turn indexed-blueprint cursor: log once, unconditionally
+				// (not gated behind DH_VERBOSE_STRATEGY -- this is a real, if rare,
+				// degradation event, not routine strategy-distribution detail),
+				// exactly at the transition, since resolve_preflop_decision()'s own
+				// "!preflop_path_confident" guard (this flag's only other reader)
+				// returns its placeholder 'call' silently and has no strategy
+				// distribution of its own left to print. This branch should now be
+				// rare: it only fires for a degenerate pot/call bookkeeping state
+				// (see match_raise_action_byte_fuzzy()'s comment), not for an
+				// ordinary off-ladder bet size, which is handled above instead.
+				std::fprintf(stderr,
+					"[DH_PREFLOP_BLUEPRINT] preflop path confidence lost for the "
+					"rest of this hand -- observed raise to %d hit a degenerate "
+					"pot/call bookkeeping state that pseudo-harmonic size "
+					"translation could not bracket -- preflop decisions will fall "
+					"back to a placeholder 'call' with no [DH_STRATEGY] "
+					"percentages logged\n",
+					amount);
+				g.preflop_path_confident = false; // can no longer trust the tracked path this hand
+			}
 		}
 		else if (!preflop) {
 			// Postflop: an all-in-sized raise maps to byte 'n'; any other

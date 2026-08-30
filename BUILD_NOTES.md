@@ -6989,6 +6989,167 @@ by 6,000 iterations/0.799%, RIVER by 10,000/0.862%, TURN not converged by
 FLOP/TURN) — confirming this fix, like the rest of this integration,
 leaves `RealtimeSearch.h`/`LiveResolver` completely untouched.
 
+## 51. Investigating a user-flagged live preflop call (2h9c BB vs. a 6x-BB SB open, hand #12474088712), and fixing the real bug it exposed: an off-ladder opponent bet size silently disabled ALL preflop reasoning for the rest of the hand
+
+A live SkyPoker hand (`$HOME/src/TexasSolver`'s `web/server.py` bridge,
+hand `12474088712`) drew a direct question: hero (BB) held `2h9c` and
+called villain's (CHEYDI, SB) open to €1.20 over €0.10/€0.20 blinds — a
+6x-the-big-blind raise. Investigating why this call happened, and why
+it produced no `[DH_STRATEGY] PREFLOP ...` diagnostic line (unlike every
+other preflop decision logged elsewhere in this same session and unlike
+this same hand's own flop decisions), traced to a real, fixable bug —
+not a by-design omission.
+
+### Root cause
+
+`resolve_preflop_decision()` (`PokerAI/tools/dh_native_ai.cpp`) opens
+with `if (!g.preflop_path_confident) return "call";` — a hardcoded
+placeholder, before any blueprint lookup or `dh_log_strategy()` call.
+`g.preflop_path_confident` goes false, permanently for the rest of the
+hand, inside `opp_take_action()`'s raise branch, whenever
+`match_raise_action_byte()` can't match the opponent's new total bet
+*exactly* to one of the trained abstraction's seven discrete sizes
+(byte codes `{1,2,3,4,8,20,40}`, corresponding to `{0.5x,1x,~0x,2x,4x,
+10x,20x}` pot, which for a first preflop raise over 50/100 blinds work
+out to new-total-bet multiples of `{2x,3x,n/a,5x,9x,21x,41x}` the big
+blind). CHEYDI's €1.20 open converts (via `web/decisionholdem.py`'s
+`_native_chips()`, `_live_per_native_chip = parsed_big_blind / 100.0`)
+to exactly 600 native units — 6x the BB, strictly between the trained
+5x (byte 4) and 9x (byte 8) sizes, so `match_raise_action_byte()`
+returns `-1` and confidence is lost. From that point on, **every**
+remaining preflop decision this hand — regardless of hero's actual
+cards — is the same hardcoded `"call"`, with no blueprint consultation,
+no `[DH_STRATEGY]` line, and no villain-range narrowing
+(`narrow_villain_range_preflop()` is only called when still confident).
+This is not rare against real opponents: humans do not size raises in
+exact fractions of pot, so any non-round preflop open is likely to miss
+all seven trained buckets. `git blame`/history confirm this was never
+an intentional "only handle exact sizes" design choice — it simply
+predates a bracketing tool that didn't exist yet when it was written.
+
+### The fix
+
+Postflop already solves this exact problem for opponent raises via
+`BlueprintActionTranslation::translate()`
+(`PokerAI/tree/BlueprintActionTranslation.h`, built on
+`PokerAI/tree/PseudoHarmonic.h`) — the published pseudo-harmonic
+action-translation technique (Ganzfried & Sandholm, "Action Translation
+in Extensive-Form Games with Large Action Spaces", IJCAI 2013): bracket
+an observed bet between its two nearest legal/trained sizes by
+pot-relative fraction, then randomly sample one of the two, weighted
+toward whichever is numerically closer. Preflop had no equivalent and
+simply gave up.
+
+Added `match_raise_action_byte_fuzzy()` immediately after the existing
+`match_raise_action_byte()` (kept unchanged and still tried first, so
+already-exact sizes are byte-for-byte unaffected): on a miss, it
+computes each of the seven candidate bytes' pot-relative fraction,
+clamps to the nearest end bucket if the observed size falls entirely
+outside the trained ladder (avoiding extrapolation), otherwise brackets
+between the two nearest neighbors and samples one via the same
+`RealtimeSearch::randomized_pseudo_harmonic()` helper postflop already
+uses. `opp_take_action()`'s preflop raise branch now calls this instead
+of the exact-only version. The "confidence lost" fallback branch is
+kept (its diagnostic message updated) for a genuinely degenerate
+pot/call bookkeeping state, but should no longer fire for an ordinary
+off-ladder bet size.
+
+```cpp
+template <typename RNG>
+int match_raise_action_byte_fuzzy(int total_pot_before, int last_bigbet_before, int my_bet_before,
+	int observed_new_total_bet, RNG& rng) {
+	int exact = match_raise_action_byte(total_pot_before, last_bigbet_before, my_bet_before, observed_new_total_bet);
+	if (exact >= 0) return exact;
+	// ... bracket by pot-fraction among {1,2,3,4,8,20,40}, sample via
+	// RealtimeSearch::randomized_pseudo_harmonic(lo.fraction, hi.fraction, x, rng) ...
+}
+```
+
+### Concrete confirmation this changes a real decision, not just a log line
+
+Replaying hand #12474088712's exact scenario (`restart_game(1, "2h",
+"9c")`, then `opp_take_action("raise 600")`, matching CHEYDI's real
+6x-BB open) with the fix in place: `g.preflop_path_confident` **stays
+true** (previously flipped false); 600 correctly brackets between byte
+4 (5x, total 500) and byte 8 (9x, total 900) — pot-fraction `x = 2.5`
+between their fractions `2.0`/`4.0` — and is sampled, not snapped
+arbitrarily; `getdecision()` now genuinely consults the trained
+blueprint:
+```
+[DH_STRATEGY] PREFLOP hand=2h9c pot=700 expl=n/a: fold=100.00% call=0.00% raise(0.50x pot)=0.00% raise(1.00x pot)=0.00% raise(2.00x pot)=0.00% raise(4.00x pot)=0.00% raise(10.00x pot)=0.00% allin=0.00%
+```
+**The real blueprint says fold=100% here.** Real Monte Carlo equity for
+hero's `9c2h` (using the already-installed `treys` library, a
+disposable verification script per this file's own established
+"throwaway scripts" precedent) needs ~41.7% pot equity to profitably
+call but tops out at 39.6% even against the widest possible assumed
+opening range (any two cards) — so the fix's fold is also the
+sound decision by raw equity, not merely a coincidental blueprint
+output. This means the bug was not cosmetic: it measurably changed
+hero's actual in-hand decision for this hand, from an always-identical,
+hand-strength-blind "call" to a confident, hand-strength-aware "fold".
+
+Separately, confirmed (tracing `decisionholdem_bridge.py`'s entire
+protocol surface — `new_hand`/`street`/`opponent_action`/`act`/`reveal`)
+that opponent HUD/VPIP/AF stats computed by TexasSolver's
+`web/browser_events.py` (CHEYDI showed VPIP=83%/AF=100%/"maniac" in this
+session) are never threaded into the native decision engine — display
+only. The old fallback's "call" was therefore not an exploit of villain's
+real observed looseness either way; it was an unconditional placeholder.
+
+### Validation
+
+New test `PokerAI/tools/test_preflop_offladder_sizing.cpp` (five
+independent checks, all pass): an exact match (raise to 300 = 3x) still
+resolves via the original path (byte 2, no regression); CHEYDI's real
+off-ladder 6x open (raise to 600) now brackets to byte 4 or 8 instead of
+-1; an end-to-end replay of the real hand confirms confidence stays true
+and a real `[DH_STRATEGY]` line is logged; sampling the same 6x input
+2000 times reaches both byte 4 and byte 8, skewed toward byte 4 (the
+numerically closer trained size); a degenerate (non-positive pot) input
+still correctly returns -1.
+
+Build (from `PokerAI/`, full OpenMP command per section 46):
+```sh
+g++ -std=c++17 -O2 -Wall -Wextra -DDH_SKIP_RIVER_CLUSTER \
+    -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include \
+    -shared -fPIC -o dh_native_ai.dylib tools/dh_native_ai.cpp \
+    -L/opt/homebrew/opt/libomp/lib -lomp
+nm -gU dh_native_ai.dylib   # all 5 ABI symbols confirmed present
+```
+Full existing regression suite re-run unmodified, all pass, with
+postflop numbers byte-for-byte identical to before this change
+(confirming zero effect outside preflop raise matching):
+```sh
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_bet_size_narrowing tools/test_bet_size_narrowing.cpp && ./tools/test_bet_size_narrowing
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_hero_range_narrowing tools/test_hero_range_narrowing.cpp && ./tools/test_hero_range_narrowing
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_villain_weight_distribution tools/test_villain_weight_distribution.cpp && ./tools/test_villain_weight_distribution
+```
+
+### Scope and honest caveats
+
+- This only changes how an **opponent's** preflop raise size maps onto
+  the trained abstraction's byte codes. It does not add new sizes to
+  the trained abstraction itself (impossible without retraining) — it
+  only avoids discarding all reasoning capability the instant a size
+  falls between two trained buckets.
+- The bracket-and-sample choice is a heuristic approximation (the same
+  one already accepted for postflop), not a claim that it exactly
+  recovers what the blueprint would have output had it been trained
+  with a size at exactly 6x. It is unambiguously better than the prior
+  behavior (a hand-strength-blind, always-identical "call").
+- `narrow_villain_range_preflop()` narrows using whichever byte was
+  sampled; if that byte happens to not be legal at this exact node
+  (already-existing, separate error handling), narrowing is safely
+  skipped for that one action only, exactly as for the exact-match path.
+  No new failure mode was introduced.
+- This fix originated independently in two parallel investigations of
+  the same hand and was cross-validated between them before being
+  ported here; the rebuilt `dh_native_ai.dylib` has not yet been copied
+  over any live-session copy — deploying requires a live session
+  restart at a moment of the user's choosing, to avoid disrupting
+  real-money play in progress.
+
 ## Symmetric public-range narrowing
 
 `PokerAI/tools/dh_native_ai.cpp` now maintains two persistent, normalized
