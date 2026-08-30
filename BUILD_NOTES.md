@@ -7150,6 +7150,292 @@ g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_villain_weight_distribu
   restart at a moment of the user's choosing, to avoid disrupting
   real-money play in progress.
 
+## 52. Making the six DH_* live-session environment variables default to the live SkyPoker bridge session's values, so they no longer have to be exported by hand every launch (2026-08-30)
+
+### The user's request
+
+The live SkyPoker bridge session (a separate, sibling checkout that loads
+`PokerAI/dh_native_ai.dylib` from the MAIN checkout,
+`/Users/jason/src/DecisionHoldem`, branch `test-direct-blueprint`) depends on
+six environment variables the user had to remember to `export` by hand
+before every single launch:
+
+```
+DH_DIRECT_BLUEPRINT=1
+DH_BLUEPRINT_PATH=/Users/jason/dh_local_data/blueprint_stgy.dat
+DH_BLUEPRINT_INDEX=/Users/jason/dh_local_data/blueprint_stgy.dat.idx
+DH_RIVER_SPLIT_DIR=/Users/jason/dh_local_data/river_cluster_split
+DH_VERBOSE_STRATEGY=1
+DH_TEXASSOLVER_FALLBACK=force
+```
+
+The ask: make these six values the **default** (used only when the
+corresponding env var is *unset*) so the live session no longer needs them
+set by hand, while keeping the override-via-environment-variable behavior
+fully intact for a build/test harness, CI, or a deliberate one-off
+different run. Done in an isolated worktree branched off
+`test-direct-blueprint`'s tip -- the live main checkout was never touched.
+
+### What changed
+
+All six call sites are pure, stateless (no caching) `std::getenv()`-backed
+getters/helpers -- only their **fallback value** (used when the variable is
+unset) changed. Any value the environment variable is explicitly set to
+still wins exactly as before; nothing about the "set" path changed.
+
+| Variable | Old default (unset) | New default (unset) | Call site |
+|---|---|---|---|
+| `DH_DIRECT_BLUEPRINT` | off (`false`) | **on** (`true`) | `dh_native_ai.cpp`'s `direct_blueprint_enabled()` |
+| `DH_BLUEPRINT_PATH` | `cluster/blueprint_strategy.dat` | `/Users/jason/dh_local_data/blueprint_stgy.dat` | `dh_native_ai.cpp`'s `direct_blueprint_path()` |
+| `DH_BLUEPRINT_INDEX` | `<source>.idx` (derived) | `<source>.idx` (derived, unchanged -- see below) | `dh_native_ai.cpp`'s `direct_blueprint_index_path()` |
+| `DH_RIVER_SPLIT_DIR` | empty (feature off) | `/Users/jason/dh_local_data/river_cluster_split` | `dh_native_ai.cpp`'s `river_split_dir()` |
+| `DH_VERBOSE_STRATEGY` | off (`false`) | **on** (`true`) | `dh_native_ai.cpp`'s `dh_verbose_enabled()` |
+| `DH_TEXASSOLVER_FALLBACK` | `"auto"` | `"force"` | `TexasSolverBridge.h`'s `texassolver_bridge::trigger_mode()` |
+
+### Design decisions
+
+**The two booleans (`DH_DIRECT_BLUEPRINT`, `DH_VERBOSE_STRATEGY`): unset ->
+true, explicit `"0"` -> false, explicit `"1"`/`"true"` -> true.** Both
+getters got the exact same minimal change: a single new
+`if (!value) return true;` short-circuit inserted *before* the original
+body, which is otherwise byte-for-byte unchanged. This means:
+- `std::getenv()` returning `nullptr` (the variable is not in the
+  environment at all) is now the *only* thing that changes meaning -- it
+  now means "default on" instead of "default off".
+- Every previously-defined *explicit* value keeps doing exactly what it
+  did before: `direct_blueprint_enabled()` still only recognizes
+  `"1"`/`"true"`/`"TRUE"` as true and anything else (`"0"`, `"false"`, an
+  unrecognized token) as false; `dh_verbose_enabled()` still treats an
+  empty string or `"0"` as false and anything else non-empty as true --
+  matching `dh_verbose_enabled()`'s own pre-existing unset-vs-explicit
+  convention (its docstring already called out `unset/0/empty = off`),
+  just with the unset branch's *value* flipped.
+- Concretely: `DH_DIRECT_BLUEPRINT=0` and `DH_VERBOSE_STRATEGY=0` still
+  disable each feature exactly as before -- verified directly in the new
+  test (see Validation below).
+
+**`DH_BLUEPRINT_INDEX`'s fallback logic is intentionally left unchanged
+(still `source + ".idx"`), not hardcoded to the new personal index path.**
+This was a deliberate choice, not an oversight: `direct_blueprint_index_path()`
+takes the *already-resolved* blueprint source path as its argument, so once
+`direct_blueprint_path()`'s own default became this user's real blueprint
+file, the derived `source + ".idx"` naturally resolves to exactly this
+user's real sidecar index (`/Users/jason/dh_local_data/blueprint_stgy.dat.idx`)
+with both variables unset -- matching the requested target value exactly,
+with zero code change needed at that specific site. Hardcoding the index
+fallback instead would have been *worse*: if `DH_BLUEPRINT_PATH` is ever
+overridden (a different machine, a different blueprint snapshot, a CI
+fixture) without also overriding `DH_BLUEPRINT_INDEX`, a hardcoded
+personal-path fallback would silently point the index at *this* user's
+file while the source points somewhere else entirely -- a mismatch
+`IndexedBlueprint::Reader::load_index()` would likely reject anyway (it
+already cross-checks the real source file's actual size and a content
+fingerprint against `source_size_`/`source_hash_` stored in the index,
+throwing `"source size does not match index fingerprint"` on a mismatch --
+see `IndexedBlueprint.h` lines ~359-360). Keeping the derived logic means
+the index always sensibly follows whatever source is actually in use. All
+three behaviors (derives from the personal default when both are unset;
+derives from an overridden source when only `DH_BLUEPRINT_PATH` is
+overridden; honors an explicit `DH_BLUEPRINT_INDEX` override regardless of
+source) are directly verified in the new test.
+
+**`DH_TEXASSOLVER_FALLBACK`'s default flips from `"auto"` to `"force"`.**
+This one is a plain string default passed to the pre-existing `env_or()`
+helper (`TexasSolverBridge.h`) -- no behavioral-convention design needed,
+just the literal fallback string changed from `"auto"` to `"force"`.
+`env_or()`'s existing "empty-or-unset falls back to the default" semantics
+are unchanged.
+
+### The local-data-path caveat (portability)
+
+`DH_BLUEPRINT_PATH`, `DH_BLUEPRINT_INDEX` (via its derived-from-
+`DH_BLUEPRINT_PATH` fallback), and `DH_RIVER_SPLIT_DIR` now default to
+hardcoded paths under `/Users/jason/dh_local_data/` -- **this user's
+personal local data directory on this specific machine, not something that
+ships with the repo or is portable to another machine/username.** Each
+changed default has a code comment explaining this directly at its
+`getenv()` site (and in the file's top-of-file header-comment block).
+Anyone else building this repo, or a CI environment where that path
+doesn't exist, should set `DH_BLUEPRINT_PATH` / `DH_BLUEPRINT_INDEX` /
+`DH_RIVER_SPLIT_DIR` explicitly to their own copies -- the explicit env var
+always wins over the new default exactly as it did over the old one. If
+the default path is simply absent (e.g. a fresh checkout on a different
+machine), the existing, pre-existing failure handling in each consumer
+takes over unchanged: `initialize_direct_blueprint()` already catches
+`IndexedBlueprint::Reader`'s constructor exception and transparently
+disables the cursor for the hand (falls back to LiveResolver);
+`river_split_dir()` pointing at a missing directory already means
+`RiverClusterLeafModel` transparently falls back to the original exact
+chance-node + showdown behavior. Neither of those fallback paths needed
+any change -- they already had to handle "configured path doesn't exist"
+correctly before this change, for the same reason they had to handle a bad
+*explicit* override before.
+
+### Local data path sanity check (per the task's own instructions)
+
+All three referenced local paths were checked directly on this machine
+before finalizing anything:
+
+```
+$ ls -la /Users/jason/dh_local_data/blueprint_stgy.dat
+-rw------- 1 jason staff 16123074125 Aug 26 13:02 /Users/jason/dh_local_data/blueprint_stgy.dat
+$ ls -la /Users/jason/dh_local_data/blueprint_stgy.dat.idx
+-rw-r--r-- 1 jason staff 5357737 Aug 27 16:49 /Users/jason/dh_local_data/blueprint_stgy.dat.idx
+$ ls /Users/jason/dh_local_data/river_cluster_split | wc -l
+    1326
+```
+
+- `blueprint_stgy.dat`: 16,123,074,125 bytes (~16.1GB) -- matches this
+  file's own header comment's stated size for the trained blueprint
+  (`~16.1GB`). Readable by this user; first bytes are structured binary
+  (length-prefixed records), not garbage/zero-filled.
+- `blueprint_stgy.dat.idx`: 5,357,737 bytes, readable, and its first 8
+  bytes are exactly `DHBPIDX1` -- `IndexedBlueprint.h`'s own `MAGIC`
+  constant (`{'D','H','B','P','I','D','X','1'}`), confirming this is a
+  real, correctly-formatted index for this reader, not a stray/corrupt
+  file.
+- `river_cluster_split/`: exactly **1326** files (`ls | wc -l`), matching
+  section 31's documented "1326 separate per-hole-hand files" exactly;
+  sample file (`1.bin`) is exactly 12,712,560 bytes, matching section 31's
+  own documented per-file size (`each exactly 12,712,560 bytes`)
+  byte-for-byte. Filenames are `<handid>.bin` with `handid = i*52+j` per
+  section 31's own documented formula (sparse, not contiguous 1..1326 --
+  e.g. up to `2651.bin` -- which is expected and correct for that formula,
+  not a corruption).
+
+**All three paths: present, readable, and sane. No caveats to flag.**
+
+### Validation
+
+**Build** (from `PokerAI/`, exact OpenMP command per sections 43/51):
+```sh
+$ g++ -std=c++17 -O2 -Wall -Wextra -DDH_SKIP_RIVER_CLUSTER \
+    -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include \
+    -shared -fPIC -o dh_native_ai.dylib tools/dh_native_ai.cpp \
+    -L/opt/homebrew/opt/libomp/lib -lomp
+tools/../poker/State.h:37:40: warning: unused parameter '_engine' [-Wunused-parameter]
+tools/../third_party/json.hpp:22709:35: warning: identifier '_json' preceded by whitespace ... [-Wdeprecated-literal-operator]
+tools/../third_party/json.hpp:22728:49: warning: identifier '_json_pointer' preceded by whitespace ... [-Wdeprecated-literal-operator]
+3 warnings generated.
+```
+All 3 warnings are pre-existing, in unrelated files (`State.h`, the bundled
+`json.hpp`), not in any code touched by this change.
+
+**ABI check**:
+```sh
+$ nm -gU dh_native_ai.dylib
+0000000000005c5c T _Next_stage
+00000000000064f4 T _opp_take_action
+000000000001a11c T _getdecision
+00000000000313e8 T _report_actual_hand
+0000000000003958 T _restart_game
+(plus internal data symbols)
+```
+All 5 required ABI symbols present (`_restart_game`, `_Next_stage`,
+`_opp_take_action`, `_getdecision`, `_report_actual_hand`).
+
+**Existing regression suite** (unmodified source, run from `PokerAI/` with
+none of the six vars set by hand -- i.e. exercising the *new* defaults, not
+the old ones). `PokerAI/cluster/` was populated with symlinks into
+`/Users/jason/dh_local_data/` (matching the existing convention already
+used in a sibling worktree) so these tests run against the same real
+blueprint/cluster data the live session uses:
+```sh
+$ g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_bet_size_narrowing tools/test_bet_size_narrowing.cpp && ./tools/test_bet_size_narrowing
+Before villain FLOP raise: 1081 combos tracked, weights sum to 1.0000000000
+After villain FLOP raise 700: 1081 combos tracked, weights sum to 1.0000000000
+Max per-combo weight change: 0.0042035361
+PASS: weights measurably changed after a non-all-in raise -- bet-size narrowing is working (previously this would have been a no-op).
+PASS: pre-existing all-in narrowing still works (no regression).
+TURN non-all-in raise narrowing: max weight change 0.0118363198, wall-clock 14453.3 ms
+PASS: TURN non-all-in raise narrowing works.
+ALL CHECKS PASSED
+
+$ g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_hero_range_narrowing tools/test_hero_range_narrowing.cpp && ./tools/test_hero_range_narrowing
+hero range narrowing checks passed
+
+$ g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_villain_weight_distribution tools/test_villain_weight_distribution.cpp && ./tools/test_villain_weight_distribution
+(real measurement tool, no pass/fail assertions -- completed, exit code 0)
+```
+All 3 pre-existing tests pass (exit code 0). Notably,
+`[DH_DIRECT_BLUEPRINT] indexed reader enabled` now fires on every run (the
+new default), but `[DH_DIRECT_BLUEPRINT] cursor disabled for this hand
+(street transition did not reach expected chance-collapsed node) -- using
+LiveResolver` also fires for every one of these tests' specific synthetic
+action sequences -- i.e. the pre-existing "any failure transparently
+restores LiveResolver" fallback (unchanged by this task) is exactly what
+keeps these tests behaviorally identical to before. `[DH_RANGE_MODEL]`/
+`[DH_STRATEGY]` diagnostic lines now also appear (`DH_VERBOSE_STRATEGY`
+defaulting on) -- extra stderr noise, asserted on by none of these tests.
+
+**New test** (`tools/test_default_env_vars.cpp`, ~20 focused checks, one
+`unsetenv()`+assert-new-default and one `setenv()`+assert-override-still-
+wins pair per variable, plus the `DH_BLUEPRINT_INDEX`
+derived-vs-overridden-source case called out above):
+```sh
+$ g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_default_env_vars tools/test_default_env_vars.cpp && ./tools/test_default_env_vars
+PASS: DH_DIRECT_BLUEPRINT unset -> direct_blueprint_enabled() defaults to true
+PASS: DH_DIRECT_BLUEPRINT=0 explicit override -> direct_blueprint_enabled() is false
+PASS: DH_DIRECT_BLUEPRINT=1 explicit override -> direct_blueprint_enabled() is true
+PASS: DH_DIRECT_BLUEPRINT=false explicit override -> direct_blueprint_enabled() is false (unrecognized-as-true token, same pre-existing semantics as before this change)
+PASS: DH_BLUEPRINT_PATH unset -> direct_blueprint_path() defaults to the local blueprint file (got "/Users/jason/dh_local_data/blueprint_stgy.dat")
+PASS: DH_BLUEPRINT_PATH explicit override -> direct_blueprint_path() honors it (got "/tmp/example_override_blueprint.dat")
+PASS: DH_BLUEPRINT_INDEX unset (DH_BLUEPRINT_PATH also unset) -> direct_blueprint_index_path() defaults to the local blueprint index file (got "/Users/jason/dh_local_data/blueprint_stgy.dat.idx")
+PASS: DH_BLUEPRINT_INDEX unset but DH_BLUEPRINT_PATH overridden -> direct_blueprint_index_path() derives from the overridden source, not the personal default (got "/tmp/example_override_blueprint.dat.idx")
+PASS: DH_BLUEPRINT_INDEX explicit override -> direct_blueprint_index_path() honors it regardless of source (got "/tmp/example_override_blueprint.dat.idx")
+PASS: DH_RIVER_SPLIT_DIR unset -> river_split_dir() defaults to the local split-file directory (got "/Users/jason/dh_local_data/river_cluster_split")
+PASS: DH_RIVER_SPLIT_DIR explicit override -> river_split_dir() honors it (got "/tmp/example_override_river_split")
+PASS: DH_VERBOSE_STRATEGY unset -> dh_verbose_enabled() defaults to true
+PASS: DH_VERBOSE_STRATEGY=0 explicit override -> dh_verbose_enabled() is false
+PASS: DH_VERBOSE_STRATEGY=1 explicit override -> dh_verbose_enabled() is true
+PASS: DH_VERBOSE_STRATEGY="" (explicitly set but empty) -> dh_verbose_enabled() is false, same pre-existing semantics as before this change
+PASS: DH_TEXASSOLVER_FALLBACK unset -> trigger_mode() defaults to FORCE
+PASS: DH_TEXASSOLVER_FALLBACK=auto explicit override -> trigger_mode() is AUTO
+PASS: DH_TEXASSOLVER_FALLBACK=off explicit override -> trigger_mode() is OFF
+PASS: DH_TEXASSOLVER_FALLBACK=force explicit override -> trigger_mode() is FORCE
+ALL CHECKS PASSED
+```
+All 20 checks pass.
+
+### What this does NOT change
+
+- No ABI change -- same 5 exported functions, same signatures.
+- No change to any explicit-override behavior for any of the six
+  variables -- only the "nothing set" fallback value changed.
+- No change to `env_or()`, `env_or_int()`, `env_or_double()`,
+  `exploitability_trigger_pct()`, `texassolver_home()`, or any other
+  `DH_TEXASSOLVER_*`/`DH_*` variable not in the requested six.
+- Does not touch `$HOME/src/TexasSolver` -- these env vars are entirely
+  consumed inside this repo's own `dh_native_ai.cpp`/`TexasSolverBridge.h`.
+- Does not touch or rebuild `/Users/jason/src/DecisionHoldem`'s actual live
+  `dh_native_ai.dylib` -- this task's dylib was built only in this isolated
+  worktree; deploying it to the live session (copying it over the main
+  checkout's `PokerAI/dh_native_ai.dylib`) is a separate, deliberate step
+  left to the user, at a moment that doesn't disrupt real-money play in
+  progress (same precedent as section 51's closing caveat).
+
+### Files touched
+
+- `PokerAI/tools/dh_native_ai.cpp`: changed the fallback default for
+  `direct_blueprint_enabled()`, `direct_blueprint_path()`,
+  `river_split_dir()`, and `dh_verbose_enabled()`; updated the top-of-file
+  header-comment block's prose describing each one's default; added
+  design-rationale comments at each site (including at
+  `direct_blueprint_index_path()`, whose own logic is unchanged but whose
+  *effective* default changed as a side effect of `direct_blueprint_path()`
+  changing).
+- `PokerAI/tree/TexasSolverBridge.h`: changed `trigger_mode()`'s fallback
+  string from `"auto"` to `"force"`.
+- `PokerAI/tools/test_default_env_vars.cpp` (new): focused smoke test,
+  independent of the 3 pre-existing regression tests, checking exactly
+  these six unset-default/explicit-override behaviors.
+- `.gitignore`: added `PokerAI/tools/test_default_env_vars` (the new
+  test's compiled binary), matching the existing per-binary pattern for
+  every other `PokerAI/tools/test_*` tool.
+- Rebuilt `dh_native_ai.dylib` in this isolated worktree only; confirmed
+  all 5 ABI symbols still exported via `nm -gU`. **Not** copied over the
+  main checkout's live copy.
+
 ## Symmetric public-range narrowing
 
 `PokerAI/tools/dh_native_ai.cpp` now maintains two persistent, normalized

@@ -70,27 +70,38 @@
 //       exactly (real showdown, no cluster approximation) since there are no
 //       more cards to deal. See BUILD_NOTES.md for the design writeup and
 //       measured performance cost of tracking a full (rather than a small,
-//       fixed-size sampled) range. Setting DH_DIRECT_BLUEPRINT=1 opts FLOP
-//       and TURN into IndexedBlueprint.h's direct, positional-I/O policy
-//       lookup instead. One public-tree cursor is advanced through preflop
+//       fixed-size sampled) range. DH_DIRECT_BLUEPRINT opts FLOP and TURN
+//       into IndexedBlueprint.h's direct, positional-I/O policy lookup
+//       instead -- default ON as of BUILD_NOTES.md section 52 (set
+//       DH_DIRECT_BLUEPRINT=0 to restore the original LiveResolver-only
+//       behavior). One public-tree cursor is advanced through preflop
 //       and chance nodes; arbitrary opponent raises are pseudo-harmonically
 //       translated only among that node's real raise actions, and the same
 //       node's current-street bucket rows update villain_range. The source
-//       and sidecar paths default to cluster/blueprint_strategy.dat and
-//       cluster/blueprint_strategy.dat.idx and can be overridden with
-//       DH_BLUEPRINT_PATH/DH_BLUEPRINT_INDEX. Any failure disables this
-//       opt-in cursor for the hand and transparently restores LiveResolver.
+//       and sidecar paths default to this user's real local data files,
+//       /Users/jason/dh_local_data/blueprint_stgy.dat and
+//       /Users/jason/dh_local_data/blueprint_stgy.dat.idx (BUILD_NOTES.md
+//       section 52 -- previously cluster/blueprint_strategy.dat and
+//       cluster/blueprint_strategy.dat.idx), and can be overridden with
+//       DH_BLUEPRINT_PATH/DH_BLUEPRINT_INDEX (required for anyone else
+//       building this repo on a different machine/username). Any failure
+//       disables this cursor for the hand and transparently restores
+//       LiveResolver.
 //     - TURN mode's per-CFR-iteration cost (dealing a real river card via a
 //       chance node, then an exact showdown, for every one of ~44-48
 //       branches, every iteration) can optionally be replaced with a cheap
 //       RiverClusterLeafModel lookup (BUILD_NOTES.md section 34) -- set the
 //       DH_RIVER_SPLIT_DIR environment variable to the path of the
 //       per-hole-hand split river-cluster files (see BUILD_NOTES.md section
-//       31/34 for how those are built) to enable it. This is purely
-//       opt-in/additive: unset (the default), or if the directory/files
-//       can't be read, TURN mode transparently falls back to the original
-//       exact chance-node + showdown behavior -- never worse or wrong,
-//       only slower without it.
+//       31/34 for how those are built) to enable it. Default is this user's
+//       real split-file directory, /Users/jason/dh_local_data/
+//       river_cluster_split (BUILD_NOTES.md section 52 -- previously unset/
+//       off), overridable with DH_RIVER_SPLIT_DIR for another machine/
+//       username or a CI environment where that path doesn't exist. This
+//       remains purely additive: if the directory/files can't be read
+//       (default or overridden), TURN mode transparently falls back to the
+//       original exact chance-node + showdown behavior -- never worse or
+//       wrong, only slower without it.
 //     - Purely-additive FALLBACK postflop resolver: resolve_decision() can
 //       optionally reach for the external TexasSolver CFR solver
 //       (PokerAI/tree/TexasSolverBridge.h, shelled out as a subprocess) if
@@ -110,7 +121,10 @@
 //       practice, since resolve_direct_blueprint_decision() already answers
 //       the large majority of them straight from the trained blueprint.
 //       Controlled by:
-//         DH_TEXASSOLVER_FALLBACK=auto (default) | force | off
+//         DH_TEXASSOLVER_FALLBACK=force (default) | auto | off
+//           (default changed from "auto" to "force" in BUILD_NOTES.md
+//           section 52 -- set DH_TEXASSOLVER_FALLBACK=auto to restore the
+//           original only-on-failure/high-exploitability behavior.)
 //           auto: on the river only, use TexasSolver if the in-process
 //                 resolver throws, or its measured exploitability exceeds
 //                 DH_TEXASSOLVER_EXPLOITABILITY_TRIGGER_PCT (default 15.0 --
@@ -282,17 +296,41 @@ PreflopCacheLoader g_preflop_cache_loader;
 std::unique_ptr<IndexedBlueprint::Reader> g_indexed_blueprint;
 bool g_indexed_blueprint_init_attempted = false;
 
+// Default ON (BUILD_NOTES.md section 52): the live SkyPoker bridge session
+// always wants the direct indexed blueprint policy, so "unset" now means
+// enabled instead of disabled -- matching dh_verbose_enabled()'s own
+// unset-vs-explicit-override convention below. An explicit override still
+// wins exactly as before: DH_DIRECT_BLUEPRINT=0 (or "false"/"FALSE") turns
+// it back off, e.g. for a build/test harness that wants LiveResolver's
+// original behavior instead.
 bool direct_blueprint_enabled() {
 	const char* value = std::getenv("DH_DIRECT_BLUEPRINT");
-	return value && (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
-		std::strcmp(value, "TRUE") == 0);
+	if (!value) return true; // unset -> default on
+	return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+		std::strcmp(value, "TRUE") == 0;
 }
 
+// Default is this machine's real trained blueprint data file (BUILD_NOTES.md
+// section 52) -- NOT a path that ships with the repo or is portable to
+// another machine/username. Anyone else building this repo (or a CI
+// environment) should set DH_BLUEPRINT_PATH explicitly to their own copy;
+// the env var, when set to anything, still wins over this default exactly
+// as before.
 std::string direct_blueprint_path() {
 	const char* value = std::getenv("DH_BLUEPRINT_PATH");
-	return value ? std::string(value) : std::string("cluster/blueprint_strategy.dat");
+	return value ? std::string(value) : std::string("/Users/jason/dh_local_data/blueprint_stgy.dat");
 }
 
+// No hardcoded personal-path default needed here: this derives from
+// whatever direct_blueprint_path() resolved to (its own explicit override,
+// or its new personal-path default above), so it automatically tracks
+// the blueprint file it's actually indexing -- if DH_BLUEPRINT_PATH is
+// overridden (another machine, another blueprint snapshot, a CI fixture)
+// without also overriding DH_BLUEPRINT_INDEX, the sidecar index still
+// correctly follows the overridden source instead of pointing at this
+// user's personal index file. With both env vars unset this still resolves
+// to exactly this user's real sidecar, /Users/jason/dh_local_data/
+// blueprint_stgy.dat.idx, since source is now that same default path.
 std::string direct_blueprint_index_path(const std::string& source) {
 	const char* value = std::getenv("DH_BLUEPRINT_INDEX");
 	return value ? std::string(value) : source + ".idx";
@@ -335,18 +373,28 @@ void initialize_direct_blueprint() {
 // be read, TURN mode transparently falls back to its original, exact
 // chance-node + showdown behavior -- this can never make a TURN decision
 // WORSE or WRONG, only slower when the split files aren't available.
+// Default (BUILD_NOTES.md section 52) is this user's real, already-split
+// local data directory -- not something that ships with the repo or is
+// portable to another machine/username. Anyone else building this repo (or
+// a CI environment) should set DH_RIVER_SPLIT_DIR explicitly to their own
+// split-file directory (or leave it pointed at a nonexistent path, which
+// safely falls back to the exact/original behavior described above); the
+// env var, when set to anything, still wins over this default exactly as
+// before.
 std::string river_split_dir() {
 	const char* env = std::getenv("DH_RIVER_SPLIT_DIR");
-	return env ? std::string(env) : std::string();
+	return env ? std::string(env) : std::string("/Users/jason/dh_local_data/river_cluster_split");
 }
 
 // ---------------------------------------------------------------------------
 // Optional, purely-additive verbose diagnostic logging: prints hero's real
 // average-strategy distribution (every legal action's actual probability,
 // not just whichever one gets sampled) and a compact summary of every
-// villain_range narrowing update, to stderr. Off by default (matches this
-// file's other opt-in DH_* env vars, e.g. DH_RIVER_SPLIT_DIR); enable with:
-//   DH_VERBOSE_STRATEGY=1
+// villain_range narrowing update, to stderr. On by default as of
+// BUILD_NOTES.md section 52 (the live SkyPoker bridge session always wants
+// this visible, so "unset" now means enabled instead of disabled); disable
+// explicitly with:
+//   DH_VERBOSE_STRATEGY=0
 // This is read-only instrumentation -- it never changes what action gets
 // sampled/returned or how villain_range is narrowed, only what gets printed.
 // Since Python's ctypes calls straight into this same process (no pipe/
@@ -356,7 +404,8 @@ std::string river_split_dir() {
 // already do) -- no changes to the Python driver are needed to see them.
 bool dh_verbose_enabled() {
 	const char* env = std::getenv("DH_VERBOSE_STRATEGY");
-	return env && env[0] != '\0' && std::string(env) != "0";
+	if (!env) return true; // unset -> default on
+	return env[0] != '\0' && std::string(env) != "0";
 }
 
 // Renders a card id (this file's convention: id = suit*13 + rank, suits

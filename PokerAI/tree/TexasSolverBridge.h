@@ -146,10 +146,16 @@ inline Config load_config() {
 // without restarting the bot process (e.g. between hands in a test
 // harness). See dh_native_ai.cpp's resolve_decision() for how each value
 // is used; documented in BUILD_NOTES.md.
+// Default is "force" as of BUILD_NOTES.md section 52 (previously "auto") --
+// the live SkyPoker bridge session always wants the river-only TexasSolver
+// comparison path exercised rather than only-on-failure/high-exploitability.
+// An explicit DH_TEXASSOLVER_FALLBACK=auto (or =off) still wins over this
+// default exactly as before, e.g. for a build/test harness that wants the
+// original auto-trigger behavior.
 enum class TriggerMode { AUTO, FORCE, OFF };
 
 inline TriggerMode trigger_mode() {
-	std::string v = env_or("DH_TEXASSOLVER_FALLBACK", "auto");
+	std::string v = env_or("DH_TEXASSOLVER_FALLBACK", "force");
 	std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char)std::tolower(c); });
 	if (v == "force") return TriggerMode::FORCE;
 	if (v == "off") return TriggerMode::OFF;
