@@ -6813,6 +6813,57 @@ debugging instead of deleting them on completion).
   natural next step before relying on AUTO-triggered fallback in a real
   session.
 
+### Independent audit addendum: three real-hand comparison tools, and a segfault found/fixed in one of them
+
+Alongside `test_texassolver_fallback.cpp`, this integration also left
+three standalone real-hand replay/comparison tools that drive
+`resolve_decision()` against actual logged SkyPoker hands and dump both
+players' narrowed ranges for external inspection
+(`/tmp/hand*_hero_range_texassolver.txt` / `..._villain_range_texassolver.txt`):
+`test_hand_12473146716_texassolver_compare.cpp` (hero SB/slot 0),
+`test_hand_12473147059_texassolver_compare.cpp` (hero BB/slot 1), and
+`test_kcflush_river_range.cpp` (a user-flagged missed-flush-fold
+investigation, hero also slot 0). All three were rebuilt and rerun as
+part of a follow-on independent audit of this integration:
+
+```sh
+cd PokerAI
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_hand_12473146716_texassolver_compare tools/test_hand_12473146716_texassolver_compare.cpp && ./tools/test_hand_12473146716_texassolver_compare
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_hand_12473147059_texassolver_compare tools/test_hand_12473147059_texassolver_compare.cpp && ./tools/test_hand_12473147059_texassolver_compare
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_kcflush_river_range tools/test_kcflush_river_range.cpp && ./tools/test_kcflush_river_range
+```
+
+`test_hand_12473147059_texassolver_compare` **segfaulted** on first
+audit. Root cause: all three tools populate a `Players_range range;`
+struct to hand to `LiveResolver`, but `range.hero`/`range.villain` are
+NOT "our own bot" vs. "the opponent" — per `range_for_slot()` and
+`build_resolver_ranges()` (`dh_native_ai.cpp`), they are **absolute seat
+0** and **absolute seat 1**, respectively. The buggy version of this
+file assigned `range.hero = hero_hands; range.villain = villain_hands;`
+unconditionally (correct only when hero occupies slot 0). Its sibling
+`test_hand_12473146716...` happens to have hero as SB/slot 0
+(`restart_game(0, ...)`), so the same unconditional assignment is
+actually correct there and in `test_kcflush_river_range` (also hero
+slot 0, `restart_game(0, ...)`, and explicitly commented as such) — but
+`test_hand_12473147059...`'s hero is BB/**slot 1**, so the unconditional
+version silently swapped the two ranges, corrupting the N/M sizing that
+`LiveResolver::average_strategy()` indexes into and crashing on an
+out-of-bounds read. Fixed by routing the assignment through `g.my_id`
+(mirroring `range_for_slot()`'s own convention) inside
+`narrow_hero_range_local_postflop()`; rebuilt and reran clean
+afterward (all 4 narrowing steps — preflop, and 3 postflop streets —
+complete without crashing, final `resolve_decision()` returns `call`,
+matching the real hand's known-sane action). The other two tools were
+confirmed to already be correct as written (their unconditional
+assignment matches their specific hand's actual seating, and is not a
+latent bug for those specific historical replays), and all three plus
+the full pre-existing regression suite (`test_hero_range_narrowing`,
+`test_bet_size_narrowing`, `test_villain_weight_distribution`,
+`test_texassolver_fallback`) were reconfirmed passing together after the
+fix. This bug was confined entirely to one offline diagnostic tool; it
+never affected `TexasSolverBridge.h`, `resolve_decision()`, or any other
+production code path.
+
 ## Symmetric public-range narrowing
 
 `PokerAI/tools/dh_native_ai.cpp` now maintains two persistent, normalized

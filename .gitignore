@@ -53,3 +53,8 @@ PokerAI/tools/test_texassolver_fallback
 PokerAI/tools/test_kcflush_river_range
 PokerAI/tools/test_hand_12473146716_texassolver_compare
 PokerAI/tools/test_hand_12473147059_texassolver_compare
+
+# TexasSolver's console_solver hardcodes this log filename relative to CWD
+# (src/tools/CommandLineTool.cpp:111) -- written any time it's run from
+# PokerAI/, not a bridge/test artifact we control the path of.
+PokerAI/tmp_log.txt
