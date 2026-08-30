@@ -26,10 +26,10 @@
 //   in-process villain-range narrowing resolves that a real flop/turn replay
 //   would otherwise trigger.
 //
-//   Three scenarios, all rooted at the river:
+//   Five scenarios, all rooted at the river:
 //
 //     1. FORCED fallback, hero's own OPENING river decision
-//        (actions_this_street==0) -- the exact/no-approximation bridge case
+//        (action_path=[]) -- the exact/no-approximation bridge case
 //        (no set_initial_actions needed; TexasSolver solves its own root).
 //        Expected to genuinely SUCCEED end-to-end post river-only-fix:
 //        checks the returned action is sane AND that g.hero_range's
@@ -37,7 +37,7 @@
 //        would be trivially true even if the fallback silently no-op'd) --
 //        i.e. proof TexasSolver's real output was parsed and consumed.
 //     2. FORCED fallback, hero facing a single prior river bet
-//        (actions_this_street==1) -- the set_initial_actions/nearest-amount-
+//        (action_path=["BET_n"]) -- the set_initial_actions/nearest-amount-
 //        match bridge case. Same "real narrowing occurred" bar as #1.
 //     3. AUTO-mode fallback triggered by a genuine in-process EXCEPTION:
 //        hero's actual holding is deliberately removed from g.hero_range
@@ -58,6 +58,25 @@
 //        extern "C" ABI boundary -- it just also confirms the bridge
 //        correctly refuses to fabricate a narrowing update when hero's own
 //        combo genuinely isn't representable in either range.
+//     4. FORCED fallback, hero (OOP) checks, villain (IP) bets, hero faces
+//        that bet (action_path=["CHECK","BET_n"], 2 prior actions) -- the
+//        single most common real multi-action river spot (a plain
+//        check-then-facing-a-bet), and the exact shape that was previously
+//        REFUSED outright by this bridge's old actions_this_street==0-or-1
+//        restriction (see TexasSolverBridge.h's solve() header comment for
+//        why that restriction was removed: TexasSolver's own
+//        set_initial_actions/navigateToSubtree already natively supports an
+//        arbitrary-length comma-separated action list, so DH's own
+//        g.street_action_path just needed to actually be tracked and
+//        passed through). Same "real narrowing occurred" bar as #1/#2.
+//     5. FORCED fallback, a river 3-bet: villain (OOP) bets, hero (IP)
+//        raises, villain re-raises, hero faces THAT (action_path=
+//        ["BET_n","RAISE_n","RAISE_n"], 3 prior actions) -- confirms the fix
+//        generalizes beyond the 2-action case to an arbitrary depth (up to
+//        TexasSolver's own compiled-in raise_limit=4/street), and that the
+//        BET-vs-RAISE token choice and each actor's own INCREMENTAL (not
+//        cumulative) bet-size convention are both correct multiple levels
+//        deep, not just for a single prior action.
 //
 //   REQUIRES a real, already-built TexasSolver checkout -- see
 //   TexasSolverBridge.h's load_config()/DH_TEXASSOLVER_* env vars. Set
@@ -317,11 +336,133 @@ static void scenario_auto_fallback_on_exception() {
 		"is unfindable in either the in-process OR TexasSolver path, not fabricated from a fake basis");
 }
 
+// Scenario 4: hero (BB, OOP postflop) checks the river, villain (IP) bets,
+// and NOW hero faces that bet -- action_path==["CHECK","BET_n"], 2 prior
+// actions this street. This is the exact shape that the OLD bridge (before
+// this fix) refused outright with "actions_this_street 0 or 1 only" -- and
+// empirically the single most common failure observed live (a plain
+// check-then-facing-a-bet river line). Hero's own check is scripted
+// directly via apply_own_action("call") (same established pattern this
+// file's preflop setup already uses -- see scenario_opening_decision()) so
+// this test controls exactly which decision getdecision() is asked to
+// make, rather than letting the in-process/blueprint path pick hero's
+// first action too.
+static void scenario_checks_then_faces_a_bet() {
+	fprintf(stderr, "\n=== Scenario 4: FORCED fallback, hero checks then faces a RIVER bet (2 prior actions) ===\n");
+	setenv("DH_TEXASSOLVER_FALLBACK", "off", 1); // keep setup on the normal path
+	int hero_c1 = card_id("Kc"), hero_c2 = card_id("Kd");
+	restart_game(1, hero_c1, hero_c2); // hero = BB = OOP postflop, my_id=1
+	opp_take_action((char*)"call");      // SB (villain, slot0) limps/calls to 100
+	apply_own_action("call");             // hero (BB) checks their preflop option
+	fprintf(stderr, "  preflop closed: stack[0]=%d stack[1]=%d\n", g.stack[0], g.stack[1]);
+
+	unsigned char river[5] = {
+		(unsigned char)card_id("8d"), (unsigned char)card_id("4c"), (unsigned char)card_id("Qh"),
+		(unsigned char)card_id("6s"), (unsigned char)card_id("2h")
+	};
+	Next_stage(3, (char*)river);
+	apply_own_action("call"); // hero's own river CHECK (nothing owed yet -> "call" means check)
+	opp_take_action((char*)"raise 130"); // villain (IP) bets 130 after hero's check
+	fprintf(stderr, "  hero checks, villain bets 130: betting_stage=%d actions_this_street=%d "
+		"street_action_path=[%s] stack=[%d,%d]\n",
+		g.betting_stage, g.actions_this_street, join_strings(g.street_action_path, ",").c_str(),
+		g.stack[0], g.stack[1]);
+	check(g.betting_stage == 3, "betting_stage==3 (river) after Next_stage(3, ...)");
+	check(g.actions_this_street == 2, "actions_this_street==2 (hero's check + villain's bet) before hero's decision");
+	check(g.street_action_path.size() == 2 && g.street_action_path[0] == "CHECK" &&
+		g.street_action_path[1].rfind("BET_", 0) == 0,
+		"street_action_path is [\"CHECK\", \"BET_<n>\"] -- exactly the sequence that was previously refused");
+
+	std::vector<double> before = snapshot_hero_weights();
+	double before_sum = 0.0;
+	hero_range_is_sane(&before_sum);
+	fprintf(stderr, "  hero_range weight sum before decision: %.6f (size=%zu)\n", before_sum, g.hero_range.size());
+
+	setenv("DH_TEXASSOLVER_FALLBACK", "force", 1);
+	char out[20];
+	getdecision(out);
+	std::string action(out);
+	fprintf(stderr, "  getdecision() -> \"%s\"\n", action.c_str());
+
+	std::vector<double> after = snapshot_hero_weights();
+	double after_sum = 0.0;
+	bool sane = hero_range_is_sane(&after_sum);
+	fprintf(stderr, "  hero_range weight sum after narrowing: %.6f\n", after_sum);
+
+	check(sane_action_string(action), "returned action string is one of fold/call/allin/raise N");
+	check(sane, "g.hero_range is a valid probability distribution after narrowing (sum~=1, no NaN/negative)");
+	check(weights_meaningfully_changed(before, after),
+		"g.hero_range weights actually changed -- TexasSolver solved the 2-action subtree and was consumed, "
+		"not refused/silently no-op'd");
+}
+
+// Scenario 5: a river 3-bet. Villain (OOP) bets, hero (IP) raises, villain
+// re-raises, and NOW hero faces that re-raise --
+// action_path==["BET_n","RAISE_n","RAISE_n"], 3 prior actions this street.
+// Confirms the fix generalizes beyond the 2-action case (both the
+// BET-vs-RAISE token choice and each actor's own INCREMENTAL bet-size
+// convention, not the cumulative "new total" DH otherwise uses -- see
+// dh_native_ai.cpp's texassolver_bet_or_raise_token()) to an arbitrary
+// depth, up to TexasSolver's own compiled-in raise_limit=4/street
+// (include/tools/CommandLineTool.h in the TexasSolver checkout).
+static void scenario_river_three_bet() {
+	fprintf(stderr, "\n=== Scenario 5: FORCED fallback, hero faces a RIVER 3-bet (3 prior actions) ===\n");
+	setenv("DH_TEXASSOLVER_FALLBACK", "off", 1); // keep setup on the normal path
+	int hero_c1 = card_id("Ac"), hero_c2 = card_id("Kc");
+	restart_game(0, hero_c1, hero_c2); // hero = SB/BTN = IP postflop, my_id=0
+	apply_own_action("call");           // hero (SB) limps/calls to 100
+	opp_take_action((char*)"call");     // villain (BB) checks their option
+	fprintf(stderr, "  preflop closed: stack[0]=%d stack[1]=%d\n", g.stack[0], g.stack[1]);
+
+	unsigned char river[5] = {
+		(unsigned char)card_id("2s"), (unsigned char)card_id("7h"), (unsigned char)card_id("Jd"),
+		(unsigned char)card_id("9c"), (unsigned char)card_id("4d")
+	};
+	Next_stage(3, (char*)river);
+	opp_take_action((char*)"raise 150");  // villain (OOP) bets 150 (street-relative total)
+	apply_own_action("raise 450");        // hero (IP) raises to 450 (street-relative total)
+	opp_take_action((char*)"raise 1200"); // villain re-raises to 1200 (street-relative total)
+	fprintf(stderr, "  bet/raise/re-raise: betting_stage=%d actions_this_street=%d street_action_path=[%s] "
+		"stack=[%d,%d] stack_at_street_start=[%d,%d]\n",
+		g.betting_stage, g.actions_this_street, join_strings(g.street_action_path, ",").c_str(),
+		g.stack[0], g.stack[1], g.stack_at_street_start[0], g.stack_at_street_start[1]);
+	check(g.betting_stage == 3, "betting_stage==3 (river) after Next_stage(3, ...)");
+	check(g.actions_this_street == 3, "actions_this_street==3 (bet, raise, re-raise) before hero's decision");
+	check(g.street_action_path.size() == 3 && g.street_action_path[0].rfind("BET_", 0) == 0 &&
+		g.street_action_path[1] == "RAISE_450" && g.street_action_path[2] == "RAISE_1050",
+		"street_action_path is [\"BET_150\",\"RAISE_450\",\"RAISE_1050\"] -- INCREMENTAL amounts "
+		"(each actor's own commitment delta), not DH's cumulative \"new total\" convention");
+
+	std::vector<double> before = snapshot_hero_weights();
+	double before_sum = 0.0;
+	hero_range_is_sane(&before_sum);
+	fprintf(stderr, "  hero_range weight sum before decision: %.6f (size=%zu)\n", before_sum, g.hero_range.size());
+
+	setenv("DH_TEXASSOLVER_FALLBACK", "force", 1);
+	char out[20];
+	getdecision(out);
+	std::string action(out);
+	fprintf(stderr, "  getdecision() -> \"%s\"\n", action.c_str());
+
+	std::vector<double> after = snapshot_hero_weights();
+	double after_sum = 0.0;
+	bool sane = hero_range_is_sane(&after_sum);
+	fprintf(stderr, "  hero_range weight sum after narrowing: %.6f\n", after_sum);
+
+	check(sane_action_string(action), "returned action string is one of fold/call/allin/raise N");
+	check(sane, "g.hero_range is a valid probability distribution after narrowing (sum~=1, no NaN/negative)");
+	check(weights_meaningfully_changed(before, after),
+		"g.hero_range weights actually changed -- TexasSolver solved the 3-action (3-bet) subtree and was "
+		"consumed, not refused/silently no-op'd");
+}
+
 int main() {
 	setenv("DH_TEXASSOLVER_MAX_ITERATIONS", "80", 1); // keep the solve fast for a test tool
 	scenario_opening_decision();
 	scenario_facing_a_bet();
 	scenario_auto_fallback_on_exception();
+	scenario_checks_then_faces_a_bet();
+	scenario_river_three_bet();
 
 	fprintf(stderr, "\n=== SUMMARY: %s (%d failure%s) ===\n",
 		g_failures == 0 ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED",

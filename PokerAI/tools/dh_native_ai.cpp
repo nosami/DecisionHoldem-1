@@ -199,6 +199,20 @@ struct LiveGame {
 	std::vector<WeightedHand> hero_range;
 	std::vector<WeightedHand> villain_range;
 
+	// Ordered TexasSolver-vocabulary action tokens ("CHECK"/"CALL"/"FOLD"/
+	// "BET_<n>"/"RAISE_<n>") for every action taken so far on the CURRENT
+	// street, in chronological order. Cleared every street alongside
+	// actions_this_street (see reset_street_counters()); appended to by
+	// apply_own_action()/opp_take_action() below, using TexasSolver's own
+	// wire vocabulary and increment convention -- NOT this struct's usual
+	// pot-fraction byte codes. Only ever consumed by TexasSolverBridge.h's
+	// solve() (river-only) as the `set_initial_actions` argument, which is
+	// what lets a single TexasSolver solve answer ANY decision point this
+	// street (not just the first two) by replaying this exact path. See
+	// BUILD_NOTES.md for the full derivation, cross-checked against
+	// TexasSolver's own src/GameTree.cpp action-tree construction.
+	std::vector<std::string> street_action_path;
+
 	// Real preflop blueprint bookkeeping (see BlueprintReader.h): the exact
 	// sequence of action bytes (PokerAI/poker/State.h convention: 'd' fold,
 	// 'l' call/check, 'n' allin, or a raise pot-fraction byte code) taken so
@@ -547,6 +561,18 @@ int committed_this_street(int slot) {
 	return g.stack_at_street_start[slot] - g.stack[slot];
 }
 
+// Small formatting helper for logging g.street_action_path (a comma is
+// exactly the delimiter TexasSolver's own set_initial_actions expects, so
+// this doubles as a preview of the literal string that would be sent).
+std::string join_strings(const std::vector<std::string>& parts, const char* sep) {
+	std::string out;
+	for (size_t i = 0; i < parts.size(); i++) {
+		if (i) out += sep;
+		out += parts[i];
+	}
+	return out;
+}
+
 void reset_street_counters() {
 	g.stack_at_street_start[0] = g.stack[0];
 	g.stack_at_street_start[1] = g.stack[1];
@@ -554,6 +580,7 @@ void reset_street_counters() {
 	g.actions_this_street = 0;
 	g.last_raise_size = 0;
 	g.blueprint_last_raise_size = 0;
+	g.street_action_path.clear();
 }
 
 // pypokergui's "raise N" amount is always the TOTAL bet for the CURRENT
@@ -1456,23 +1483,22 @@ std::string resolve_decision() {
 			villain_combos.reserve(g.villain_range.size());
 			for (const auto& h : g.villain_range) villain_combos.push_back({ h.c1, h.c2, h.weight });
 
-			int opp = 1 - g.my_id;
 			int pot_at_street_start = (20000 - g.stack_at_street_start[0]) + (20000 - g.stack_at_street_start[1]);
 			int effective_stack_at_street_start = std::min(g.stack_at_street_start[0], g.stack_at_street_start[1]);
-			int opp_committed_this_street = committed_this_street(opp);
-			bool other_seat_checked = (g.actions_this_street == 1 && opp_committed_this_street == 0);
 
 			if (dh_verbose_enabled())
 				std::fprintf(stderr,
-					"[DH_TEXASSOLVER] invoking fallback (mode=%s, in_process_ok=%d, in_process_expl_pct=%.2f%%)\n",
+					"[DH_TEXASSOLVER] invoking fallback (mode=%s, in_process_ok=%d, in_process_expl_pct=%.2f%%, "
+					"action_path=[%s])\n",
 					fallback_mode == texassolver_bridge::TriggerMode::FORCE ? "force" : "auto",
-					in_process_ok ? 1 : 0, in_process_expl_pct);
+					in_process_ok ? 1 : 0, in_process_expl_pct,
+					join_strings(g.street_action_path, ",").c_str());
 
 			texassolver_bridge::Decision fb = texassolver_bridge::solve(
 				/*hero_is_ip=*/g.my_id == 0,
 				hero_combos, villain_combos, g.board,
 				pot_at_street_start, effective_stack_at_street_start,
-				g.actions_this_street, other_seat_checked, opp_committed_this_street,
+				g.street_action_path,
 				g.my_hole[0], g.my_hole[1], g.rng);
 
 			if (fb.ok) {
@@ -1617,12 +1643,46 @@ std::string resolve_preflop_decision() {
 	}
 }
 
+// Builds the TexasSolver-wire token ("BET_<n>" or "RAISE_<n>") for an
+// aggressive (bet/raise/allin) action, mirroring EXACTLY how TexasSolver's
+// own tree builder accumulates ip_commit/oop_commit (src/GameTree.cpp's
+// "bet"/"raise" branches: `nextrule.ip_commit += one_betting_size` --
+// always an INCREMENT on top of that seat's own prior commitment, never a
+// new total). This is NOT the same quantity as DH's own "raise N" action
+// string amount (always this actor's new TOTAL street-relative
+// commitment, see street_relative_raise_baseline()'s comment) -- the two
+// only coincide when the actor hadn't committed anything yet this street.
+// "BET" names the FIRST aggressive action into a street with no live bet
+// yet (prev_facing==0 immediately before this action); any aggressive
+// action facing an existing bet is a "RAISE", regardless of how many
+// raises have already happened this street. An all-in shove has no
+// separate token in TexasSolver's own vocabulary (confirmed against
+// include/nodes/GameTreeNode.h's PokerActions enum: BEGIN/ROUNDBEGIN/BET/
+// RAISE/CHECK/FOLD/CALL only) -- it is just a BET/RAISE whose amount
+// happens to be the actor's whole remaining stack, which TexasSolver's own
+// nearest-available-size matching (PCfrSolver::navigateToSubtree) snaps to
+// its configured all-in bucket, exactly as for any other sizing. See
+// BUILD_NOTES.md for the full derivation and citations.
+std::string texassolver_bet_or_raise_token(int prev_facing, int actor_committed_before, int new_total_commitment) {
+	int increment = std::max(0, new_total_commitment - actor_committed_before);
+	return (prev_facing == 0 ? "BET_" : "RAISE_") + std::to_string(increment);
+}
+
+// CHECK when nothing was owed immediately before this action, CALL
+// otherwise -- TexasSolver's tree distinguishes these as different action
+// names (unlike DH's own internal "call" string, which covers both).
+inline const char* texassolver_check_or_call_token(int prev_facing) {
+	return prev_facing == 0 ? "CHECK" : "CALL";
+}
+
 void apply_own_action(const std::string& action) {
 	int me = g.my_id;
 	int prev_facing = std::max(committed_this_street(0), committed_this_street(1));
+	int me_committed_before = committed_this_street(me);
 	if (action == "fold") {
 		g.folder = me;
 		g.betting_stage = 5;
+		g.street_action_path.push_back("FOLD");
 	}
 	else if (action == "allin") {
 		g.blueprint_last_raise_size = std::max(0, g.stack_at_street_start[me] - prev_facing);
@@ -1630,6 +1690,8 @@ void apply_own_action(const std::string& action) {
 		g.has_allin = true;
 		g.n_raises_this_street++;
 		g.actions_this_street++;
+		g.street_action_path.push_back(
+			texassolver_bet_or_raise_token(prev_facing, me_committed_before, g.stack_at_street_start[me]));
 	}
 	else if (action.rfind("raise ", 0) == 0) {
 		int amount = std::stoi(action.substr(6));
@@ -1637,6 +1699,8 @@ void apply_own_action(const std::string& action) {
 		g.stack[me] = street_relative_raise_baseline(me) - amount;
 		g.n_raises_this_street++;
 		g.actions_this_street++;
+		g.street_action_path.push_back(
+			texassolver_bet_or_raise_token(prev_facing, me_committed_before, amount));
 	}
 	else { // "call" (also covers "check" -- identical bookkeeping when nothing is owed)
 		// A call always brings the caller's WHOLE-HAND cumulative
@@ -1658,6 +1722,7 @@ void apply_own_action(const std::string& action) {
 		int last_bigbet_before = std::max(20000 - g.stack[0], 20000 - g.stack[1]);
 		g.stack[me] = 20000 - last_bigbet_before;
 		g.actions_this_street++;
+		g.street_action_path.push_back(texassolver_check_or_call_token(prev_facing));
 	}
 }
 
@@ -1703,6 +1768,7 @@ void opp_take_action(char* actionstr_c) {
 	std::string a(actionstr_c);
 	int opp = 1 - g.my_id;
 	int prev_facing = std::max(committed_this_street(0), committed_this_street(1));
+	int opp_committed_before = committed_this_street(opp);
 	bool preflop = (g.betting_stage == 0);
 	if (a == "fold") {
 		if (preflop) { if (g.preflop_path_confident) narrow_villain_range_preflop('d'); }
@@ -1713,6 +1779,7 @@ void opp_take_action(char* actionstr_c) {
 		g.folder = opp;
 		g.betting_stage = 5;
 		if (preflop && g.preflop_path_confident) g.preflop_action_path.push_back('d');
+		g.street_action_path.push_back("FOLD");
 	}
 	else if (a == "allin") {
 		if (preflop) { if (g.preflop_path_confident) narrow_villain_range_preflop('n'); }
@@ -1728,6 +1795,8 @@ void opp_take_action(char* actionstr_c) {
 		g.n_raises_this_street++;
 		g.actions_this_street++;
 		if (preflop && g.preflop_path_confident) g.preflop_action_path.push_back('n');
+		g.street_action_path.push_back(
+			texassolver_bet_or_raise_token(prev_facing, opp_committed_before, g.stack_at_street_start[opp]));
 	}
 	else if (a.rfind("raise ", 0) == 0) {
 		int amount = std::stoi(a.substr(6));
@@ -1778,6 +1847,8 @@ void opp_take_action(char* actionstr_c) {
 		g.blueprint_last_raise_size = g.last_raise_size;
 		g.n_raises_this_street++;
 		g.actions_this_street++;
+		g.street_action_path.push_back(
+			texassolver_bet_or_raise_token(prev_facing, opp_committed_before, amount));
 	}
 	else { // "call" or "check"
 		if (preflop) { if (g.preflop_path_confident) narrow_villain_range_preflop('l'); }
@@ -1793,6 +1864,7 @@ void opp_take_action(char* actionstr_c) {
 		g.stack[opp] = 20000 - last_bigbet_before;
 		g.actions_this_street++;
 		if (preflop && g.preflop_path_confident) g.preflop_action_path.push_back('l');
+		g.street_action_path.push_back(texassolver_check_or_call_token(prev_facing));
 	}
 }
 

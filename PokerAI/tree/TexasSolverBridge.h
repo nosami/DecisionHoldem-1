@@ -580,17 +580,28 @@ struct TempFiles {
 // `hero_is_ip`: true if hero occupies the IP (slot 0 / SB-BTN) postflop
 // seat this hand, false if hero is OOP (slot 1 / BB) -- see
 // dh_native_ai.cpp's slot convention (g.my_id==0 -> IP postflop).
-// `actions_this_street`: 0 (opening decision, most common/best-supported
-// case -- solved via a fresh symmetric-commit root, no approximation) or
-// 1 (hero faces the single action the other seat already took this
-// street -- solved via `set_initial_actions`, using TexasSolver's own
-// nearest-available-size matching in PCfrSolver::navigateToSubtree, so
-// no manual bucket-rounding is needed here). Any other value is refused
-// (returns ok=false) -- see BUILD_NOTES.md for why: reconstructing an
-// arbitrary multi-action betting sequence this street would need a full
-// ordered per-street action log this codebase does not currently
-// maintain (only aggregate counters/last-raise-size are tracked), so
-// this is an honest, documented scope limit, not a silent guess.
+// `action_path`: every action already taken this street, in chronological
+// order, in TexasSolver's own wire vocabulary ("CHECK"/"CALL"/"FOLD"/
+// "BET_<n>"/"RAISE_<n>" -- see dh_native_ai.cpp's g.street_action_path and
+// its texassolver_bet_or_raise_token()/texassolver_check_or_call_token()
+// builders). Empty for hero's own opening decision this street (solved via
+// a fresh symmetric-commit root, no approximation needed). Any non-empty
+// path is replayed via `set_initial_actions` before solving, using
+// TexasSolver's own PCfrSolver::navigateToSubtree -- which walks an
+// ARBITRARY-LENGTH comma-separated action list one token at a time,
+// nearest-available-size-matching each BET_/RAISE_ amount -- so a river
+// check-raise, a 3-bet, or any deeper action sequence this street is
+// handled by the exact same mechanism as the single-prior-action case,
+// not a special case of it. (An earlier version of this bridge only
+// supported 0 or 1 prior actions and refused anything deeper; that
+// restriction was an artificial limitation of THIS bridge's own call
+// site, not a real constraint of TexasSolver's interface -- see
+// BUILD_NOTES.md for the full derivation, including why the token amount
+// must be each actor's own INCREMENT over their prior commitment this
+// street, not DH's own "new total" convention.) TexasSolver's own
+// raise_limit (4 raises/street, include/tools/CommandLineTool.h) still
+// applies underneath this -- a path deeper than that fails safely
+// (ok=false, caught below) rather than crashing.
 inline Decision solve(
 	bool hero_is_ip,
 	const std::vector<Combo>& hero_range,
@@ -598,9 +609,7 @@ inline Decision solve(
 	const std::vector<unsigned char>& board,
 	int pot_at_street_start,
 	int effective_stack_at_street_start,
-	int actions_this_street,
-	bool other_seat_checked,          // only meaningful if actions_this_street==1
-	int other_seat_bet_street_relative, // only meaningful if actions_this_street==1 && !other_seat_checked
+	const std::vector<std::string>& action_path,
 	unsigned char hero_c1, unsigned char hero_c2,
 	std::mt19937_64& rng) {
 
@@ -617,11 +626,6 @@ inline Decision solve(
 			std::to_string(board.size()) + ") -- flop/turn fallback is out of scope, see BUILD_NOTES.md";
 		return result;
 	}
-	if (actions_this_street != 0 && actions_this_street != 1) {
-		result.error = "TexasSolver bridge only supports actions_this_street 0 or 1 (got " +
-			std::to_string(actions_this_street) + ") -- see BUILD_NOTES.md scope note";
-		return result;
-	}
 
 	SolveRequest req;
 	req.pot_at_street_start = pot_at_street_start;
@@ -630,14 +634,11 @@ inline Decision solve(
 	req.ip_range = hero_is_ip ? hero_range : villain_range;
 	req.oop_range = hero_is_ip ? villain_range : hero_range;
 	req.cfg = load_config();
-	if (actions_this_street == 1) {
-		// The other seat always acts first each postflop street (OOP), so
-		// a single prior action this street was necessarily made by the
-		// OOP seat.
-		req.initial_actions = other_seat_checked
-			? "CHECK"
-			: ("BET_" + std::to_string(other_seat_bet_street_relative));
+	for (size_t i = 0; i < action_path.size(); i++) {
+		if (i) req.initial_actions += ",";
+		req.initial_actions += action_path[i];
 	}
+
 
 	TempFiles tmp;
 	{

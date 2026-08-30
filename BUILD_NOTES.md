@@ -6684,16 +6684,23 @@ streets against different boards before any postflop resolve runs, so
 they are generically asymmetric under the current street's
 board-automorphism group by the time TexasSolver is invoked.
 
-Scope limits, stated plainly rather than papered over: `solve()` only
-supports `actions_this_street` 0 (a fresh street-start decision) or 1
-(hero facing the one action the other seat, who always acts first
-postflop, already took) — anything deeper is refused
-(`TexasSolverBridge.h:620-624`) because reconstructing an arbitrary
-multi-action betting sequence this street would need a full ordered
-per-street action log this codebase doesn't currently maintain (only
-aggregate counters/last-raise-size). This covers hero's OPENING river
-decision and hero's response to a single river bet/raise — the two most
-common river spots — but not, e.g., a river check-raise-reraise sequence.
+**Scope limit since removed** (see "Addendum: arbitrary-depth multi-action
+river sequences" at the end of this section for the full fix, added after
+initial delivery in response to observing real live-play failures): the
+first version of this bridge only supported `actions_this_street` 0 (a
+fresh street-start decision) or 1 (hero facing the one action the other
+seat, who always acts first postflop, already took) and refused anything
+deeper. That turned out to be an artificial limitation of this bridge's
+own call site, not a real constraint of TexasSolver's own interface —
+`set_initial_actions`/`PCfrSolver::navigateToSubtree` already natively
+walk an ARBITRARY-LENGTH comma-separated action list
+(`src/solver/PCfrSolver.cpp:88-169`). `g.street_action_path`
+(`dh_native_ai.cpp`) now tracks the genuine ordered per-street action
+history needed to drive that, so `solve()` handles any decision point
+this street — a check-then-facing-a-bet, a 3-bet, etc. — up to
+TexasSolver's own compiled-in `raise_limit=4`/street
+(`include/tools/CommandLineTool.h:53`, a real solver-side cap this bridge
+does not attempt to work around).
 
 ### Validation
 
@@ -6798,10 +6805,13 @@ debugging instead of deleting them on completion).
   TexasSolver solve is structurally intractable (see above) without
   porting a leaf-value/runout-sampling model into TexasSolver itself,
   which was judged out of scope for this task.
-- `actions_this_street > 1` (e.g. a river check-raise-reraise) is refused
-  rather than approximated; extending `set_initial_actions` replay to an
-  arbitrary sequence would need this codebase to start maintaining a real
-  per-street action log, which it does not today.
+- `actions_this_street > 1` (e.g. a river check-raise-reraise) is now
+  handled (see the addendum below) rather than refused — the residual
+  limit is TexasSolver's own compiled-in `raise_limit=4`/street
+  (`include/tools/CommandLineTool.h:53`), which this bridge does not
+  attempt to raise; a path needing a 5th raise this street fails safely
+  (`ok=false`, caught by the existing fallback-through logic), not
+  silently or incorrectly.
 - The bet-size ladder sent to TexasSolver is a documented approximation of
   `LiveResolver`'s own street-position-dependent full-ladder-vs-reduced-ladder
   behavior (`TexasSolverBridge.h:244-272`), since TexasSolver's own config
@@ -6863,6 +6873,121 @@ the full pre-existing regression suite (`test_hero_range_narrowing`,
 fix. This bug was confined entirely to one offline diagnostic tool; it
 never affected `TexasSolverBridge.h`, `resolve_decision()`, or any other
 production code path.
+
+### Addendum: arbitrary-depth multi-action river sequences
+
+Found via live play: running against Slumbot with
+`DH_TEXASSOLVER_FALLBACK=force` (a deliberate stress test of the fallback
+path on every river decision), 16 of 91 fallback attempts in one session
+failed with `"TexasSolver bridge only supports actions_this_street 0 or 1
+(got 2)"` (15 occurrences) or `"(got 3)"` (1 occurrence) — i.e. a plain
+river check-then-facing-a-bet (by far the most common multi-action river
+shape) or a river 3-bet. Under `force` mode these fell all the way through
+to the context-blind `"call"` placeholder (`dh_native_ai.cpp`'s
+`resolve_decision()` last-resort branch), which is a real behavioral gap
+under `force`, though harmless under the default `auto` mode (which simply
+keeps the in-process result whenever the fallback isn't wanted or fails).
+
+**Root cause: an artificial restriction in this bridge's OWN call site,
+not a real constraint of TexasSolver's interface.** Investigating
+`PCfrSolver::navigateToSubtree` (`$HOME/src/TexasSolver/src/solver/PCfrSolver.cpp:88-169`,
+the function `set_initial_actions` ultimately drives) shows it already
+parses an **arbitrary-length** comma-separated action list (line 97's
+`while ((pos = remaining.find(',')) != string::npos)` loop), walking one
+tree node per token with the same nearest-available-size matching already
+relied on for the single-action case (lines 128-146). The original
+`actions_this_street != 0 && actions_this_street != 1` refusal
+(previously at `TexasSolverBridge.h:620-624`) was this bridge choosing not
+to use that capability, because `dh_native_ai.cpp` didn't yet track a real
+ordered per-street action history — only aggregate counters
+(`n_raises_this_street`, `last_raise_size`). The fix adds that history and
+removes the refusal; `set_initial_actions`/`navigateToSubtree` themselves
+did not need to change at all.
+
+**The fix, precisely:**
+
+- `g.street_action_path` (`std::vector<std::string>`, `dh_native_ai.cpp:214`) —
+  every action taken so far this street, in chronological order, already
+  in TexasSolver's own wire vocabulary (`"CHECK"`/`"CALL"`/`"FOLD"`/
+  `"BET_<n>"`/`"RAISE_<n>"`). Cleared every street in
+  `reset_street_counters()` (`dh_native_ai.cpp:576-584`) alongside the
+  pre-existing `actions_this_street`/`n_raises_this_street` counters, and
+  appended to by both `apply_own_action()` (`dh_native_ai.cpp:1678-1727`,
+  hero's own actions) and `opp_take_action()`
+  (`dh_native_ai.cpp:1767-1869`, villain's actions) — the same two
+  functions that already drive every other piece of per-action
+  bookkeeping in this file, so no new call sites were needed anywhere.
+- **Token amount is each actor's own INCREMENT over their prior
+  commitment this street, not DH's usual "new total" convention.** DH's
+  own `"raise N"` action strings always carry an actor's new TOTAL
+  street-relative commitment (see `street_relative_raise_baseline()`'s
+  comment), but TexasSolver's own tree builder accumulates bet/raise sizes
+  as increments on top of a seat's own prior commitment
+  (`$HOME/src/TexasSolver/src/GameTree.cpp:164-175` for `"bet"`,
+  `:211-224` for `"raise"` — both do `nextrule.ip_commit +=
+  one_betting_size` / `oop_commit += one_betting_size`, never assign a new
+  total). The two conventions only coincide when the actor hadn't
+  committed anything yet this street (which is why the original
+  single-action case happened to already be correct without this
+  distinction). `texassolver_bet_or_raise_token()`
+  (`dh_native_ai.cpp:1646-1669`) computes `new_total_commitment -
+  actor_committed_before` to bridge the two conventions correctly at any
+  depth.
+- **BET vs. RAISE token choice**: TexasSolver names the FIRST aggressive
+  action into a street with no live bet yet `"BET"`, and any aggressive
+  action facing an existing bet `"RAISE"` (confirmed against
+  `include/nodes/GameTreeNode.h`'s `PokerActions` enum — `BEGIN`,
+  `ROUNDBEGIN`, `BET`, `RAISE`, `CHECK`, `FOLD`, `CALL` — there is no
+  separate `"ALLIN"` token; an all-in shove is just a `BET`/`RAISE` whose
+  amount happens to be the actor's whole remaining stack, which
+  `navigateToSubtree`'s nearest-size matching snaps to TexasSolver's own
+  `set_allin_threshold`-configured bucket like any other sizing).
+  `texassolver_bet_or_raise_token()` decides this from whether anything
+  was already committed this street (`prev_facing == 0`) immediately
+  BEFORE the current action, generalizing the check the original
+  single-action case used (`opp_committed_this_street == 0`) to hold at
+  any position in the sequence, not just the first.
+- `texassolver_bridge::solve()`'s signature changed from three
+  single-action parameters (`actions_this_street`, `other_seat_checked`,
+  `other_seat_bet_street_relative`) to one `const
+  std::vector<std::string>& action_path` (`TexasSolverBridge.h:605-614`),
+  joined into TexasSolver's comma-separated wire format
+  (`TexasSolverBridge.h:637-640`). The `board.size()
+  != 5` river-only refusal is unchanged; the old `actions_this_street`
+  length refusal is gone (any length is attempted; TexasSolver's own
+  compiled-in `raise_limit=4`/street cap, `include/tools/CommandLineTool.h:53`,
+  is the only remaining depth limit, and a path exceeding it fails safely
+  via the existing `ok=false` path rather than crashing).
+
+**Validation**: `test_texassolver_fallback.cpp` gained two new scenarios
+exercising exactly the shapes seen failing live —
+`scenario_checks_then_faces_a_bet()` (hero checks, villain bets, hero
+faces `action_path=["CHECK","BET_130"]`, 2 prior actions) and
+`scenario_river_three_bet()` (villain bets, hero raises, villain
+re-raises, hero faces `action_path=["BET_150","RAISE_450","RAISE_1050"]`,
+3 prior actions — the assertions explicitly check the amounts are
+INCREMENTAL, `450`/`1050`, not the cumulative `450`/`1200` DH's own action
+strings used to construct the scenario). All 5 scenarios (the original 3
+plus these 2) pass:
+
+```
+=== SUMMARY: ALL CHECKS PASSED (0 failures) ===
+       36.71 real        33.94 user         1.47 sys
+          1525874688  maximum resident set size
+          4084747528  peak memory footprint
+```
+
+Peak resident set size ~1.5 GB across all 5 real `console_solver`
+subprocess calls (still nowhere near the 70+ GB flop/turn OOM this
+section's river-only restriction exists to avoid — river has no chance
+nodes regardless of how many actions have already happened this street).
+The pre-existing regression suite
+(`test_resolver_exploitability`/`test_bet_size_narrowing`) was rerun
+unmodified and reproduced its established numbers exactly (FLOP under 1%
+by 6,000 iterations/0.799%, RIVER by 10,000/0.862%, TURN not converged by
+2,000/5.788%; bet-size narrowing max weight changes 0.0042/0.0027 for
+FLOP/TURN) — confirming this fix, like the rest of this integration,
+leaves `RealtimeSearch.h`/`LiveResolver` completely untouched.
 
 ## Symmetric public-range narrowing
 
