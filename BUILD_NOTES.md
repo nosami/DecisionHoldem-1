@@ -6470,6 +6470,349 @@ probability equality. On the local SSD, reader startup was 10-15 ms, a
 full 50,000-bucket/eight-action flop payload was about 5.2 ms, 1,081
 cached likelihood-row accesses took about 0.006 ms, a full turn payload
 took about 0.69 ms, and a cached node lookup was below 0.001 ms.
+
+## 50. TexasSolver as a river-only fallback postflop resolver
+
+Section 7 flagged `$HOME/src/TexasSolver` (`nosami/skypoker`, a personal
+fork of the open-source AGPLv3 `bupticybee/TexasSolver`) as "the most
+concrete legitimate path forward" for real-time search, while noting the
+translation-bridge work required was a genuine multi-day project. This
+section documents that bridge: `PokerAI/tree/TexasSolverBridge.h` (735
+lines, new), wired into `dh_native_ai.cpp`'s `resolve_decision()` as a
+strictly additive, opt-in **fallback** alongside the existing in-process
+`LiveResolver` path — never a replacement.
+
+### TexasSolver's actual interface (verified against its own source)
+
+TexasSolver is driven by a plain CLI executable, `console_solver`, whose
+arguments are `-i <input_file> -r <resource_dir> -m holdem|shortdeck`
+(`$HOME/src/TexasSolver/src/console.cpp:10-32`). `input_file` is a
+plain-text batch of newline-separated commands, parsed one line at a time
+by `CommandLineTool::execFromFile`/`execCommand`
+(`src/tools/CommandLineTool.cpp`). The commands this bridge emits (see
+`build_batch_commands()`, `TexasSolverBridge.h:295-350`) and their
+verified semantics:
+
+- `set_pot <n>` splits the value evenly into `ip_commit`/`oop_commit`
+  (`CommandLineTool.cpp:193-195`) — i.e. it wants the CURRENT total pot at
+  the moment of the fresh decision, assuming both seats have committed
+  equally so far, not a street-relative "amount to call". This bridge
+  only ever calls `solve()` at a street-start node (see scope note below),
+  where that assumption genuinely holds.
+- `set_effective_stack <n>` sets `stack = n + ip_commit`
+  (`CommandLineTool.cpp:196-197`), i.e. the value passed is each player's
+  REMAINING stack behind the pot already committed, not their total
+  starting stack.
+- `set_board <c1,c2,...>` — comma-separated `<rank><suit>` cards
+  (`c`/`d`/`h`/`s` suits, `23456789TJQKA` ranks, cross-checked against
+  `include/Card.h`/`src/Card.cpp`'s `getSuits()`/`strCard2int` and found
+  identical in convention to this file's own `dh_card_str()` in
+  `dh_native_ai.cpp`, so no translation is needed). **Critically, the
+  number of cards directly sets `current_round`**: 3→flop(1), 4→turn(2),
+  5→river(3) (`CommandLineTool.cpp:198-206`), and `build_tree` constructs
+  the game tree starting AT that round
+  (`CommandLineTool.cpp:242-243`, `this->ps.build_game_tree(...,current_round,...)`)
+  — a 5-card board therefore produces a tree with **zero chance/runout
+  nodes**, since the board is already complete. This one fact drove this
+  integration's most important design decision (see "River-only scope"
+  below).
+- `set_range_ip <combo:weight,...>` / `set_range_oop <...>` — comma-separated
+  `<4-char-combo>:<weight>` tokens (e.g. `AhKh:0.5`), parsed by
+  `PrivateRangeConverter` (`src/tools/PrivateRangeConverter.cpp`). Weights
+  `<= 0` are silently skipped (line 29); a duplicate combo appearing twice
+  throws (lines 119/125). Both seats require a genuine weighted range —
+  there is no "single hand" shorthand.
+- `set_bet_sizes <ip|oop>,<round>,<bet|raise|donk|allin>,<pct,...>` — a
+  separate bet-size ladder (as % of pot) per seat, per street, per
+  category (`CommandLineTool.cpp:214-235`). This bridge only ever emits
+  `river` categories (see scope note).
+- `set_allin_threshold`, `set_thread_num`, `set_accuracy`,
+  `set_max_iteration`, `set_use_isomorphism`, `set_initial_actions` — solver
+  tuning/replay knobs; `set_initial_actions` takes a comma-separated
+  `ACTIONNAME[_amount]` list (e.g. `CHECK` or `BET_150`) consumed by
+  `PCfrSolver::navigateToSubtree` (`src/solver/PCfrSolver.cpp:69,88`) to
+  root the solve/dump at the node reached after replaying those actions —
+  this is how this bridge represents "hero facing a bet that's already in"
+  without needing its own subtree-navigation code.
+- `build_tree`, `start_solve`, `set_dump_rounds 1`, `dump_result <path>` —
+  build, solve, then write a JSON strategy dump for the node reached
+  (root, or the `set_initial_actions` subtree). The dump's shape (root
+  keys `player`/`actions`/`childrens`/`strategy`, with the inner
+  `strategy` object itself containing `actions` + a `strategy` map of
+  `<4-char-combo> -> [prob, ...]`) is produced by
+  `PCfrSolver::reConvertJson` (`src/solver/PCfrSolver.cpp:1100-1135`,
+  specifically line 1135's `(*retval)["strategy"] = trainable->dump_strategy(false)`)
+  and `PokerSolver::dump_strategy` (`src/runtime/PokerSolver.cpp:300-345`),
+  and was additionally cross-checked directly against a real dump file
+  produced during this integration's own validation runs. Action strings
+  are `FOLD`/`CHECK`/`CALL`/`BET <amt>`/`RAISE <amt>`
+  (`GameActions::toString`, `src/nodes/GameActions.cpp`); a combo key can
+  appear as either `c1c2` or `c2c1` — this bridge's `find_combo_probs()`
+  (`TexasSolverBridge.h:535-543`) tries both orders rather than depending
+  on TexasSolver's internal ordering rule.
+
+The build itself uses CMake (confirmed via `$HOME/src/TexasSolver/CMakeLists.txt`)
+with an OpenMP-parallelized CFR core; a working `console_solver` binary
+and `resources/` directory (hand-strength lookup tables) were already
+present at `$HOME/src/TexasSolver/build/console_solver` and
+`$HOME/src/TexasSolver/resources` on this machine from a prior
+investigation (section 43 already exercised this same solver directly),
+and were re-confirmed runnable during this integration rather than
+rebuilt from scratch.
+
+### The hero-range gap: found already resolved, consumed as-is
+
+The task's critical correctness requirement — that TexasSolver must
+receive a genuine weighted range for BOTH seats, not a point-mass "hero's
+exact hand" — was investigated first. `dh_native_ai.cpp` already
+maintains `g.hero_range` (`dh_native_ai.cpp:199`) as a full, persistently
+Bayesian-narrowed weighted-combo distribution mirroring `g.villain_range`
+exactly (see the pre-existing, unnumbered "Symmetric public-range
+narrowing" section immediately below this one, and commit `055ceeb`,
+which added it before this fallback work began). It is initialized
+uniformly (`init_uniform_range`, line 755), pruned for board collisions
+(`prune_range_for_board`, line 812), and narrowed by
+`resolve_decision()`'s own in-process branch using hero's REAL resolved
+strategy row-by-row across every tracked combo (lines 1386-1391) — the
+exact same math `narrow_villain_range_postflop()` uses for villain, just
+applied to hero's own observed action sequence. **No new range-tracking
+mechanism had to be built for this task** — `g.hero_range` already existed
+and was already correct; this integration's job was to make sure the
+TexasSolver bridge actually consumes it as a real range, not to
+special-case hero down to a single combo. `resolve_decision()` does this
+directly: `hero_combos` (`dh_native_ai.cpp:1454-1455`) is built by
+copying every entry of `g.hero_range` verbatim (`{h.c1, h.c2, h.weight}`),
+exactly parallel to how `villain_combos` (lines 1456-1457, same loop shape)
+copies `g.villain_range`, and both are handed to
+`texassolver_bridge::solve()` as `hero_range`/`villain_range` parameters,
+which serializes each with the identical `serialize_range()`
+(`TexasSolverBridge.h:227-242`) — there is no code path anywhere in this
+bridge that treats hero's seat differently from villain's seat when
+building the solver's input file. Hero's actual decision is then sampled
+from hero's own specific-combo row of the returned strategy
+(`TexasSolverBridge.h:682-687`, `find_combo_probs(strat, hero_c1, hero_c2)`),
+exactly the DeepStack/Libratus-style "solve with full ranges for both
+seats, act from your own hand's row" pattern the task asked for.
+
+### Fallback trigger design
+
+`resolve_decision()` (`dh_native_ai.cpp:1278`) now computes the in-process
+`LiveResolver` result into local `in_process_*` variables first (never
+touching `g.hero_range` directly), then decides whether to keep it or
+prefer a TexasSolver-derived result, then commits exactly one of the two
+to `g.hero_range` — guaranteeing hero's range is narrowed exactly once
+per decision regardless of which path served it. Trigger modes, read via
+`DH_TEXASSOLVER_FALLBACK` (`TexasSolverBridge.h:149-157`):
+
+- `auto` (default): try TexasSolver only if the in-process resolver
+  threw, or "succeeded" but its measured exploitability (the same %-of-pot
+  metric `run_until_converged()` already computes, `dh_native_ai.cpp:1072-1093`)
+  is still `>= DH_TEXASSOLVER_EXPLOITABILITY_TRIGGER_PCT` (default 15.0 —
+  a loose "something is clearly wrong" backstop, well above the
+  in-process path's own 1.0% target; `TexasSolverBridge.h:168-170`).
+- `force`: always use TexasSolver, skipping the in-process resolver
+  entirely — a testing/comparison hook (used by
+  `test_texassolver_fallback.cpp`), not intended for normal play.
+- `off`: never use TexasSolver; on in-process failure, fall straight to
+  the pre-existing "call" placeholder (mirroring
+  `resolve_preflop_decision()`'s own established precedent).
+
+If the fallback is attempted and itself fails or returns a degenerate
+(near-zero total weight) result, `resolve_decision()` falls back further:
+first to the in-process result if one exists (even if poorly converged —
+still better than a context-blind placeholder), and only as an absolute
+last resort to the "call" placeholder with `g.hero_range` left completely
+untouched (`dh_native_ai.cpp:1518-1531`) — never a partial or double
+narrowing.
+
+### River-only scope (the key design decision, and why)
+
+The task asked to concentrate on river solves only, deprioritizing
+flop/turn (which the blueprint already handles the large majority of in
+practice). This lines up exactly with what validation had already found:
+an earlier attempt at wiring the fallback in for ALL postflop streets
+uncovered that a flop-rooted (or turn-rooted) TexasSolver solve OOM-kills
+the subprocess (observed RSS exceeding 70 GB before being killed) at this
+codebase's realistic range widths, even with a trimmed bet ladder. The
+root cause, confirmed directly against TexasSolver's own source rather
+than assumed: as documented above, `set_board`'s card count fixes
+`current_round`, and `build_tree` builds the tree starting at exactly
+that round (`CommandLineTool.cpp:198-206,242-243`) — for FLOP/TURN this
+means enumerating every remaining turn/river card runout with no
+leaf-value shortcut analogous to this codebase's own
+`TurnClusterLeafModel`/`RiverClusterLeafModel`, and that combinatorial
+runout space is what actually blows up memory, independent of range
+width or bet-ladder width. A RIVER-rooted board (5 cards) has **no
+further chance nodes at all** — `current_round` is already the terminal
+street — so the tree is just one street of betting: small and fast
+regardless of range width, matching this codebase's OWN measured
+per-iteration cost data (section 28: FLOP ~0.065ms/iter, RIVER
+~0.18ms/iter, TURN ~5.98ms/iter, `BUILD_NOTES.md:3524-3525`) showing
+RIVER as the in-process resolver's cheapest mode per iteration, not its
+most expensive — and this section's own validation run below
+(`test_resolver_exploitability`) reproduces that same ordering.
+
+This is enforced in two places, not just one:
+
+- `dh_native_ai.cpp:1280`: `bool fallback_eligible_street = (g.betting_stage == 3);`
+  gates BOTH the FORCE-mode in-process-skip (`dh_native_ai.cpp:1295`) and
+  the AUTO/FORCE `want_fallback` computation (`dh_native_ai.cpp:1432-1438`)
+  — on the flop or turn, `DH_TEXASSOLVER_FALLBACK` has NO effect at all;
+  every postflop decision on those streets is handled exactly as it was
+  before this integration existed.
+- `TexasSolverBridge.h:615-619`: `solve()` itself defensively refuses
+  (`ok=false`) any board that isn't exactly 5 cards, so even a future
+  caller mistake can't reintroduce the OOM.
+
+`build_batch_commands()` (`TexasSolverBridge.h:295-350`) was correspondingly
+simplified to emit `set_bet_sizes` only for the `river` category (an
+earlier version looped over `flop`/`turn`/`river`, which was dead config
+for a river-rooted tree and had no bearing on the OOM either way, but was
+removed for clarity once the scope narrowed).
+
+Bet-size ladder actually used (river only, `TexasSolverBridge.h:271-272`):
+opening/donk sizes `50,100,200,400,800,1000,2000` (% of pot; the same
+0.5/1/2/4/8/10/20x-pot ladder `LiveResolver`'s own `full_ladder` opening
+branch uses, `RealtimeSearch.h` lines ~992-1013), a single `100` (1x pot)
+facing-a-bet raise size (mirroring `LiveResolver`'s `extended_actions_`
+flag, which adds exactly one canonical raise size), and `allin` always
+offered. `set_use_isomorphism` is left at `0`
+(`TexasSolverBridge.h:333-345`) for the same reason section 46 already
+gave for not porting isomorphism into the in-process resolver:
+`g.hero_range`/`g.villain_range` are narrowed across multiple prior
+streets against different boards before any postflop resolve runs, so
+they are generically asymmetric under the current street's
+board-automorphism group by the time TexasSolver is invoked.
+
+Scope limits, stated plainly rather than papered over: `solve()` only
+supports `actions_this_street` 0 (a fresh street-start decision) or 1
+(hero facing the one action the other seat, who always acts first
+postflop, already took) — anything deeper is refused
+(`TexasSolverBridge.h:620-624`) because reconstructing an arbitrary
+multi-action betting sequence this street would need a full ordered
+per-street action log this codebase doesn't currently maintain (only
+aggregate counters/last-raise-size). This covers hero's OPENING river
+decision and hero's response to a single river bet/raise — the two most
+common river spots — but not, e.g., a river check-raise-reraise sequence.
+
+### Validation
+
+Focused end-to-end tool (river-only scenarios, forcing the fallback via
+`DH_TEXASSOLVER_FALLBACK=force`, all three constructed via a direct
+preflop-close → dealt-river-board jump, which `Next_stage()` supports
+safely since it has no street-history dependency and simply overwrites
+`g.board`/`g.betting_stage` from whatever is passed):
+
+```sh
+cd PokerAI
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER \
+  -o tools/test_texassolver_fallback tools/test_texassolver_fallback.cpp
+./tools/test_texassolver_fallback
+```
+
+Three scenarios, all against real river boards with real `console_solver`
+subprocess invocations (not a stub/mock):
+
+1. **Opening river decision** (hero=AhAd, board Ks7d2c3h9s, hero OOP/BB,
+   `actions_this_street==0`): fallback forced, solver returned `raise 200`,
+   hero's 1,081-combo range renormalized (sum stayed 1.0) and its weights
+   were confirmed to have actually, measurably changed (not a silent
+   no-op).
+2. **Facing a river bet** (hero=QhQs, board Jc8h3s5dTc, hero IP/SB,
+   villain bets 150, `actions_this_street==1`): fallback forced via
+   `set_initial_actions BET_150`, solver returned `call`, hero's range
+   renormalized and measurably changed.
+3. **AUTO-triggered fallback via a forced in-process exception**
+   (hero=9c9d, board Ts4h2s6dKc): hero's own combo was deliberately
+   stripped from `g.hero_range` first, so the in-process resolver's
+   `find_hand_index()` throws as expected; AUTO mode reaches for
+   TexasSolver, which correctly ALSO cannot find hero's combo in its own
+   dumped strategy (hero's combo is absent from the range sent to it
+   either) and reports `ok=false`; `resolve_decision()` then correctly
+   falls all the way through to the last-resort `"call"` placeholder with
+   `g.hero_range` left bit-for-bit untouched — proving the system fails
+   safe (no crash, no fabricated narrowing) rather than silently
+   inventing a result when hero's own hand is unrepresentable in either
+   resolver's input.
+
+Actual run (`/usr/bin/time -l ./tools/test_texassolver_fallback`), all 3
+real `console_solver` subprocess calls included:
+
+```
+=== SUMMARY: ALL CHECKS PASSED (0 failures) ===
+       22.87 real        20.29 user         1.66 sys
+           843300864  maximum resident set size
+          4084239648  peak memory footprint
+```
+
+Peak RSS ~843 MB across the whole run (vs. the 70+ GB OOM previously
+observed at the flop) and 22.87s wall-clock for three full solves —
+confirms the river-only restriction is a real fix, not just a
+theoretical one, and that river fallback solves are fast in practice.
+
+Pre-existing regression tools, run unmodified, to confirm zero impact on
+the default in-process path (per this file's own established convention
+of citing the exact build/run commands):
+
+```sh
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_resolver_exploitability tools/test_resolver_exploitability.cpp
+./tools/test_resolver_exploitability
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_bet_size_narrowing tools/test_bet_size_narrowing.cpp
+./tools/test_bet_size_narrowing
+```
+
+`test_resolver_exploitability` reproduced its established shape unchanged:
+FLOP dropped under the 1% target by 6,000 iterations (0.799%, 99.9 ms),
+RIVER by 10,000 iterations (0.862%, 496.5 ms — still its cheapest
+per-iteration mode), and TURN did not reach 1% within tested checkpoints
+(2,000 iterations, 5.788%) — all consistent with prior documented
+behavior, since nothing in this integration touches `RealtimeSearch.h` or
+any in-process convergence code at all. `test_bet_size_narrowing` printed
+`ALL CHECKS PASSED` for both FLOP and TURN non-all-in raise narrowing
+(max weight changes of 0.0042 and 0.0027 respectively), confirming the
+resolver-invoking villain-narrowing path is untouched.
+
+### Configuration reference
+
+All overridable via env var, read fresh on every call (no restart
+needed): `DH_TEXASSOLVER_FALLBACK` (`auto`/`force`/`off`, default `auto`),
+`DH_TEXASSOLVER_EXPLOITABILITY_TRIGGER_PCT` (default `15.0`),
+`DH_TEXASSOLVER_HOME` (default `$HOME/src/TexasSolver`),
+`DH_TEXASSOLVER_BINARY` (default `<home>/build/console_solver`),
+`DH_TEXASSOLVER_RESOURCE_DIR` (default `<home>/resources`),
+`DH_TEXASSOLVER_MAX_ITERATIONS` (default `100`), `DH_TEXASSOLVER_THREADS`
+(default: hardware concurrency), `DH_TEXASSOLVER_ACCURACY` (default
+`0.5`), `DH_TEXASSOLVER_TIMEOUT_MS` (default `25000`, hard subprocess
+wall-clock cap enforced by polling `waitpid(WNOHANG)` from the calling
+thread, SIGKILL on expiry — see `TexasSolverBridge.h:353-443` for why this
+is deliberately not a background-thread watchdog), and
+`DH_TEXASSOLVER_KEEP_TEMP=1` (preserves the batch-command input file,
+solver log, and JSON output under `/tmp/dh_texassolver_*` for post-mortem
+debugging instead of deleting them on completion).
+
+### Open follow-ups
+
+- Flop/turn TexasSolver support is out of scope by product decision (this
+  section), not merely unimplemented — the blueprint already handles
+  flop/turn the large majority of the time in practice, and a flop/turn
+  TexasSolver solve is structurally intractable (see above) without
+  porting a leaf-value/runout-sampling model into TexasSolver itself,
+  which was judged out of scope for this task.
+- `actions_this_street > 1` (e.g. a river check-raise-reraise) is refused
+  rather than approximated; extending `set_initial_actions` replay to an
+  arbitrary sequence would need this codebase to start maintaining a real
+  per-street action log, which it does not today.
+- The bet-size ladder sent to TexasSolver is a documented approximation of
+  `LiveResolver`'s own street-position-dependent full-ladder-vs-reduced-ladder
+  behavior (`TexasSolverBridge.h:244-272`), since TexasSolver's own config
+  surface has no equivalent "wider only at the very first decision"
+  concept — this is called out in-line, not hidden.
+- No production hands have yet been played with `DH_TEXASSOLVER_FALLBACK=auto`
+  live against Slumbot; validation so far is the focused test tool above
+  plus the pre-existing regression suite. A live soak test would be the
+  natural next step before relying on AUTO-triggered fallback in a real
+  session.
+
 ## Symmetric public-range narrowing
 
 `PokerAI/tools/dh_native_ai.cpp` now maintains two persistent, normalized

@@ -91,6 +91,44 @@
 //       can't be read, TURN mode transparently falls back to the original
 //       exact chance-node + showdown behavior -- never worse or wrong,
 //       only slower without it.
+//     - Purely-additive FALLBACK postflop resolver: resolve_decision() can
+//       optionally reach for the external TexasSolver CFR solver
+//       (PokerAI/tree/TexasSolverBridge.h, shelled out as a subprocess) if
+//       the in-process LiveResolver path above throws, or (in "auto" mode)
+//       converges too poorly. This NEVER replaces or changes LiveResolver's
+//       own behavior on the success path -- see BUILD_NOTES.md's TexasSolver
+//       section for the full design writeup, and TexasSolverBridge.h for the
+//       wire-format details (verified directly against the actual checked-
+//       out TexasSolver source, not guessed). RIVER ONLY (g.betting_stage==3):
+//       a flop/turn-rooted TexasSolver solve has to enumerate every
+//       remaining turn/river card runout with no leaf-value shortcut,
+//       confirmed during validation to OOM-kill the subprocess at DH's
+//       realistic range widths; a river-rooted solve has no further chance
+//       nodes at all, so it stays cheap regardless of range width. FLOP/TURN
+//       postflop decisions always use the in-process LiveResolver, completely
+//       unaffected by any of the env vars below -- also the rare case in
+//       practice, since resolve_direct_blueprint_decision() already answers
+//       the large majority of them straight from the trained blueprint.
+//       Controlled by:
+//         DH_TEXASSOLVER_FALLBACK=auto (default) | force | off
+//           auto: on the river only, use TexasSolver if the in-process
+//                 resolver throws, or its measured exploitability exceeds
+//                 DH_TEXASSOLVER_EXPLOITABILITY_TRIGGER_PCT (default 15.0 --
+//                 a loose "something is clearly wrong" backstop, well above
+//                 the in-process path's own 1% target).
+//           force: on the river only, always use TexasSolver, skipping the
+//                 in-process resolver entirely -- a testing/comparison hook,
+//                 not intended for normal play. No effect on flop/turn.
+//           off:   never use TexasSolver; if the in-process resolver fails,
+//                 fall straight to the existing "call" placeholder pattern
+//                 (see resolve_preflop_decision()'s own precedent).
+//       DH_TEXASSOLVER_HOME / DH_TEXASSOLVER_BINARY / DH_TEXASSOLVER_
+//       RESOURCE_DIR / DH_TEXASSOLVER_MAX_ITERATIONS / DH_TEXASSOLVER_THREADS
+//       / DH_TEXASSOLVER_ACCURACY / DH_TEXASSOLVER_TIMEOUT_MS override the
+//       solver's location and per-solve budget; see TexasSolverBridge.h's
+//       load_config() for defaults. Scope limitation (see BUILD_NOTES.md):
+//       only decisions with 0 or 1 prior actions this street are supported;
+//       anything deeper falls through to the same "call" placeholder.
 //     - This is meant to make the existing GUI (pypokergui) ACTUALLY
 //       PLAYABLE against a genuine, working, from-scratch search algorithm
 //       on macOS -- it is explicitly NOT a reconstruction of the original
@@ -111,6 +149,7 @@
 #include "../tree/PreflopCache.h"
 #include "../tree/IndexedBlueprint.h"
 #include "../tree/BlueprintActionTranslation.h"
+#include "../tree/TexasSolverBridge.h"
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -366,6 +405,44 @@ void dh_log_narrowing(const char* label, unsigned char observed_byte,
 	std::fprintf(stderr,
 		"[DH_RANGE_MODEL] %s narrow observed=%s combos=%zu effective_hands %.1f -> %.1f, top:",
 		label, dh_action_name(observed_byte).c_str(), range.size(), eff_before, eff_after);
+	for (size_t k = 0; k < top_k; k++) {
+		const WeightedHand& h = range[idx[k]];
+		std::fprintf(stderr, " %s%s=%.2f%%",
+			dh_card_str(h.c1).c_str(), dh_card_str(h.c2).c_str(), h.weight * 100.0);
+	}
+	std::fprintf(stderr, "\n");
+}
+
+// Same shape as dh_log_narrowing() above, but for a TexasSolver-fallback-
+// driven narrowing update: the "observed" thing being narrowed against is
+// HERO'S OWN just-sampled action, expressed as the same "fold"/"call"/
+// "allin"/"raise <amount>" string resolve_decision() returns -- not one of
+// this file's native pot-fraction action BYTES, so dh_action_name()/
+// dh_log_narrowing() (which format a byte) can't be reused directly here.
+void dh_log_texassolver_narrowing(const std::string& action_label,
+	const std::vector<double>& weights_before,
+	const std::vector<WeightedHand>& range) {
+	if (!dh_verbose_enabled()) return;
+	auto effective_n = [](const std::vector<double>& w) {
+		double sum_sq = 0.0;
+		for (double x : w) sum_sq += x * x;
+		return (sum_sq > 1e-15) ? 1.0 / sum_sq : 0.0;
+	};
+	double eff_before = effective_n(weights_before);
+	std::vector<double> weights_after;
+	weights_after.reserve(range.size());
+	for (const auto& h : range) weights_after.push_back(h.weight);
+	double eff_after = effective_n(weights_after);
+
+	std::vector<size_t> idx(range.size());
+	for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
+	size_t top_k = std::min<size_t>(5, idx.size());
+	std::partial_sort(idx.begin(), idx.begin() + top_k, idx.end(),
+		[&](size_t a, size_t b) { return range[a].weight > range[b].weight; });
+
+	std::fprintf(stderr,
+		"[DH_TEXASSOLVER] hero-postflop narrow observed=%s combos=%zu effective_hands %.1f -> %.1f, top:",
+		action_label.c_str(), range.size(), eff_before, eff_after);
 	for (size_t k = 0; k < top_k; k++) {
 		const WeightedHand& h = range[idx[k]];
 		std::fprintf(stderr, " %s%s=%.2f%%",
@@ -986,18 +1063,25 @@ const double TARGET_EXPLOITABILITY_PCT = 1.0;
 // `external_reach0`/`external_reach1` are passed straight through to both
 // run() and exploitability() so the convergence check reflects this exact
 // decision's real tracked-range belief, not a synthetic uniform one.
+// `out_final_expl_pct`, if non-null, receives the LAST measured
+// exploitability-as-%-of-pot value from the loop below (whatever value
+// triggered the stop, whether by hitting TARGET_EXPLOITABILITY_PCT or a
+// safety cap) -- purely an additional reporting channel for a value this
+// function already computes internally every batch regardless of caller;
+// existing callers that don't pass it see no behavior change at all.
 void run_until_converged(LiveResolver& resolver, LiveResolver::Mode mode,
 	const std::vector<double>* external_reach0, const std::vector<double>* external_reach1,
-	bool full_ladder = false) {
+	bool full_ladder = false, double* out_final_expl_pct = nullptr) {
 	ConvergenceConfig cfg = convergence_config_for_mode(mode, full_ladder);
 	double pot = (double)resolver.root->state.table.total_pot;
 	auto t0 = std::chrono::steady_clock::now();
 	int done = 0;
+	double expl_pct = 0.0;
 	while (done < cfg.max_iterations) {
 		int batch = std::min(cfg.batch_size, cfg.max_iterations - done);
 		resolver.run(batch, external_reach0, external_reach1);
 		done += batch;
-		double expl_pct = (pot > 1e-9)
+		expl_pct = (pot > 1e-9)
 			? 100.0 * resolver.exploitability(external_reach0, external_reach1) / pot
 			: 0.0;
 		double elapsed_ms = std::chrono::duration<double, std::milli>(
@@ -1005,6 +1089,7 @@ void run_until_converged(LiveResolver& resolver, LiveResolver::Mode mode,
 		if (expl_pct < TARGET_EXPLOITABILITY_PCT) break;
 		if (elapsed_ms >= cfg.max_ms) break;
 	}
+	if (out_final_expl_pct) *out_final_expl_pct = expl_pct;
 }
 
 // Bayesian-narrows villain_range using a DEDICATED LiveResolver run rooted
@@ -1164,124 +1249,286 @@ std::string resolve_direct_blueprint_decision() {
 // Builds the Searchstate snapshot for the current decision, runs the
 // appropriately-scoped LiveResolver against both live public range beliefs,
 // then samples the strategy for our actual private hand.
+//
+// FALLBACK DESIGN (see this file's own top header comment for the
+// DH_TEXASSOLVER_FALLBACK env var and TexasSolverBridge.h for the solver
+// interface): the in-process computation above is done ENTIRELY into
+// local variables (in_process_*) -- g.hero_range is not touched until
+// after this function has decided, below, whether to keep that result or
+// discard it in favor of a TexasSolver-driven one. This guarantees
+// g.hero_range is narrowed EXACTLY ONCE per call, from exactly one
+// resolver's real strategy, never partially from one and then again from
+// the other. On the pure success path (no fallback ever considered) the
+// sequence of computations and log output is byte-for-byte identical to
+// this function's original, pre-fallback form.
+//
+// RIVER ONLY: the TexasSolver fallback is never even considered unless
+// g.betting_stage==3 (river) -- see `fallback_eligible_street` below and
+// TexasSolverBridge.h's top header comment for the full rationale (a
+// flop/turn-rooted TexasSolver solve forces it to enumerate every
+// remaining turn/river runout with no leaf-value shortcut, confirmed
+// during validation to OOM-kill the subprocess at DH's realistic range
+// widths; a river-rooted solve has no further chance nodes at all, so it
+// stays cheap regardless of range width). FLOP/TURN postflop decisions
+// are therefore handled EXCLUSIVELY by the in-process LiveResolver below,
+// completely unchanged from before this integration existed -- this is
+// also consistent with FLOP/TURN being the rare case in practice, since
+// resolve_direct_blueprint_decision() (see getdecision()) already answers
+// the large majority of them straight from the trained blueprint.
 std::string resolve_decision() {
-	Searchstate s = build_current_searchstate(g.my_id);
+	texassolver_bridge::TriggerMode fallback_mode = texassolver_bridge::trigger_mode();
+	bool fallback_eligible_street = (g.betting_stage == 3);
 
-	Players_range range;
-	std::vector<double> reach0, reach1;
-	build_resolver_ranges(range, reach0, reach1);
+	bool in_process_ok = false;
+	std::string in_process_result;
+	std::vector<double> in_process_updated_weights;
+	std::vector<double> in_process_before_weights;
+	unsigned char in_process_act = 0;
+	std::string in_process_error;
+	double in_process_expl_pct = -1.0;
 
-	LiveResolver::Mode mode = (g.betting_stage == 1) ? LiveResolver::Mode::FLOP
-		: (g.betting_stage == 2) ? LiveResolver::Mode::TURN
-		: LiveResolver::Mode::RIVER;
+	// FORCE mode skips the in-process resolver entirely -- a deliberate
+	// testing/comparison hook (see tools/test_texassolver_fallback.cpp),
+	// not intended for normal play. Only takes effect on the river
+	// (fallback_eligible_street); FORCE has no effect on flop/turn, which
+	// always run the in-process resolver below regardless of this env var.
+	if (!(fallback_mode == texassolver_bridge::TriggerMode::FORCE && fallback_eligible_street)) {
+		try {
+			Searchstate s = build_current_searchstate(g.my_id);
 
-	std::unique_ptr<TurnClusterLeafModel> leaf;
-	if (mode == LiveResolver::Mode::FLOP) {
-		unsigned char flop_board[3] = { g.board[0], g.board[1], g.board[2] };
-		leaf.reset(new TurnClusterLeafModel(engine, flop_board, range));
-	}
+			Players_range range;
+			std::vector<double> reach0, reach1;
+			build_resolver_ranges(range, reach0, reach1);
 
-	std::unique_ptr<RiverClusterLeafModel> river_leaf;
-	if (mode == LiveResolver::Mode::TURN) {
-		std::string dir = river_split_dir();
-		if (!dir.empty()) {
-			unsigned char turn_board[4] = { g.board[0], g.board[1], g.board[2], g.board[3] };
-			river_leaf.reset(new RiverClusterLeafModel(dir, turn_board, range));
+			LiveResolver::Mode mode = (g.betting_stage == 1) ? LiveResolver::Mode::FLOP
+				: (g.betting_stage == 2) ? LiveResolver::Mode::TURN
+				: LiveResolver::Mode::RIVER;
+
+			std::unique_ptr<TurnClusterLeafModel> leaf;
+			if (mode == LiveResolver::Mode::FLOP) {
+				unsigned char flop_board[3] = { g.board[0], g.board[1], g.board[2] };
+				leaf.reset(new TurnClusterLeafModel(engine, flop_board, range));
+			}
+
+			std::unique_ptr<RiverClusterLeafModel> river_leaf;
+			if (mode == LiveResolver::Mode::TURN) {
+				std::string dir = river_split_dir();
+				if (!dir.empty()) {
+					unsigned char turn_board[4] = { g.board[0], g.board[1], g.board[2], g.board[3] };
+					river_leaf.reset(new RiverClusterLeafModel(dir, turn_board, range));
+				}
+			}
+
+			// full_ladder gives hero's OWN decision the real native pot-fraction
+			// bet sizes (0.5/1/2/4/10/20x pot, per State.h's legal_actions() --
+			// the same abstraction the blueprint was trained with) at the opening
+			// action of a betting round, instead of only fold/check/allin -- see
+			// RealtimeSearch.h's LiveResolver constructor comment and BUILD_NOTES.md
+			// section 37 for the full design writeup and measured tractability.
+			// Only safe for modes that don't expand a further chance node inside
+			// this resolver's own tree: FLOP and RIVER always qualify; TURN only
+			// when river_leaf is actually active (non-null) -- TURN without it
+			// still deals a real, expensive river chance node per iteration, and
+			// combining that with the full ladder reproduces the original
+			// "several minutes" combinatorial blowup this file used to warn
+			// about, so it is deliberately excluded here.
+			bool full_ladder = (mode == LiveResolver::Mode::FLOP) || (mode == LiveResolver::Mode::RIVER)
+				|| (mode == LiveResolver::Mode::TURN && river_leaf != nullptr);
+
+			LiveResolver resolver(range, engine, leaf.get(), mode, /*extended_actions=*/false, river_leaf.get(),
+				full_ladder);
+			resolver.init_root(s, g.board);
+			run_until_converged(resolver, mode, &reach0, &reach1, full_ladder, &in_process_expl_pct);
+			// Adaptive iteration budget -- keeps iterating until measured
+			// exploitability drops under ~1% of the pot (or a safety cap is hit);
+			// see run_until_converged()'s comment above for the real measured
+			// convergence data this replaces a fixed count with, and BUILD_NOTES.md
+			// for the full writeup. Resolving against the full tracked range rather
+			// than a fixed-size sample is markedly more expensive per iteration --
+			// see BUILD_NOTES.md's range-model section for measured timings.
+			// in_process_expl_pct now holds the same final exploitability value
+			// this loop already computed internally on its last batch -- used
+			// below both for the verbose log (as before) and for this
+			// function's own AUTO fallback trigger, at no extra computation
+			// cost (see run_until_converged()'s out_final_expl_pct comment).
+
+			size_t my_hand_index = find_hand_index(g.hero_range, g.my_hole[0], g.my_hole[1]);
+			std::vector<double> avg;
+			LiveResolver::average_strategy(resolver.root.get(), (int)my_hand_index, avg);
+
+			if (dh_verbose_enabled()) {
+				double pot_d = (double)resolver.root->state.table.total_pot;
+				const char* mode_name = (mode == LiveResolver::Mode::FLOP) ? "FLOP"
+					: (mode == LiveResolver::Mode::TURN) ? "TURN" : "RIVER";
+				dh_log_strategy(mode_name, resolver.root->actions, avg, in_process_expl_pct, (int)pot_d);
+			}
+
+			// Root actions may not literally be [fold, call, allin] in that order or
+			// even all present (e.g., no fold offered if nothing is owed) -- match
+			// by the actual encoded action bytes ('d'=fold, 'l'=call/check, 'n'=allin,
+			// anything else is a pot-fraction raise byte -- only reachable when
+			// full_ladder gave this decision access to the real ladder above).
+			double r = std::uniform_real_distribution<double>(0.0, 1.0)(g.rng);
+			double cum = 0.0;
+			size_t selected_action = resolver.root->actions.size() - 1;
+			for (size_t a = 0; a < resolver.root->actions.size(); a++) {
+				cum += avg[a];
+				if (r <= cum || a + 1 == resolver.root->actions.size()) {
+					selected_action = a;
+					break;
+				}
+			}
+
+			in_process_before_weights.reserve(g.hero_range.size());
+			for (const auto& h : g.hero_range) in_process_before_weights.push_back(h.weight);
+			in_process_updated_weights.resize(g.hero_range.size());
+			double sum = 0.0;
+			for (size_t i = 0; i < g.hero_range.size(); ++i) {
+				std::vector<double> hand_strategy;
+				LiveResolver::average_strategy(resolver.root.get(), (int)i, hand_strategy);
+				in_process_updated_weights[i] = g.hero_range[i].weight * hand_strategy[selected_action];
+				sum += in_process_updated_weights[i];
+			}
+			if (!(sum > 1e-12))
+				throw std::runtime_error("hero range collapsed to ~0 total weight after resolved action");
+			for (size_t i = 0; i < in_process_updated_weights.size(); ++i)
+				in_process_updated_weights[i] /= sum;
+			in_process_act = resolver.root->actions[selected_action];
+
+			if (in_process_act == 'd') in_process_result = "fold";
+			else if (in_process_act == 'n') in_process_result = "allin";
+			else if (in_process_act == 'l') in_process_result = "call";
+			else {
+				// Pot-fraction raise byte: compute the real chip total using the
+				// EXACT same formula State.h uses, then convert it to the API's
+				// street-relative amount.
+				int total_pot_before = (int)s.table.total_pot;
+				int last_bigbet_before = (int)s.last_bigbet;
+				int my_bet_before = 20000 - g.stack[g.my_id];
+				int n_chips_to_call = last_bigbet_before - my_bet_before;
+				int pot_i = total_pot_before + n_chips_to_call;
+				int last_raise = pot_i * in_process_act / 200 * 100;
+				int new_total_bet_whole_hand = last_bigbet_before + last_raise;
+				int already_committed_earlier_streets = 20000 - g.stack_at_street_start[g.my_id];
+				int new_total_bet_street_relative = new_total_bet_whole_hand - already_committed_earlier_streets;
+				in_process_result = "raise " + std::to_string(new_total_bet_street_relative);
+			}
+			in_process_ok = true;
+		} catch (const std::exception& e) {
+			in_process_error = e.what();
+		} catch (...) {
+			in_process_error = "unknown non-std::exception thrown from in-process resolver";
 		}
 	}
 
-	// full_ladder gives hero's OWN decision the real native pot-fraction
-	// bet sizes (0.5/1/2/4/10/20x pot, per State.h's legal_actions() --
-	// the same abstraction the blueprint was trained with) at the opening
-	// action of a betting round, instead of only fold/check/allin -- see
-	// RealtimeSearch.h's LiveResolver constructor comment and BUILD_NOTES.md
-	// section 37 for the full design writeup and measured tractability.
-	// Only safe for modes that don't expand a further chance node inside
-	// this resolver's own tree: FLOP and RIVER always qualify; TURN only
-	// when river_leaf is actually active (non-null) -- TURN without it
-	// still deals a real, expensive river chance node per iteration, and
-	// combining that with the full ladder reproduces the original
-	// "several minutes" combinatorial blowup this file used to warn
-	// about, so it is deliberately excluded here.
-	bool full_ladder = (mode == LiveResolver::Mode::FLOP) || (mode == LiveResolver::Mode::RIVER)
-		|| (mode == LiveResolver::Mode::TURN && river_leaf != nullptr);
-
-	LiveResolver resolver(range, engine, leaf.get(), mode, /*extended_actions=*/false, river_leaf.get(),
-		full_ladder);
-	resolver.init_root(s, g.board);
-	run_until_converged(resolver, mode, &reach0, &reach1, full_ladder);
-	// Adaptive iteration budget -- keeps iterating until measured
-	// exploitability drops under ~1% of the pot (or a safety cap is hit);
-	// see run_until_converged()'s comment above for the real measured
-	// convergence data this replaces a fixed count with, and BUILD_NOTES.md
-	// for the full writeup. Resolving against the full tracked range rather
-	// than a fixed-size sample is markedly more expensive per iteration --
-	// see BUILD_NOTES.md's range-model section for measured timings.
-
-	size_t my_hand_index = find_hand_index(g.hero_range, g.my_hole[0], g.my_hole[1]);
-	std::vector<double> avg;
-	LiveResolver::average_strategy(resolver.root.get(), (int)my_hand_index, avg);
-
-	if (dh_verbose_enabled()) {
-		double pot = (double)resolver.root->state.table.total_pot;
-		double expl_pct = (pot > 1e-9)
-			? 100.0 * resolver.exploitability(&reach0, &reach1) / pot
-			: 0.0;
-		const char* mode_name = (mode == LiveResolver::Mode::FLOP) ? "FLOP"
-			: (mode == LiveResolver::Mode::TURN) ? "TURN" : "RIVER";
-		dh_log_strategy(mode_name, resolver.root->actions, avg, expl_pct, (int)pot);
-	}
-
-	// Root actions may not literally be [fold, call, allin] in that order or
-	// even all present (e.g., no fold offered if nothing is owed) -- match
-	// by the actual encoded action bytes ('d'=fold, 'l'=call/check, 'n'=allin,
-	// anything else is a pot-fraction raise byte -- only reachable when
-	// full_ladder gave this decision access to the real ladder above).
-	double r = std::uniform_real_distribution<double>(0.0, 1.0)(g.rng);
-	double cum = 0.0;
-	size_t selected_action = resolver.root->actions.size() - 1;
-	for (size_t a = 0; a < resolver.root->actions.size(); a++) {
-		cum += avg[a];
-		if (r <= cum || a + 1 == resolver.root->actions.size()) {
-			selected_action = a;
-			break;
+	// Decide whether to reach for the TexasSolver fallback -- see this
+	// file's top header comment (DH_TEXASSOLVER_FALLBACK) for the three
+	// modes' full semantics: FORCE always tries it; AUTO tries it only if
+	// the in-process attempt above threw, or "succeeded" but converged
+	// too poorly; OFF never tries it (want_fallback stays false). Gated
+	// on fallback_eligible_street regardless of mode -- see this
+	// function's own top comment and TexasSolverBridge.h for why FLOP/TURN
+	// never reach for TexasSolver even under FORCE/AUTO.
+	bool want_fallback = false;
+	if (fallback_eligible_street) {
+		if (fallback_mode == texassolver_bridge::TriggerMode::FORCE) want_fallback = true;
+		else if (fallback_mode == texassolver_bridge::TriggerMode::AUTO) {
+			if (!in_process_ok) want_fallback = true;
+			else if (in_process_expl_pct >= texassolver_bridge::exploitability_trigger_pct()) want_fallback = true;
 		}
 	}
 
-	std::vector<double> before;
-	before.reserve(g.hero_range.size());
-	for (const auto& h : g.hero_range) before.push_back(h.weight);
-	std::vector<double> updated(g.hero_range.size());
-	double sum = 0.0;
-	for (size_t i = 0; i < g.hero_range.size(); ++i) {
-		std::vector<double> hand_strategy;
-		LiveResolver::average_strategy(resolver.root.get(), (int)i, hand_strategy);
-		updated[i] = g.hero_range[i].weight * hand_strategy[selected_action];
-		sum += updated[i];
-	}
-	if (!(sum > 1e-12))
-		throw std::runtime_error("hero range collapsed to ~0 total weight after resolved action");
-	for (size_t i = 0; i < g.hero_range.size(); ++i)
-		g.hero_range[i].weight = updated[i] / sum;
-	unsigned char act = resolver.root->actions[selected_action];
-	dh_log_narrowing("hero-postflop", act, before, g.hero_range);
+	if (want_fallback) {
+		// set_pot's symmetric-commit assumption (see TexasSolverBridge.h)
+		// requires both players to have committed EQUALLY as of this
+		// street's start -- always true for a genuine street-start decision
+		// (a betting round only closes once bets are matched), but checked
+		// defensively rather than silently trusting it.
+		if (g.stack_at_street_start[0] != g.stack_at_street_start[1]) {
+			std::fprintf(stderr,
+				"[DH_TEXASSOLVER] skipped: stack_at_street_start asymmetric (%d vs %d) -- "
+				"cannot represent as a fresh symmetric-commit root\n",
+				g.stack_at_street_start[0], g.stack_at_street_start[1]);
+		} else {
+			std::vector<texassolver_bridge::Combo> hero_combos, villain_combos;
+			hero_combos.reserve(g.hero_range.size());
+			for (const auto& h : g.hero_range) hero_combos.push_back({ h.c1, h.c2, h.weight });
+			villain_combos.reserve(g.villain_range.size());
+			for (const auto& h : g.villain_range) villain_combos.push_back({ h.c1, h.c2, h.weight });
 
-	if (act == 'd') return "fold";
-	if (act == 'n') return "allin";
-	if (act == 'l') return "call";
-	// Pot-fraction raise byte: compute the real chip total using the EXACT
-	// same formula State.h uses, then convert it to the API's street-relative
-	// amount.
-	int total_pot_before = (int)s.table.total_pot;
-	int last_bigbet_before = (int)s.last_bigbet;
-	int my_bet_before = 20000 - g.stack[g.my_id];
-	int n_chips_to_call = last_bigbet_before - my_bet_before;
-	int pot = total_pot_before + n_chips_to_call;
-	int last_raise = pot * act / 200 * 100;
-	int new_total_bet_whole_hand = last_bigbet_before + last_raise;
-	int already_committed_earlier_streets = 20000 - g.stack_at_street_start[g.my_id];
-	int new_total_bet_street_relative = new_total_bet_whole_hand - already_committed_earlier_streets;
-	return "raise " + std::to_string(new_total_bet_street_relative);
+			int opp = 1 - g.my_id;
+			int pot_at_street_start = (20000 - g.stack_at_street_start[0]) + (20000 - g.stack_at_street_start[1]);
+			int effective_stack_at_street_start = std::min(g.stack_at_street_start[0], g.stack_at_street_start[1]);
+			int opp_committed_this_street = committed_this_street(opp);
+			bool other_seat_checked = (g.actions_this_street == 1 && opp_committed_this_street == 0);
+
+			if (dh_verbose_enabled())
+				std::fprintf(stderr,
+					"[DH_TEXASSOLVER] invoking fallback (mode=%s, in_process_ok=%d, in_process_expl_pct=%.2f%%)\n",
+					fallback_mode == texassolver_bridge::TriggerMode::FORCE ? "force" : "auto",
+					in_process_ok ? 1 : 0, in_process_expl_pct);
+
+			texassolver_bridge::Decision fb = texassolver_bridge::solve(
+				/*hero_is_ip=*/g.my_id == 0,
+				hero_combos, villain_combos, g.board,
+				pot_at_street_start, effective_stack_at_street_start,
+				g.actions_this_street, other_seat_checked, opp_committed_this_street,
+				g.my_hole[0], g.my_hole[1], g.rng);
+
+			if (fb.ok) {
+				std::vector<double> before;
+				before.reserve(g.hero_range.size());
+				for (const auto& h : g.hero_range) before.push_back(h.weight);
+
+				double sum = 0.0;
+				std::vector<double> updated(g.hero_range.size());
+				for (size_t i = 0; i < g.hero_range.size(); i++) {
+					updated[i] = g.hero_range[i].weight * fb.hero_prob_of_chosen_action[i];
+					sum += updated[i];
+				}
+				if (sum > 1e-12) {
+					for (size_t i = 0; i < g.hero_range.size(); i++)
+						g.hero_range[i].weight = updated[i] / sum;
+					dh_log_texassolver_narrowing(fb.action, before, g.hero_range);
+					if (dh_verbose_enabled() && !fb.diagnostic.empty())
+						std::fprintf(stderr, "[DH_TEXASSOLVER] %s\n", fb.diagnostic.c_str());
+					return fb.action;
+				}
+				std::fprintf(stderr,
+					"[DH_TEXASSOLVER] fallback strategy collapsed hero range to ~0 weight -- "
+					"discarding, trying remaining options\n");
+			} else {
+				std::fprintf(stderr, "[DH_TEXASSOLVER] fallback failed (%s)\n", fb.error.c_str());
+			}
+		}
+	}
+
+	// Either the fallback wasn't wanted (in-process succeeded well enough
+	// and mode != FORCE), or it WAS wanted but itself failed/produced a
+	// degenerate result -- a poorly-converged in-process result is still
+	// preferable to the context-blind last-resort placeholder below, so
+	// use it if we have it.
+	if (in_process_ok) {
+		for (size_t i = 0; i < g.hero_range.size(); ++i)
+			g.hero_range[i].weight = in_process_updated_weights[i];
+		dh_log_narrowing("hero-postflop", in_process_act, in_process_before_weights, g.hero_range);
+		return in_process_result;
+	}
+
+	// Last resort: mirrors resolve_preflop_decision()'s own established
+	// "always call" placeholder for this decision only, reached only when
+	// EVERY other avenue (in-process resolver, and, if attempted, the
+	// TexasSolver fallback) has failed. g.hero_range is deliberately left
+	// UNTOUCHED here -- neither computation's narrowing update is
+	// committed -- rather than guessing which (if either) partial/failed
+	// computation to trust.
+	std::fprintf(stderr,
+		"[DH_RESOLVE] postflop decision unresolved by the in-process resolver%s -- "
+		"falling back to placeholder 'call' for this decision only (%s)\n",
+		(fallback_mode == texassolver_bridge::TriggerMode::FORCE && fallback_eligible_street)
+			? " (skipped: forced fallback)" : "",
+		in_process_error.empty() ? "no in-process error recorded" : in_process_error.c_str());
+	return "call";
 }
 
 // Facing hero's very first preflop decision, or having watched only
