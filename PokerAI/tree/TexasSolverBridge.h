@@ -278,6 +278,128 @@ inline const char* opening_bet_sizes_pct() { return "50,100,200,400,800,1000,200
 inline const char* facing_bet_raise_sizes_pct() { return "100"; }
 
 // ---------------------------------------------------------------------------
+// Exact bet-size ratios for ALREADY-OBSERVED actions in the replayed path.
+// ---------------------------------------------------------------------------
+// `action_path` (see solve()'s own top comment) already carries a player's
+// REAL, exact bet/raise for this street in its "BET_<n>"/"RAISE_<n>"
+// tokens -- `n` is dh_native_ai.cpp's own stack-diff-corrected chip
+// increment, not an approximation (texassolver_bet_or_raise_token()). Once
+// that is known, there is no reason to ALSO offer the standard
+// opening_bet_sizes_pct()/facing_bet_raise_sizes_pct() abstraction ladder
+// for that SPECIFIC player+category: PCfrSolver::navigateToSubtree
+// (invoked via set_initial_actions to replay this path) finds the tree
+// child whose configured amount is numerically CLOSEST to the real one it
+// is asked to match (PCfrSolver.cpp's own "find closest amount" comment),
+// so offering the fixed ladder alongside -- or instead of -- the real size
+// risks silently re-solving as if the opponent had bet a different, rounder
+// size than they actually did, and even when it does pick the real size
+// (because it happens to also be configured), the surrounding ladder sizes
+// are dead weight: nothing else in this replayed, already-decided path can
+// ever reach them.
+//
+// TexasSolver's own set_bet_sizes command has no restriction to a small
+// fixed menu -- CommandLineTool.cpp's handler parses every size with a
+// plain `stof` (arbitrary float, not one of a hardcoded set), and
+// GameTree::get_possible_bets() converts a configured size back into a
+// chip amount with a single `amount = one_bet * pot` multiply, rounded
+// only to the nearest big blind -- so configuring the tree with the REAL
+// ratio for the one size that actually happened reproduces the original
+// chip amount exactly (mod float32 precision, which is many orders of
+// magnitude finer than a single big blind for any realistic stack depth).
+//
+// This ONLY replaces the menu for a player+category that has real,
+// observed data (i.e. that player genuinely made a bet/raise of that kind
+// already this street, per the replayed action_path). A player+category
+// with no real action yet (e.g. hero's own still-undecided raise sizing
+// in response, or a player who never bet at all this street) still uses
+// the standard abstraction ladder -- there is no real data to replace it
+// with, and the tree still needs SOME menu of options for that
+// genuinely-hypothetical, not-yet-decided future branch.
+struct ExactBetRatios {
+	// Percent-of-pot-at-that-moment ratios, one entry per real BET (resp.
+	// RAISE) this player made this street, in chronological order. Almost
+	// always at most one BET per player (a player can only make the FIRST
+	// aggressive action into a street once -- any further aggression from
+	// either player is necessarily a RAISE, see
+	// texassolver_bet_or_raise_token()'s own naming rule), but RAISE can
+	// legitimately repeat for the same player across a longer sequence
+	// (e.g. bet/raise/re-raise/re-re-raise).
+	std::vector<double> oop_bet, oop_raise, ip_bet, ip_raise;
+};
+
+// Replays `action_path` purely to recover each real BET/RAISE's exact
+// percent-of-pot ratio -- mirrors dh_native_ai.cpp's own per-street commit
+// tracking (committed_this_street()) and GameTree.cpp's own pot formula
+// (`pot = max(ip_commit, oop_commit) * 2`) closely enough to reproduce the
+// same ratio TexasSolver itself will multiply back out, but is otherwise
+// independent bookkeeping local to this function -- it does not read or
+// mutate any LiveGame state.
+//
+// `ip_commit`/`oop_commit` must start at `pot_at_street_start / 2` each,
+// NOT zero: set_pot's own symmetric-commit precondition (checked by the
+// caller before this bridge is even invoked) means both players have
+// already committed that much by the time this street's root is built,
+// and GameTree.cpp's tree root is constructed on that same basis -- so a
+// street with real money already in it before any action (the overwhelmingly
+// common case) needs that baseline folded in, or the very first BET/RAISE's
+// "pot before" is wrongly computed as if the street opened with nothing in
+// the middle at all.
+inline ExactBetRatios compute_exact_bet_ratios(const std::vector<std::string>& action_path, int pot_at_street_start) {
+	ExactBetRatios result;
+	int ip_commit = pot_at_street_start / 2, oop_commit = pot_at_street_start / 2;
+	bool actor_is_oop = true; // OOP (BB) acts first postflop in heads-up
+	                           // (dh_native_ai.cpp's own slot-1-first-
+	                           // postflop convention).
+	for (const std::string& token : action_path) {
+		size_t underscore = token.find('_');
+		std::string name = underscore == std::string::npos ? token : token.substr(0, underscore);
+		int pot_before = std::max(ip_commit, oop_commit) * 2;
+		if (name == "BET" || name == "RAISE") {
+			int amount = std::stoi(token.substr(underscore + 1));
+			int own_commit_before = actor_is_oop ? oop_commit : ip_commit;
+			int facing_commit_before = actor_is_oop ? ip_commit : oop_commit;
+			// GameTree.cpp's own RAISE branch does
+			// `amount = one_bet*pot; amount += (facing_commit -
+			// own_commit)` -- the configured ratio only spans the
+			// pot-fraction portion, and TexasSolver itself adds the
+			// call-equalization on top when building the tree. So to
+			// recover the ratio that reproduces our real `amount`, that
+			// same equalization term must be subtracted back out first.
+			// For BET this term is always 0 (a BET is by definition the
+			// first aggressive action into a street, so both commits are
+			// still equal at that point), so one formula covers both.
+			int raise_adjustment = (name == "RAISE") ? (facing_commit_before - own_commit_before) : 0;
+			double ratio_pct = pot_before > 0 ? (100.0 * (amount - raise_adjustment) / pot_before) : 0.0;
+			std::vector<double>& target = actor_is_oop
+				? (name == "BET" ? result.oop_bet : result.oop_raise)
+				: (name == "BET" ? result.ip_bet : result.ip_raise);
+			target.push_back(ratio_pct);
+			(actor_is_oop ? oop_commit : ip_commit) += amount;
+		} else if (name == "CALL") {
+			int matched = std::max(ip_commit, oop_commit);
+			(actor_is_oop ? oop_commit : ip_commit) = matched;
+		}
+		// CHECK/FOLD: no commitment change. All-in has no separate
+		// TexasSolver token (texassolver_bet_or_raise_token()'s own
+		// comment: an all-in shove is just a BET/RAISE whose amount
+		// happens to be the actor's whole remaining stack), so it is
+		// already handled by the BET/RAISE branch above.
+		actor_is_oop = !actor_is_oop;
+	}
+	return result;
+}
+
+inline std::string format_ratio_list(const std::vector<double>& ratios) {
+	std::ostringstream out;
+	out << std::setprecision(12);
+	for (size_t i = 0; i < ratios.size(); i++) {
+		if (i) out << ",";
+		out << ratios[i];
+	}
+	return out.str();
+}
+
+// ---------------------------------------------------------------------------
 // Batch command-file construction.
 // ---------------------------------------------------------------------------
 struct SolveRequest {
@@ -295,6 +417,10 @@ struct SolveRequest {
 	// top-level line parser rejects any line with more than one space,
 	// see BUILD_NOTES.md citation into CommandLineTool.cpp).
 	std::string initial_actions;
+	// Real, observed bet-size ratios derived from `initial_actions` (see
+	// compute_exact_bet_ratios() above) -- populated by solve() below.
+	// Empty for a player+category with no real action yet this street.
+	ExactBetRatios exact_ratios;
 	Config cfg;
 };
 
@@ -316,17 +442,31 @@ inline std::string build_batch_commands(const SolveRequest& req, const std::stri
 	// bridge's original OOM when (before this restriction existed) it was
 	// exercised from the flop, forcing a full flop->turn->river
 	// enumeration (see BUILD_NOTES.md).
-	for (const char* pos : { "oop", "ip" }) {
-		cmd << "set_bet_sizes " << pos << ",river,bet," << opening_bet_sizes_pct() << "\n";
-		cmd << "set_bet_sizes " << pos << ",river,raise," << facing_bet_raise_sizes_pct() << "\n";
-		cmd << "set_bet_sizes " << pos << ",river,allin\n";
+	{
+		const std::vector<double>* oop_bet_exact = &req.exact_ratios.oop_bet;
+		const std::vector<double>* oop_raise_exact = &req.exact_ratios.oop_raise;
+		const std::vector<double>* ip_bet_exact = &req.exact_ratios.ip_bet;
+		const std::vector<double>* ip_raise_exact = &req.exact_ratios.ip_raise;
+		cmd << "set_bet_sizes oop,river,bet,"
+			<< (oop_bet_exact->empty() ? opening_bet_sizes_pct() : format_ratio_list(*oop_bet_exact).c_str()) << "\n";
+		cmd << "set_bet_sizes oop,river,raise,"
+			<< (oop_raise_exact->empty() ? facing_bet_raise_sizes_pct() : format_ratio_list(*oop_raise_exact).c_str()) << "\n";
+		cmd << "set_bet_sizes oop,river,allin\n";
+		cmd << "set_bet_sizes ip,river,bet,"
+			<< (ip_bet_exact->empty() ? opening_bet_sizes_pct() : format_ratio_list(*ip_bet_exact).c_str()) << "\n";
+		cmd << "set_bet_sizes ip,river,raise,"
+			<< (ip_raise_exact->empty() ? facing_bet_raise_sizes_pct() : format_ratio_list(*ip_raise_exact).c_str()) << "\n";
+		cmd << "set_bet_sizes ip,river,allin\n";
 	}
 	// Donk (OOP leading into a street after being the non-aggressor) is
 	// only meaningful for OOP; mirrored after the confirmed-working
 	// example config at resources/text/commandline_one_hand.txt, which
 	// only sets a river donk size. DH itself has no separate "donk"
 	// concept (its action set doesn't distinguish by prior-street
-	// aggressor), so the opening ladder is reused here too.
+	// aggressor), so the opening ladder is reused here too -- donk sizing
+	// is never replayed via initial_actions (a donk IS an opening "BET",
+	// indistinguishable from one in DH's own action vocabulary), so it has
+	// no exact-ratio equivalent and always uses the standard ladder.
 	cmd << "set_bet_sizes oop,river,donk," << opening_bet_sizes_pct() << "\n";
 	cmd << "set_allin_threshold 0.67\n";
 	if (!req.initial_actions.empty())
@@ -644,7 +784,7 @@ inline Decision solve(
 		if (i) req.initial_actions += ",";
 		req.initial_actions += action_path[i];
 	}
-
+	req.exact_ratios = compute_exact_bet_ratios(action_path, pot_at_street_start);
 
 	TempFiles tmp;
 	{

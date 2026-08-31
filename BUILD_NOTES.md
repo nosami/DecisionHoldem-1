@@ -7635,6 +7635,203 @@ immediately after confirming this.
 - Rebuilt `dh_native_ai.dylib` in this isolated worktree only (see caveat
   above); **not** copied over the main checkout's live copy.
 
+## 54. Using the opponent's/hero's exact observed river bet size in the
+TexasSolver fallback, instead of a fixed abstracted percent-of-pot ladder,
+for any player+category with real action data this street (2026-08-31)
+
+### The question that started this
+
+While reviewing this bot's river resolving, the user asked directly: when
+the TexasSolver fallback (§50) solves a river spot facing an opponent bet,
+does it solve using the opponent's actual bet size? Tracing
+`TexasSolverBridge.h`'s `build_batch_commands()` showed the honest answer
+was **no** -- every river decision is configured with the same fixed
+abstraction ladder regardless of what either player actually did this
+street: `opening_bet_sizes_pct()` = `"50,100,200,400,800,1000,2000"` (percent
+of pot) for a player's first aggressive action, `facing_bet_raise_sizes_pct()`
+= `"100"` for a raise. `set_initial_actions` (used to replay the real
+action_path so the solved node matches the actual decision hero faces) then
+asks `PCfrSolver::navigateToSubtree`
+(`/Users/jason/src/TexasSolver/src/solver/PCfrSolver.cpp:88-160`) to find the
+tree child whose configured amount is numerically *closest* to the real one
+-- logging `"action '<X>' matched to '<Y>'"` on any mismatch -- rather than
+requiring an exact match. So a real bet of e.g. 130 chips into a 200-chip pot
+(65% pot) was solved as if it were a round 50%-pot or 100%-pot bet, whichever
+the ladder happened to place closer, not the real size.
+
+The follow-up question -- whether TexasSolver could take the exact size at
+all, or whether the fixed ladder was a genuine solver-side restriction --
+was answered by reading TexasSolver's own source directly, not assumed:
+`CommandLineTool.cpp`'s `set_bet_sizes` handler parses every configured size
+with a plain `stof` (`:233`, arbitrary float, no hardcoded menu), and
+`GameTree::get_possible_bets()` (`GameTree.cpp:615-616`) converts a
+configured ratio back into a chip amount with `amount = one_bet * pot`,
+rounded only to the nearest big blind. Nothing in the actual solver requires
+a small fixed set of round sizes -- `opening_bet_sizes_pct()`/
+`facing_bet_raise_sizes_pct()` are purely a calling-convention choice made on
+this bridge's own side, not a limitation being worked around.
+
+### The fix
+
+`PokerAI/tree/TexasSolverBridge.h`: added `compute_exact_bet_ratios()`
+(~line 347), which replays `action_path` (the same token list already built
+for `set_initial_actions`) purely to recover, for each player+category
+(`oop_bet`/`oop_raise`/`ip_bet`/`ip_raise`) that made a real BET/RAISE this
+street, the exact percent-of-pot-at-that-moment ratio that reproduces the
+real chip amount when TexasSolver multiplies it back out. `build_batch_commands()`
+(~line 445-459) now uses that computed ratio instead of the fixed ladder for
+any player+category with real data, falling back to the standard ladder only
+for a player+category with no real action yet this street (there is no real
+size to use for a genuinely hypothetical future branch, e.g. hero's own
+still-undecided response, or a player who never bet at all). The fixed
+ladder for the smaller, now-irrelevant sizes is dropped entirely for that
+slot, not offered alongside the real size -- per instruction, since
+`navigateToSubtree`'s nearest-match behavior means dead ladder entries are
+not just inert but a latent risk of the tree accidentally preferring a
+rounder configured size over the real one on some future edit. `donk` and
+`allin` categories are unaffected: `donk` has no equivalent in DH's own
+action vocabulary (a donk is indistinguishable from an opening bet in
+`action_path`, so it always uses the opening ladder, matching pre-existing
+behavior), and `allin` takes no ratio parameter at all.
+
+### Two real bugs found and fixed during implementation (both caught by the
+existing test suite before being called done, not shipped speculatively)
+
+1. **Wrong pot-tracking baseline.** The first version initialized this
+   function's local `ip_commit`/`oop_commit` at 0. `set_pot`'s own
+   symmetric-commit precondition means both players are assumed to have
+   *already* committed `pot_at_street_start / 2` each by the time the tree
+   root is built (checked at the `dh_native_ai.cpp` call site before this
+   bridge is even invoked) -- so a street with real money already in the
+   middle (the overwhelmingly common case) needs that baseline folded in, or
+   the very first BET/RAISE's "pot before" is computed as if the street
+   opened with nothing in it at all. This crashed `test_texassolver_fallback`
+   Scenario 5 outright (`RAISE 450 not found in tree`, a ratio wildly outside
+   any amount the built tree could contain). Fixed by adding a
+   `pot_at_street_start` parameter and initializing both commit trackers to
+   `pot_at_street_start / 2`.
+2. **RAISE's call-equalization term.** After fixing (1), all scenarios
+   passed, but the solver's own mismatch warning (`PCfrSolver.cpp`'s
+   `"action '<X>' matched to '<Y>'"` log line) was still firing for RAISE
+   actions specifically, e.g. `"action 'RAISE 450' matched to 'RAISE
+   600.000000' (diff=150.00)"`. Cause: `GameTree.cpp:618` does
+   `amount = one_bet*pot; if (RAISE) amount += (facing_commit - own_commit)`
+   -- the configured ratio only spans the pot-fraction portion, and
+   TexasSolver adds the call-equalization amount on top itself when building
+   the RAISE branch specifically (BET has no such term, since by definition
+   a BET is the first aggressive action into a street, so both commits are
+   still equal at that point -- confirmed this holds structurally, not just
+   for the tested hands). Fixed by subtracting that same term back out
+   before converting the real amount to a ratio: `ratio = 100 * (amount -
+   (facing_commit_before - own_commit_before)) / pot_before`, using 0 for the
+   subtracted term on a BET.
+
+### Concrete confirmation this is now exact, not just "closer"
+
+`DH_TEXASSOLVER_KEEP_TEMP=1` preserves the generated command files and the
+solver's own console log per invocation. Inspecting both directly for all
+three of `test_texassolver_fallback`'s bet/raise-facing scenarios after both
+fixes:
+
+| `action_path` | Generated `set_bet_sizes` (affected slot) | Solver mismatch warning? |
+|---|---|---|
+| `[BET_150]` (pot 200) | `oop,river,bet,75` | none |
+| `[CHECK,BET_130]` (pot 200) | `ip,river,bet,65` | none |
+| `[BET_150,RAISE_450,RAISE_1050]` (pot 200) | `oop,river,bet,75` / `ip,river,raise,60` / `oop,river,raise,68.1818181818` | none |
+
+Every ratio checks out by hand against `GameTree.cpp`'s own formulas (e.g.
+the last row's `RAISE_1050`: after `BET_150`+`RAISE_450`, `oop_commit=250`,
+`ip_commit=550`, `pot_before=1100`; `100*(1050-(550-250))/1100 =
+100*750/1100 = 68.1818...%` -- exactly the logged value), and, more
+importantly, the solver's own internal exact-match check
+(`PCfrSolver::navigateToSubtree`, which logs on *any* nonzero difference
+between the requested and the nearest configured amount) is silent for all
+of them -- this is a stronger confirmation than the black-box pass/fail
+this session started with, since it is the solver itself asserting the
+match is exact, not merely inferred from downstream behavior.
+
+### Validation
+
+**Build** (from `PokerAI/`, standard non-OpenMP test command):
+```sh
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_texassolver_fallback tools/test_texassolver_fallback.cpp
+DH_TEXASSOLVER_KEEP_TEMP=1 ./tools/test_texassolver_fallback
+```
+All 5 scenarios pass (`=== SUMMARY: ALL CHECKS PASSED (0 failures) ===`),
+including the two crashing/mismatching cases above before the fixes.
+
+**Full regression suite**, matching (and extending, with `test_texassolver_fallback`
+and `test_default_env_vars` also included) §53's own precedent "complete
+blast radius" list for changes reachable from `opp_take_action()`/
+`TexasSolverBridge.h`:
+```sh
+for f in test_bet_size_narrowing test_hero_range_narrowing \
+  test_villain_weight_distribution test_preflop_offladder_sizing \
+  test_default_env_vars test_hand6_checkraise test_hand6_range_miss \
+  test_narrow_cfvalue_replace test_narrow_epsilon_floor \
+  test_qq_trips_range_miss test_kcflush_river_range \
+  test_texassolver_fallback test_hand_12473146716_texassolver_compare \
+  test_hand_12473147059_texassolver_compare; do
+  g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/$f tools/$f.cpp && ./tools/$f
+done
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_turn_leaf_speedup tools/test_turn_leaf_speedup.cpp \
+  && ./tools/test_turn_leaf_speedup /Users/jason/dh_local_data/river_cluster_split
+```
+**13 of 14 pass cleanly** (exit code 0; the two `_texassolver_compare` tests
+have no hardcoded assertions of their own -- confirmed by inspection, they
+are exploratory range/decision dump tools -- so "pass" there means "runs to
+completion and returns a plausible decision", which both do: `raise 1200`
+and `call` respectively). `test_turn_leaf_speedup` fails the same single
+assertion §53 already documented (`"implausible action"`) -- reconfirmed
+**pre-existing and unrelated** here too by `git stash`-ing this fix and
+rebuilding+rerunning the identical test against the original unmodified
+source, which reproduces the exact same failure (`SOME CHECKS FAILED`,
+same `"raise 1150"` implausible-action line) byte-for-byte; this test
+exercises a TURN decision, which never reaches this bridge at all
+(`solve()`'s own `board.size()==5` guard), so it could not have been
+affected by this change regardless. Restored the fix immediately after
+confirming.
+
+**ABI check**: rebuilt `dh_native_ai.dylib` in this isolated worktree with
+the standard OpenMP build command; `nm -gU` reports the same 21 exported
+symbols as the live main checkout's currently-running dylib (same names:
+`Next_stage`, `getdecision`, `opp_take_action`, `report_actual_hand`,
+`restart_game`, plus C++-mangled internals) -- no ABI surface change.
+
+### Scope and honest caveats
+
+- This only changes what the TexasSolver fallback is told about sizes
+  *already observed* this street; it does not change hero's own available
+  raise sizes for a still-undecided response (no real data exists for those
+  yet, so the standard ladder remains, unchanged) or anything about the
+  in-process `LiveResolver` path (§50: TexasSolver is river-only fallback,
+  invoked only under `DH_TEXASSOLVER_FALLBACK` auto/force).
+- `donk` bets are unaffected -- DH's own action vocabulary has no separate
+  donk concept (`action_path` cannot distinguish one from an opening bet),
+  so there is nothing for `compute_exact_bet_ratios()` to key off, and the
+  standard opening ladder continues to be used for that category, matching
+  pre-existing behavior exactly.
+- Float precision: ratios are formatted with `std::setprecision(12)`,
+  reasoned (not yet independently stress-tested beyond this session's
+  scenarios) to be far finer than `GameTree.cpp`'s own big-blind rounding
+  granularity for any realistic stack depth.
+- The rebuilt `dh_native_ai.dylib` has not been copied over the main
+  checkout's live copy -- deploying requires a live session restart at a
+  moment of the user's choosing, per this file's established precedent
+  (§§51/52/53).
+
+### Files touched
+
+- `PokerAI/tree/TexasSolverBridge.h`: added `ExactBetRatios` struct and
+  `compute_exact_bet_ratios()` (~line 318-390), `format_ratio_list()`
+  (~line 392-400); extended `SolveRequest` with an `exact_ratios` field
+  (~line 423); modified `build_batch_commands()` (~line 445-459) to use the
+  computed ratio per player+category when real data exists; wired the
+  computation into `solve()` (~line 787). ~146 lines added, 6 removed, no
+  other files changed.
+- Rebuilt `dh_native_ai.dylib` in this isolated worktree only (see caveat
+  above); **not** copied over the main checkout's live copy.
+
 ## Symmetric public-range narrowing
 
 `PokerAI/tools/dh_native_ai.cpp` now maintains two persistent, normalized
