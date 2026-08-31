@@ -7863,3 +7863,197 @@ g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER \
   -o tools/test_hero_range_narrowing tools/test_hero_range_narrowing.cpp
 ./tools/test_hero_range_narrowing
 ```
+
+## 55. Fixing the "narrow tree-node-illegal-byte gap" in section 51's preflop bracketing fix -- found investigating live hand #12476043891 (2026-08-31)
+
+### The hand
+
+Live hand `12476043891` (`game_logs/hand_12476043891/`, `$HOME/src/
+TexasSolver`): nosami (SB, real stack EUR22.00) opened to EUR0.20, ROBYNBLUFF05
+(BB, real stack EUR19.20) 3-bet to EUR0.80, nosami 4-bet to EUR2.40,
+ROBYNBLUFF05 5-bet to EUR4.00 -- and nosami's very next preflop decision (the
+call) has no `[DH_STRATEGY]` line and no `strategy_percentages` field.
+`server.log` shows:
+```
+[DH_RANGE_MODEL] villain-preflop preflop range narrowing failed (observed
+action byte not found among this node's legal actions) -- range left
+unchanged for this action
+[DH_PREFLOP_BLUEPRINT] real blueprint lookup failed (BlueprintReader: action
+byte not found among this node's legal actions) -- falling back to
+placeholder 'call' for this decision only
+```
+nosami then folded a genuinely-computed flop decision (fold=99.55%) for a
+real EUR4.00 total loss -- a small pot, but the SAME failure mode sections
+51/53 already fixed two other instances of, so worth root-causing rather
+than dismissing as "just variance."
+
+### Root cause
+
+Section 51's `match_raise_action_byte_fuzzy()` brackets an off-ladder
+preflop raise between its two nearest trained sizes, by pot-relative
+fraction, from the FIXED generic ladder `{1,2,3,4,8,20,40}` -- it has no
+concept of which of those seven bytes the trained tree actually allows as a
+legal continuation AT THE SPECIFIC NODE the hand is currently at.
+`PokerAI/poker/State.h`'s `legal_actions()` narrows the modeled raise sizes
+as a preflop raising war gets deeper (fewer of the fixed 20000-chip
+abstraction stack behind, relative to the pot), so a node reached after
+several raises can legally support only a SUBSET of the seven bytes.
+
+Confirmed directly against the real trained blueprint (read-only, via a
+disposable diagnostic against `BlueprintReader.h`/`PreflopCache.h`, not
+checked in, matching section 53's precedent): replaying the hand's real
+open (200 native, exact match, byte 1)/3-bet (800 native, fuzzy-bracketed
+by production code)/4-bet (2400 native, exact match at that point, byte 2)
+sequence, the node immediately before ROBYNBLUFF05's 5-bet has REAL legal
+actions `{100 ('d' fold), 108 ('l' call), 2 (byte 2), 110 ('n' allin)}` --
+byte 1 and byte 3 are BOTH absent. ROBYNBLUFF05's real 5-bet (4000 native)
+has no exact match (confirmed: `match_raise_action_byte()` returns -1), and
+`match_raise_action_byte_fuzzy()` brackets it between exactly byte 1 and
+byte 3 -- sampling either one 100% of the time over 200 trials in the test
+below hits an illegal byte, not merely "sometimes." Whichever gets sampled,
+pushing it onto `g.preflop_action_path` desyncs the tracked path from the
+real tree just enough that the VERY NEXT lookup (nosami's own decision
+facing the 5-bet) walks into the wrong node and throws.
+
+Notably, `opp_take_action()`'s raise branch ALREADY calls
+`narrow_villain_range_preflop(byte)` immediately before pushing the same
+byte onto `g.preflop_action_path` -- and that call's own internal
+`narrow_range_preflop()` already performs (for its own, separate purpose:
+updating the tracked opponent-range belief) essentially the same
+"is this byte legal at the current node" check that throws the very
+"action byte not found" exception quoted above. But its `bool` return value
+was discarded at the call site, and `g.preflop_action_path.push_back(byte)`
+ran unconditionally immediately afterward regardless of what that check
+found. The information needed to avoid the corruption already existed one
+line earlier; it just wasn't being used for this purpose.
+
+### The fix
+
+Added `current_preflop_node_legal_actions()` (queries the CURRENT node's
+real legal action bytes -- cache-first via the already-loaded
+`PreflopCache` -- 186 preflop nodes, a COMPLETE enumeration of the
+preflop-only tree per `build_preflop_cache.cpp`'s own header comment, so
+this is authoritative, not a sample -- then falls back to the direct
+`BlueprintReader` disk walk only if the cache is unavailable, exactly
+mirroring `narrow_range_preflop()`'s/`resolve_preflop_decision()`'s
+existing cache-then-disk pattern) and `pick_nearest_legal_raise_byte()`
+(given the real legal bytes and the same pot-fraction terms
+`match_raise_action_byte_fuzzy()` already computes, finds whichever LEGAL
+raise-size byte is numerically closest to the observed raise, instead of
+trusting a generically-plausible-but-illegal-here bracket).
+`opp_take_action()`'s raise branch now verifies the fuzzy-bracketed byte
+against `current_preflop_node_legal_actions()` before ever pushing it onto
+`g.preflop_action_path`; on a miss, it substitutes the corrected byte from
+`pick_nearest_legal_raise_byte()` instead (or, if that specific node has NO
+legal raise-size byte at all -- only fold/call/allin -- falls through to
+the pre-existing "confidence lost" placeholder, exactly as for a
+genuinely degenerate pot/call bookkeeping state). An empty
+`current_preflop_node_legal_actions()` result (cache AND disk walk both
+failed) is treated as "cannot verify this time" and keeps the pre-fix
+behavior (trust the bracket) for that rare case, rather than degrading a
+hand over an unrelated I/O problem this fix does not claim to solve.
+
+For hand #12476043891's exact scenario, the corrected byte is 2 (the
+node's only legal raise-size continuation) -- not 1 or 3.
+
+### Concrete confirmation this changes a real decision, not just a log line
+
+Replaying the exact scenario with the fix in place, across 40 replays
+(covering both RNG branches of the bracket): `g.preflop_path_confident`
+stays true every time (previously desynced on either branch);
+`g.preflop_action_path`'s last byte is always the corrected 2 (never 1 or
+3); `getdecision()` logs a genuine line instead of the fallback error:
+```
+[DH_STRATEGY] PREFLOP hand=4sJs pot=6400 expl=n/a: fold=100.00% call=0.00%
+allin=0.00%
+```
+**The real blueprint says fold=100% here** -- nosami's actual live action at
+this exact decision was "call" (the old bug's hardcoded placeholder, which
+is what the live bridge executed), not a coincidental match to the correct
+answer. This means the bug was not cosmetic here either: the live hand's
+real cost was nosami calling ROBYNBLUFF05's 5-bet (an extra ~EUR1.60 on top
+of the 4-bet already in) before folding the flop, when the real trained
+blueprint says the hand should have folded immediately, one street
+earlier and for EUR1.60 less. 4sJs facing a cold 5-bet, already 4-bet
+themselves, is a clear, undisputed fold on hand-strength grounds alone --
+consistent with the real blueprint's unanimous 100% verdict, not a close
+or surprising spot it happened to flip.
+
+### Validation
+
+**Build** (from `PokerAI/`, standard non-OpenMP test command, matching
+every other `test_*.cpp` in this suite):
+```sh
+g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/test_bracket_illegal_byte_gap tools/test_bracket_illegal_byte_gap.cpp
+./tools/test_bracket_illegal_byte_gap
+```
+**New test** (`tools/test_bracket_illegal_byte_gap.cpp`, 5 checks, all
+pass): ground truth confirms the real legal-action set at the node before
+the 5-bet excludes byte 1 and byte 3 but includes byte 2; the real 5-bet's
+bracket is illegal 100% of the time over 200 trials (not a rare flake); an
+end-to-end replay via the real `opp_take_action()`, 40 times (covering both
+RNG branches), confirms confidence stays true, the corrected byte 2 is
+always what gets tracked, and a genuine `[DH_STRATEGY]` line is logged
+(never the failure fallback); an ordinary exact-match raise (hero's own
+real open, to 200) is completely unaffected by the new verification step;
+and `pick_nearest_legal_raise_byte()` still correctly returns -1 when no
+raise-size byte is legal at all (the genuinely-degenerate case is
+unchanged).
+
+**Full blast-radius regression suite** (every `test_*.cpp` that calls
+`opp_take_action()`, references `g.preflop_action_path`, or calls
+`match_raise_action_byte*` -- 13 files, plus this section's new test, 14
+total), rebuilt and re-run unmodified against the fixed source (cluster
+files symlinked to `/Users/jason/dh_local_data/` and the existing
+`preflop_blueprint_cache.bin` copied over, matching the established
+sibling-worktree convention):
+```sh
+for f in test_allin_amount_command test_bet_size_narrowing \
+  test_hand6_checkraise test_hand6_range_miss \
+  test_hand_12473146716_texassolver_compare \
+  test_hand_12473147059_texassolver_compare test_kcflush_river_range \
+  test_narrow_cfvalue_replace test_narrow_epsilon_floor \
+  test_preflop_offladder_sizing test_qq_trips_range_miss \
+  test_texassolver_fallback test_villain_weight_distribution; do
+  g++ -std=c++17 -O2 -DDH_SKIP_RIVER_CLUSTER -o tools/$f tools/$f.cpp && ./tools/$f
+done
+```
+**All 13 pass cleanly** (exit code 0, `ALL CHECKS PASSED` where
+applicable) -- zero regressions, including `test_preflop_offladder_sizing`
+(section 51's own suite, confirming the exact-match and off-ladder-but-
+legal cases are both still byte-for-byte unaffected).
+
+### Scope and honest caveats
+
+- This only teaches `opp_take_action()` to verify a fuzzy-bracketed byte
+  against the specific node it's about to be recorded at; it does not
+  change `match_raise_action_byte_fuzzy()`'s own generic bracketing math
+  (kept intact and separately unit-tested, unchanged, by section 51's
+  existing test) or add new sizes to the trained abstraction itself.
+- Verification relies on the preflop cache being a COMPLETE enumeration of
+  the preflop tree (confirmed via `build_preflop_cache.cpp`'s own header
+  comment: 186 nodes, max depth 5, fully enumerable). If the cache is
+  unavailable and the direct disk walk ALSO fails for this exact path
+  (both empty), this fix silently keeps today's pre-fix behavior for that
+  one action rather than guessing further or paying an unbounded I/O cost
+  synchronously during opponent-action processing.
+- Like sections 51/53's fixes, this changes how an opponent's already-
+  classified-as-a-raise action is recorded; it does not touch
+  `apply_own_action()` (hero's own actions never need this format --
+  `getdecision()` always emits exact native amounts for hero's own play).
+- The rebuilt `dh_native_ai.dylib` has not been copied over the main
+  checkout's live copy -- deploying requires a live session restart at a
+  moment of the user's choosing, per this file's established precedent
+  (sections 51/52/53).
+
+### Files touched
+
+- `PokerAI/tools/dh_native_ai.cpp`: added
+  `current_preflop_node_legal_actions()` and
+  `pick_nearest_legal_raise_byte()` (~75 lines, immediately after
+  `match_raise_action_byte_fuzzy()`); updated `opp_take_action()`'s raise
+  branch (~20 lines) to verify the fuzzy-bracketed byte before trusting it.
+- `PokerAI/tools/test_bracket_illegal_byte_gap.cpp` (new): 5 focused
+  checks described above, including a full replay of the real hand.
+- Rebuilt `dh_native_ai.dylib` in this isolated worktree only (see caveat
+  above); **not** copied over the main checkout's live copy.

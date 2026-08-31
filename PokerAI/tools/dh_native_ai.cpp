@@ -747,6 +747,81 @@ int match_raise_action_byte_fuzzy(int total_pot_before, int last_bigbet_before, 
 	return pick_lower ? lo.byte : hi.byte;
 }
 
+// BUG FIX (found investigating live hand #12476043891, BUILD_NOTES.md
+// section 55): match_raise_action_byte_fuzzy() above (section 51's fix)
+// brackets an off-ladder preflop raise between two of the FIXED, generic
+// seven trained sizes {1,2,3,4,8,20,40} purely by pot-relative fraction --
+// it has no way to know whether either bracket candidate is actually a
+// LEGAL continuation at the specific (possibly rare, deep) tree node the
+// hand is currently at. State.h's legal_actions() narrows the modeled
+// raise sizes as a preflop raising war gets deeper, so a bracket that is
+// perfectly reasonable in general pot-fraction terms can still name a byte
+// this SPECIFIC node simply never trained. Pushing that byte onto
+// g.preflop_action_path desyncs it from the real tree just enough that the
+// VERY NEXT lookup (hero's own decision facing this raise) walks into the
+// wrong node and throws BlueprintReader's "action byte not found among
+// this node's legal actions", falling all the way back to a hardcoded,
+// hand-strength-blind "call" placeholder -- exactly the failure mode
+// sections 51/53 already fixed two other instances of, one level deeper.
+//
+// Returns the CURRENT node's (g.preflop_action_path AS IT STANDS, i.e.
+// BEFORE this action's byte would be appended) real legal action bytes,
+// using the exact same cache-first-then-disk-walk-fallback pattern already
+// used by narrow_range_preflop()/resolve_preflop_decision() -- both
+// numerically identical, so this is purely a speed difference. Returns an
+// empty vector (never throws) if BOTH the cache and the disk walk fail for
+// any reason (missing cache, this exact path genuinely not present in
+// EITHER source, file trouble, an already-corrupted path reaching a
+// terminal node early, etc.) -- callers must treat an empty result as
+// "cannot verify legality this time" and keep today's pre-fix behavior for
+// that rare case, rather than degrading a hand over an unrelated problem
+// this fix does not claim to solve.
+std::vector<unsigned char> current_preflop_node_legal_actions() {
+	try {
+		if (g_preflop_cache_loaded) {
+			try {
+				return PreflopCache::lookup_preflop_strategy_all_clusters(
+					g_preflop_cache, g.preflop_action_path).actionstr;
+			} catch (const std::exception&) {
+				// Cache miss/failure for this specific path -- fall through
+				// to the disk walk below, exactly as if the cache weren't
+				// loaded at all.
+			}
+		}
+		return BlueprintReader::lookup_preflop_strategy_all_clusters(
+			"cluster/blueprint_strategy.dat", g.preflop_action_path).actionstr;
+	} catch (const std::exception&) {
+		return {}; // caller must decide how to degrade -- see comment above
+	}
+}
+
+// Given a node's REAL legal action bytes (from
+// current_preflop_node_legal_actions()) and the same pot-fraction terms
+// match_raise_action_byte_fuzzy() already computes, finds whichever LEGAL
+// raise-size byte (i.e. excluding the non-raise codes 'd'/fold, 'l'/call,
+// 'n'/allin) is numerically closest to the observed raise. Comparing
+// un-normalized chip distances (rather than fractions) is equivalent here
+// since `pot` is the same denominator for every candidate. Returns -1 if
+// `legal` contains no raise-size byte at all (this specific node only
+// allows fold/call/allin) -- a genuinely degenerate case for an observed
+// "raise" action, which the caller must treat the same as any other
+// "can't trust the tracked path" outcome.
+int pick_nearest_legal_raise_byte(const std::vector<unsigned char>& legal, int pot, int observed_increment) {
+	static const int bytes[] = { 1, 2, 3, 4, 8, 20, 40 };
+	int best = -1;
+	int best_dist = 0;
+	for (int b : bytes) {
+		if (std::find(legal.begin(), legal.end(), (unsigned char)b) == legal.end())
+			continue; // generically plausible, but not legal at this node
+		int last_raise = (b != 3) ? (pot * b / 200 * 100) : (pot / 400 * 100);
+		if (last_raise <= 0) continue;
+		int dist = last_raise - observed_increment;
+		if (dist < 0) dist = -dist;
+		if (best < 0 || dist < best_dist) { best = b; best_dist = dist; }
+	}
+	return best;
+}
+
 BlueprintActionTranslation::BettingContext blueprint_betting_context(int acting_slot) {
 	BlueprintActionTranslation::BettingContext context;
 	context.total_pot = (20000 - g.stack[0]) + (20000 - g.stack[1]);
@@ -2001,6 +2076,30 @@ void opp_take_action(char* actionstr_c) {
 			// existing postflop raise-size translation.
 			int byte = match_raise_action_byte_fuzzy(total_pot_before, last_bigbet_before, my_bet_before, amount, g.rng);
 			if (byte >= 0) {
+				// BUG FIX (BUILD_NOTES.md section 55; found investigating live
+				// hand #12476043891): match_raise_action_byte_fuzzy() only
+				// reasons about generic pot-fraction math over the fixed
+				// {1,2,3,4,8,20,40} ladder -- it has no way to know which of
+				// those bytes THIS SPECIFIC (possibly rare, deep) node actually
+				// trained as a legal continuation. Verify before trusting it;
+				// see current_preflop_node_legal_actions()'s comment for the
+				// full mechanism and pick_nearest_legal_raise_byte()'s comment
+				// for the correction applied on a miss.
+				std::vector<unsigned char> legal_here = current_preflop_node_legal_actions();
+				bool verified_legal = legal_here.empty() ||
+					std::find(legal_here.begin(), legal_here.end(), (unsigned char)byte) != legal_here.end();
+				// An EMPTY legal_here means "couldn't verify" (cache and disk
+				// walk both failed) -- keep pre-fix behavior (trust the
+				// bracket) for that rare case rather than degrading a hand
+				// over an unrelated problem this fix does not claim to solve.
+				if (!verified_legal) {
+					int n_chips_to_call = last_bigbet_before - my_bet_before;
+					int pot = total_pot_before + n_chips_to_call;
+					int observed_increment = amount - last_bigbet_before;
+					byte = pick_nearest_legal_raise_byte(legal_here, pot, observed_increment);
+				}
+			}
+			if (byte >= 0) {
 				narrow_villain_range_preflop((unsigned char)byte);
 				g.preflop_action_path.push_back((unsigned char)byte);
 			}
@@ -2013,9 +2112,12 @@ void opp_take_action(char* actionstr_c) {
 				// "!preflop_path_confident" guard (this flag's only other reader)
 				// returns its placeholder 'call' silently and has no strategy
 				// distribution of its own left to print. This branch should now be
-				// rare: it only fires for a degenerate pot/call bookkeeping state
-				// (see match_raise_action_byte_fuzzy()'s comment), not for an
-				// ordinary off-ladder bet size, which is handled above instead.
+				// rarer still: it fires for a degenerate pot/call bookkeeping state
+				// (see match_raise_action_byte_fuzzy()'s comment), OR (new, section
+				// 55) for an off-ladder bet size landing at a real tree node that
+				// has NO legal raise-size continuation at all (only fold/call/
+				// allin) -- an ordinary off-ladder size at a node that DOES support
+				// some raise is now corrected to that legal size above instead.
 				std::fprintf(stderr,
 					"[DH_PREFLOP_BLUEPRINT] preflop path confidence lost for the "
 					"rest of this hand -- observed raise to %d hit a degenerate "
